@@ -7,4 +7,5 @@ pub mod registry;
 pub mod render;
 pub mod resolve;
 pub mod resource;
+pub mod skill;
 pub mod supervise;

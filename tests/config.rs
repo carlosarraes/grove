@@ -79,3 +79,21 @@ fn secrets_carry_the_per_instance_overrides() {
     assert!(frontend.set.contains_key("VITE_API_URL"));
     assert!(frontend.set.contains_key("VITE_PROXY_TARGET"));
 }
+
+/// Port names reach two places that constrain them: `{{ port.<name> }}` in a template,
+/// where minijinja would read a hyphen as subtraction, and `TREEISH_PORT_<NAME>`, which
+/// must be a legal environment variable. Both are silent corruptions, so refuse early.
+#[test]
+fn a_port_name_that_would_break_templates_is_refused() {
+    let err = config::parse(
+        r#"
+version = 1
+[ports]
+names = ["my-port"]
+"#,
+    )
+    .expect_err("must refuse a hyphenated port name");
+
+    let msg = format!("{err:#}");
+    assert!(msg.contains("my-port"), "should name the offender: {msg}");
+}

@@ -187,7 +187,13 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
-        Some(Command::Skill { action: _ }) => bail!("not implemented yet"),
+        Some(Command::Skill {
+            action: SkillAction::Install,
+        }) => {
+            let path = treeish::skill::install()?;
+            println!("installed the treeish skill to {}", path.display());
+            Ok(())
+        }
     }
 }
 

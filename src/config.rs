@@ -108,5 +108,30 @@ pub fn load(worktree: &Path) -> Result<Config> {
 }
 
 pub fn parse(text: &str) -> Result<Config> {
-    Ok(toml::from_str(text)?)
+    let config: Config = toml::from_str(text)?;
+    config.validate()?;
+    Ok(config)
+}
+
+impl Config {
+    fn validate(&self) -> Result<()> {
+        for name in &self.ports.names {
+            // A port name lands in `{{ port.<name> }}`, where a hyphen parses as
+            // subtraction, and in `TREEISH_PORT_<NAME>`, which must be a legal shell
+            // variable. Both corrupt silently, so the name is constrained up front.
+            let legal = !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                && !name.starts_with(|c: char| c.is_ascii_digit());
+            if !legal {
+                anyhow::bail!(
+                    "port name {name:?} must be lowercase letters, digits, and underscores, \
+                     starting with a letter — it becomes both `{{{{ port.{name} }}}}` in \
+                     templates and TREEISH_PORT_<NAME> in the environment"
+                );
+            }
+        }
+        Ok(())
+    }
 }

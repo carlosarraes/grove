@@ -336,3 +336,31 @@ fn run_executes_a_command_with_the_instance_environment() {
 
     cli.run(&wt, &["down"]).success();
 }
+
+#[test]
+fn skill_install_writes_a_skill_agents_can_load() {
+    let cli = Cli::new();
+    let home = TempDir::new().expect("tempdir");
+
+    Command::cargo_bin("treeish")
+        .expect("binary")
+        .current_dir(&cli.fx.main)
+        .env("HOME", home.path())
+        .args(["skill", "install"])
+        .assert()
+        .success();
+
+    let body = std::fs::read_to_string(home.path().join(".claude/skills/treeish/SKILL.md"))
+        .expect("skill installed to the global skills directory");
+    assert!(body.starts_with("---\nname: treeish\n"), "{body}");
+    assert!(
+        body.contains("description:"),
+        "a model-invoked skill needs a description to be discoverable"
+    );
+    // The schema lives in the binary and is reached by pointer, so it cannot drift.
+    assert!(body.contains("treeish --llm"), "{body}");
+    assert!(
+        !body.contains("[[secrets]]"),
+        "the skill must point at the schema rather than restate it"
+    );
+}

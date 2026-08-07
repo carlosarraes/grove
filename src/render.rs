@@ -35,6 +35,11 @@ impl Context {
     }
 }
 
+/// Expand a single template — a command line, a readiness URL, a database name.
+pub fn value(source: &str, context: &Context) -> Result<String> {
+    template(source, &context.bindings())
+}
+
 /// Write every `[[secrets]]` file this repo declares, reading each from the main checkout
 /// and writing it into the worktree. Returns what was written.
 pub fn all(

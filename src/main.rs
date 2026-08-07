@@ -1,6 +1,6 @@
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use treeish::llm;
+use treeish::{instance::Instance, llm};
 
 /// Per-worktree dev instances: each git worktree gets its own ports, env, and database.
 #[derive(Parser)]
@@ -18,7 +18,7 @@ struct Cli {
 enum Command {
     /// Render config, ensure resources, start services, wait for ready
     Up {
-        /// Re-render config and restart even if the instance is already running
+        /// Restart services that are already running
         #[arg(long)]
         fresh: bool,
         /// Permit running in the main worktree, overwriting its real env files
@@ -27,7 +27,7 @@ enum Command {
     },
     /// Stop this instance's services
     Down {
-        /// Also drop this instance's database
+        /// Also forget this instance's port reservation
         #[arg(long)]
         purge: bool,
     },
@@ -72,12 +72,139 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    let cwd = std::env::current_dir().context("reading the working directory")?;
+
     match cli.command {
         None => {
             <Cli as clap::CommandFactory>::command().print_help()?;
             println!();
             Ok(())
         }
-        Some(_) => anyhow::bail!("not implemented yet"),
+        Some(Command::Up { fresh, allow_main }) => {
+            let mut instance = Instance::open(&cwd)?;
+            if !allow_main {
+                instance.refuse_in_main()?;
+            }
+            instance.render()?;
+            instance.up(fresh)?;
+            print_summary(&instance);
+            Ok(())
+        }
+        Some(Command::Down { purge }) => {
+            let mut instance = Instance::open(&cwd)?;
+            instance.down()?;
+            if purge {
+                instance.release()?;
+            }
+            println!("stopped {}", instance.resolved.slug);
+            Ok(())
+        }
+        Some(Command::Status { json }) => {
+            let instance = Instance::open(&cwd)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status_json(&instance))?);
+            } else {
+                print_summary(&instance);
+            }
+            Ok(())
+        }
+        Some(Command::Ls) => {
+            let registry = treeish::instance::registry()?;
+            registry.reap()?;
+            let entries = registry.list()?;
+            if entries.is_empty() {
+                println!("no instances");
+            }
+            for entry in entries {
+                let ports: Vec<String> = entry
+                    .ports
+                    .iter()
+                    .map(|(n, p)| format!("{n}={p}"))
+                    .collect();
+                println!(
+                    "{:<28} {:<10} {}",
+                    entry.slug,
+                    format!("{} up", entry.services.len()),
+                    ports.join(" ")
+                );
+            }
+            Ok(())
+        }
+        Some(Command::Run { argv }) => {
+            let instance = Instance::open(&cwd)?;
+            let status = std::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .current_dir(&cwd)
+                .envs(instance.environment())
+                .status()
+                .with_context(|| format!("running `{}`", argv.join(" ")))?;
+            std::process::exit(status.code().unwrap_or(1));
+        }
+        Some(Command::Logs { service, follow }) => {
+            let instance = Instance::open(&cwd)?;
+            let name = match service {
+                Some(name) => name,
+                None => instance
+                    .config
+                    .services
+                    .first()
+                    .map(|s| s.name.clone())
+                    .context("this repo declares no services")?,
+            };
+            let path = instance.log_path(&name);
+            if follow {
+                let status = std::process::Command::new("tail")
+                    .arg("-f")
+                    .arg(&path)
+                    .status()
+                    .context("running tail")?;
+                std::process::exit(status.code().unwrap_or(0));
+            }
+            match std::fs::read_to_string(&path) {
+                Ok(body) => print!("{body}"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    bail!("{name} has no log yet at {}", path.display())
+                }
+                Err(e) => return Err(e).context("reading the log"),
+            }
+            Ok(())
+        }
+        Some(Command::Doctor) => bail!("not implemented yet"),
+        Some(Command::Skill { action: _ }) => bail!("not implemented yet"),
     }
+}
+
+fn status_json(instance: &Instance) -> serde_json::Value {
+    let services: serde_json::Map<String, serde_json::Value> = instance
+        .status()
+        .into_iter()
+        .map(|s| (s.name, serde_json::json!({ "running": s.running })))
+        .collect();
+    serde_json::json!({
+        "slug": instance.resolved.slug,
+        "worktree": instance.resolved.worktree,
+        "ports": instance.entry.ports,
+        "database": instance.db_name(),
+        "services": services,
+    })
+}
+
+/// The only thing an agent should need to read after `up`.
+fn print_summary(instance: &Instance) {
+    println!("instance  {}", instance.resolved.slug);
+    for (name, port) in &instance.entry.ports {
+        println!("{name:<10}http://localhost:{port}");
+    }
+    if let Some(db) = instance.db_name() {
+        println!("database  {db}");
+    }
+    println!();
+    let first = instance
+        .config
+        .services
+        .first()
+        .map(|s| s.name.as_str())
+        .unwrap_or("<service>");
+    println!("  treeish run -- <your test command>");
+    println!("  treeish logs {first} -f");
 }

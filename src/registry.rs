@@ -19,6 +19,12 @@ pub struct Entry {
     pub worktree: PathBuf,
     pub slug: String,
     pub ports: BTreeMap<String, u16>,
+    /// Live services, by name. Persisted because `down` runs in a different process than
+    /// the `up` that started them.
+    #[serde(default)]
+    pub services: BTreeMap<String, crate::supervise::Handle>,
+    #[serde(default)]
+    pub db_name: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -78,9 +84,19 @@ impl Registry {
                     names,
                     &taken,
                 )?,
+                services: BTreeMap::new(),
+                db_name: None,
             };
             state.instances.insert(key, entry.clone());
             Ok(entry)
+        })
+    }
+
+    /// Persist an entry that changed — new service pids, a resolved database name.
+    pub fn record(&self, entry: &Entry) -> Result<()> {
+        self.with_lock(|state| {
+            state.instances.insert(key(&entry.worktree), entry.clone());
+            Ok(())
         })
     }
 

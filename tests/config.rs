@@ -1,0 +1,81 @@
+use tempfile::TempDir;
+use treeish::{config, llm};
+
+fn worktree_with(toml: &str) -> TempDir {
+    let dir = TempDir::new().expect("tempdir");
+    std::fs::write(dir.path().join(".treeish.toml"), toml).expect("write .treeish.toml");
+    dir
+}
+
+#[test]
+fn loads_services_from_the_worktree_root() {
+    let wt = worktree_with(
+        r#"
+version = 1
+
+[ports]
+names = ["backend"]
+
+[[service]]
+name = "backend"
+cwd = "backend"
+command = "uv run uvicorn src.main:app --reload --port {{ port.backend }}"
+"#,
+    );
+
+    let c = config::load(wt.path()).expect("load");
+
+    assert_eq!(c.services.len(), 1);
+    assert_eq!(c.services[0].name, "backend");
+}
+
+#[test]
+fn missing_config_routes_the_agent_to_the_schema() {
+    let dir = TempDir::new().expect("tempdir");
+
+    let err = config::load(dir.path()).expect_err("must fail with no .treeish.toml");
+
+    let msg = format!("{err:#}");
+    assert!(msg.contains(".treeish.toml"), "should name the file: {msg}");
+    assert!(
+        msg.contains("treeish --llm"),
+        "should point at the schema so an agent can author one: {msg}"
+    );
+}
+
+/// `treeish --llm` hands this example to agents to copy. If it stops parsing, every agent
+/// that follows the docs writes a config treeish rejects.
+#[test]
+fn the_documented_example_parses() {
+    let c = config::parse(llm::MONDRIO_EXAMPLE).expect("the --llm example must parse");
+
+    let names: Vec<_> = c.services.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["backend", "frontend"]);
+
+    assert_eq!(c.ports.names, ["frontend", "backend"]);
+    assert_eq!(c.secrets.len(), 2, "backend and frontend .env.local");
+    assert_eq!(c.resources.len(), 1, "the shared mongo");
+}
+
+#[test]
+fn secrets_carry_the_per_instance_overrides() {
+    let c = config::parse(llm::MONDRIO_EXAMPLE).expect("parse");
+    let backend = c
+        .secrets
+        .iter()
+        .find(|s| s.from == "backend/.env.local")
+        .expect("backend secrets block");
+
+    // Both frontend->backend pointers and the CORS origin are the rewrites that make
+    // instances independent; losing any one silently crosses two instances.
+    assert!(backend.set.contains_key("CORS_ORIGINS"));
+    assert!(backend.set.contains_key("MONGODB_DATABASE"));
+
+    let frontend = c
+        .secrets
+        .iter()
+        .find(|s| s.from == "frontend/.env.local")
+        .expect("frontend secrets block");
+    assert!(frontend.set.contains_key("VITE_API_URL"));
+    assert!(frontend.set.contains_key("VITE_PROXY_TARGET"));
+}

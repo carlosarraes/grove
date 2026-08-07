@@ -41,7 +41,10 @@ fn knows_it_is_in_a_linked_worktree() {
 
     let r = resolve::resolve(&wt).expect("resolve");
 
-    assert!(!r.is_main(), "a linked worktree must not be treated as main");
+    assert!(
+        !r.is_main(),
+        "a linked worktree must not be treated as main"
+    );
 }
 
 #[test]

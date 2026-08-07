@@ -1,5 +1,147 @@
 //! Agent-facing schema reference, emitted by `treeish --llm`.
+//!
+//! The examples here are parsed by the test suite against the same structs that read a
+//! real `.treeish.toml`, so this file cannot document a config treeish would reject.
+
+/// A worked `.treeish.toml` for a Vite + FastAPI + MongoDB repo.
+pub const MONDRIO_EXAMPLE: &str = r#"version = 1
+
+# Port names this repo needs. treeish assigns the numbers and exposes them to every
+# template below as {{ port.<name> }}.
+[ports]
+names = ["frontend", "backend"]
+
+# Each [[secrets]] block copies one env file from the MAIN checkout into this worktree,
+# then overrides the listed keys. The main checkout is the source because a worktree
+# never inherits gitignored files -- that is the whole point.
+[[secrets]]
+from = "backend/.env.local"
+into = "backend/.env.local"
+
+[secrets.set]
+CORS_ORIGINS = "http://localhost:{{ port.frontend }}"
+MONGODB_URI = "mongodb://localhost:27017/?directConnection=true&replicaSet=rs0"
+MONGODB_DATABASE = "{{ db.name }}"
+ENVIRONMENT = "development"
+DEBUG = "True"
+"WORKOS__REDIRECT_URI" = "http://localhost:{{ port.frontend }}/auth/callback"
+"WORKOS__OAUTH_REDIRECT_URI" = "http://localhost:{{ port.frontend }}/dashboard"
+"WORKOS__POST_LOGOUT_REDIRECT_URI" = "http://localhost:{{ port.frontend }}/"
+
+[[secrets]]
+from = "frontend/.env.local"
+into = "frontend/.env.local"
+
+# Both pointers must be set. VITE_API_URL is what the browser fetches; VITE_PROXY_TARGET
+# is what the dev server proxies /auth and /api to. Each falls back to a hardcoded
+# localhost:8000, so missing either one silently drives another instance's backend.
+[secrets.set]
+VITE_API_URL = "http://localhost:{{ port.backend }}"
+VITE_PROXY_TARGET = "http://localhost:{{ port.backend }}"
+
+# One container shared by every instance. treeish probes the port first and reuses
+# whatever already answers, so a Mongo from Docker, from a VM, or forwarded over SSH all
+# work without changing this block. Instances are isolated by database name.
+[[resource]]
+name = "mongo"
+kind = "docker-shared"
+image = "mongo:8.0.23"
+args = ["--replSet", "rs0"]
+port = 27017
+init = "rs.initiate()"
+db_name = "mondrio_{{ slug }}"
+
+[[service]]
+name = "backend"
+cwd = "backend"
+setup = "uv sync --extra dev --extra mcp"
+command = "uv run uvicorn src.main:app --reload --port {{ port.backend }}"
+ready = { http = "http://localhost:{{ port.backend }}/openapi.json", timeout = "180s" }
+
+# --strictPort matters: without it Vite drifts to the next free port on collision, and
+# the backend's CORS_ORIGINS -- an exact-match list -- stops matching.
+[[service]]
+name = "frontend"
+cwd = "frontend"
+setup = "npm install"
+command = "npm run dev -- --port {{ port.frontend }} --strictPort"
+ready = { http = "http://localhost:{{ port.frontend }}/", timeout = "180s" }
+"#;
 
 pub fn reference() -> String {
-    String::new()
+    format!(
+        r#"# treeish
+
+Each git worktree gets its own running instance of the repo: its own ports, its own env
+files, its own database. Agents work in parallel without colliding and without copying
+configuration by hand.
+
+## Authoring .treeish.toml
+
+Write it at the worktree root and commit it. It is checked in, so every later agent in
+every worktree just runs `treeish up`.
+
+### Template variables
+
+Any string value in [secrets.set], [[resource]].db_name, [[service]].command, and
+[[service]].ready.http is a template. Available:
+
+  {{{{ slug }}}}           this instance's name, [a-z0-9_], from the worktree directory
+  {{{{ port.<name> }}}}    a port from [ports].names, assigned by treeish
+  {{{{ db.name }}}}        this instance's database, from [[resource]].db_name
+  {{{{ main_worktree }}}}  absolute path of the main checkout
+
+### Schema
+
+  version            required, currently 1
+
+  [ports]
+  names              list of port names this repo needs
+
+  [[secrets]]        repeatable; one per env file
+  from               path relative to the MAIN worktree -- where real secrets live
+  into               path relative to THIS worktree -- where they are written
+  [secrets.set]      keys to override after copying; values are templates
+
+  [[resource]]       repeatable; a datastore shared across instances
+  name               identifier
+  kind               "docker-shared"
+  image              container image, used only if nothing answers on `port` already
+  args               extra arguments to the container command
+  port               port to probe, and to publish if treeish starts it
+  init               one-time command against a freshly started resource
+  db_name            per-instance database name; a template
+
+  [[service]]        repeatable; a long-running process
+  name               identifier, also the log file name
+  cwd                working directory relative to the worktree root
+  setup              run once per worktree before first start (uv sync, npm install)
+  command            the process to run; must accept its port, usually via a flag
+  ready.http         URL polled until it answers
+  ready.timeout      how long to wait, e.g. "180s"
+
+### Two rules that prevent silent cross-talk
+
+1. Bind the port explicitly and strictly. A dev server that falls back to "next free
+   port" on collision will start fine and then fail to match the CORS origin the backend
+   was configured with. Pass the equivalent of Vite's --strictPort.
+
+2. Rewrite every pointer between services, not just the obvious one. A frontend often
+   holds two independent addresses for its backend -- one the browser uses and one the
+   dev-server proxy uses -- and each usually has a hardcoded fallback. Missing one is
+   invisible until an instance answers with another instance's data.
+
+## Worked example: Vite + FastAPI + MongoDB
+
+{}
+
+## Postgres and containerised stacks
+
+Not yet supported. Repos whose ports are baked into a compose file rather than passed on
+the command line, that need a database created per instance, or that run several
+repositories as one unit, need a treeish newer than this one. Run `treeish --version` and
+check the project for a release that lists them.
+"#,
+        MONDRIO_EXAMPLE
+    )
 }

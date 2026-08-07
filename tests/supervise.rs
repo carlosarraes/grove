@@ -106,16 +106,40 @@ fn a_running_service_reports_alive_and_a_stopped_one_does_not() {
     assert!(!supervise::is_alive(&handle), "should be stopped");
 }
 
-#[test]
-fn waiting_for_ready_returns_once_the_service_answers() {
+/// A stand-in service answering every request with `status`.
+///
+/// It reads the request before replying, and keeps listening rather than serving once.
+/// Both matter on macOS: closing a socket with the request still unread sends an RST, and
+/// the client sees a connection error where a response was written.
+fn serving(status: &str) -> u16 {
+    use std::io::{BufRead, BufReader};
+
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
+    let response = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+
     std::thread::spawn(move || {
-        for stream in listener.incoming().take(1) {
-            let mut stream = stream.expect("accept");
-            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+            let mut line = String::new();
+            while reader.read_line(&mut line).is_ok_and(|n| n > 0) {
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+                line.clear();
+            }
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
         }
     });
+
+    port
+}
+
+#[test]
+fn waiting_for_ready_returns_once_the_service_answers() {
+    let port = serving("200 OK");
 
     supervise::wait_ready(
         &format!("http://127.0.0.1:{port}/openapi.json"),
@@ -129,15 +153,7 @@ fn waiting_for_ready_returns_once_the_service_answers() {
 /// judge.
 #[test]
 fn an_error_status_still_counts_as_answering() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    std::thread::spawn(move || {
-        for stream in listener.incoming().take(1) {
-            let mut stream = stream.expect("accept");
-            let _ =
-                stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n");
-        }
-    });
+    let port = serving("503 Service Unavailable");
 
     supervise::wait_ready(
         &format!("http://127.0.0.1:{port}/health"),

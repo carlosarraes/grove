@@ -101,7 +101,10 @@ Any string value in [secrets.set], [[resource]].db_name, [[service]].command, an
   [[secrets]]        repeatable; one per env file
   from               path relative to the MAIN worktree -- where real secrets live
   into               path relative to THIS worktree -- where they are written
-  [secrets.set]      keys to override after copying; values are templates
+  [secrets.set]      keys to override after copying; values are templates.
+                     These are also exported into every service's environment, because
+                     code that reads the environment before its settings library loads
+                     the file would otherwise see the pre-instance value.
 
   [[resource]]       repeatable; a datastore shared across instances
   name               identifier

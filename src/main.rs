@@ -153,7 +153,7 @@ fn main() -> Result<()> {
             let status = std::process::Command::new(&argv[0])
                 .args(&argv[1..])
                 .current_dir(&cwd)
-                .envs(instance.environment())
+                .envs(instance.environment()?)
                 .status()
                 .with_context(|| format!("running `{}`", argv.join(" ")))?;
             std::process::exit(status.code().unwrap_or(1));

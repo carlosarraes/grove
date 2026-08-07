@@ -434,3 +434,50 @@ fn ls_answers_to_the_names_agents_actually_guess() {
 
     cli.run(&wt, &["down"]).success();
 }
+
+/// Reported from parallel QA: agents shared agent-browser's default session, so one
+/// agent's navigation stole another's tab — and the resulting WorkOS error page reads as
+/// an app bug in the wrong instance.
+#[test]
+fn run_isolates_the_browser_session_per_instance() {
+    let cli = Cli::new();
+    let wt = cli.worktree("mon_2695");
+    cli.run(&wt, &["up"]).success();
+
+    let out = cli
+        .run(
+            &wt,
+            &["run", "--", "sh", "-c", "echo $AGENT_BROWSER_SESSION"],
+        )
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(String::from_utf8_lossy(&out).trim(), "mon_2695");
+    cli.run(&wt, &["down"]).success();
+}
+
+/// Code that reads `os.environ` before its settings library loads the .env file sees the
+/// wrong value otherwise — mondrio logged "ENVIRONMENT not set, defaulting to production"
+/// while ENVIRONMENT=test sat on line 8 of the file treeish had just written.
+#[test]
+fn the_instance_overrides_are_in_the_environment_not_only_the_file() {
+    let cli = Cli::new();
+    let wt = cli.worktree("mon_2695");
+    cli.run(&wt, &["up"]).success();
+
+    let out = cli
+        .run(&wt, &["run", "--", "sh", "-c", "echo $INSTANCE:$API_URL"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let printed = String::from_utf8_lossy(&out).trim().to_string();
+    assert!(
+        printed.starts_with("mon_2695:http://localhost:"),
+        "{printed}"
+    );
+    cli.run(&wt, &["down"]).success();
+}

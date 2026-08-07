@@ -35,7 +35,13 @@ treeish run -- sh -c 'curl localhost:$TREEISH_PORT_BACKEND/health'
 ```
 
 `run` exports `TREEISH_PORT_<NAME>` for every declared port — the config's `web` becomes
-`TREEISH_PORT_WEB` — plus `TREEISH_SLUG`, `TREEISH_DB_NAME`, and `TREEISH_WORKTREE`.
+`TREEISH_PORT_WEB` — plus `TREEISH_SLUG`, `TREEISH_DB_NAME`, `TREEISH_WORKTREE`, and every
+per-instance override the config declares.
+
+It also sets `AGENT_BROWSER_SESSION` to this instance's slug, so browser automation run
+through `treeish run` gets its own session. Driving a browser outside `treeish run` shares
+one session across every instance on the machine, and a sibling's navigation will steal
+the tab — which then reads as an authentication bug in whichever instance was watching.
 
 Commands that read the worktree's own env files — the ordinary unit-test loop — work
 unwrapped, because `up` wrote those files to disk.

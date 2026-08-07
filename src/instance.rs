@@ -98,10 +98,14 @@ impl Instance {
         }
     }
 
-    /// The variables treeish itself exports, on top of whatever the rendered env files
-    /// carry. A command run through `treeish run` can address this instance without
-    /// having to read a file to find its ports.
-    pub fn environment(&self) -> BTreeMap<String, String> {
+    /// The environment a service or `treeish run` command receives.
+    ///
+    /// Beyond treeish's own variables this carries every `[secrets.set]` override, because
+    /// writing them to a file is not enough: code that reads the process environment
+    /// before its settings library loads the file sees the wrong value and says so
+    /// confusingly — a backend logging "ENVIRONMENT not set, defaulting to production"
+    /// with `ENVIRONMENT=test` sitting in the file treeish just wrote.
+    pub fn environment(&self) -> Result<BTreeMap<String, String>> {
         let mut env = BTreeMap::from([
             ("TREEISH_SLUG".to_string(), self.resolved.slug.clone()),
             (
@@ -118,7 +122,38 @@ impl Instance {
         if let Some(db) = &self.entry.db_name {
             env.insert("TREEISH_DB_NAME".to_string(), db.clone());
         }
-        env
+
+        // Browser automation defaults to one shared session per machine, so parallel
+        // instances steal each other's tab — and the resulting error page looks like a
+        // bug in whichever instance was watching. An explicit setting still wins.
+        if std::env::var_os("AGENT_BROWSER_SESSION").is_none() {
+            env.insert(
+                "AGENT_BROWSER_SESSION".to_string(),
+                self.resolved.slug.clone(),
+            );
+        }
+
+        let context = self.render_context();
+        for secrets in &self.config.secrets {
+            for (key, template) in &secrets.set {
+                let value = render::value(template, &context)
+                    .with_context(|| format!("rendering {key} for the environment"))?;
+                // Two files setting one key to different values is ambiguous, and picking
+                // silently would hand a service the wrong one.
+                if let Some(existing) = env.get(key)
+                    && existing != &value
+                {
+                    bail!(
+                        "{key} is set to two different values by different [[secrets]] \
+                         blocks ({existing:?} and {value:?}); give them distinct names or \
+                         the same value"
+                    );
+                }
+                env.insert(key.clone(), value);
+            }
+        }
+
+        Ok(env)
     }
 
     /// Resolve `db_name` from the first resource that declares one, then write every env
@@ -193,7 +228,8 @@ impl Instance {
 
             let command = render::value(&service.command, &context)
                 .with_context(|| format!("rendering the command for {}", service.name))?;
-            let handle = supervise::spawn(&command, &cwd, &self.environment(), &log)?;
+            let environment = self.environment()?;
+            let handle = supervise::spawn(&command, &cwd, &environment, &log)?;
             self.entry.services.insert(service.name.clone(), handle);
             self.registry.record(&self.entry)?;
 

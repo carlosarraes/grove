@@ -424,10 +424,13 @@ fn ls_reports_a_stopped_instance_as_stopped() {
 fn ls_answers_to_the_names_agents_actually_guess() {
     let cli = Cli::new();
     let wt = cli.worktree("mon_2695");
+    cli.run(&wt, &["up"]).success();
 
     for name in ["ls", "list", "instances"] {
         cli.run(&wt, &[name])
             .success()
             .stdout(predicates::str::contains("mon_2695"));
     }
+
+    cli.run(&wt, &["down"]).success();
 }

@@ -37,6 +37,7 @@ enum Command {
         json: bool,
     },
     /// Every instance on this machine
+    #[command(visible_alias = "list", alias = "instances")]
     Ls,
     /// Run a command with this instance's environment exported
     Run {

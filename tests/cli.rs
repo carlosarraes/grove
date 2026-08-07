@@ -417,3 +417,17 @@ fn ls_reports_a_stopped_instance_as_stopped() {
         "the instance should still be listed, but as stopped: {stopped}"
     );
 }
+
+/// Two agents independently guessed `treeish list` and `treeish instances` and got an
+/// error before recovering. The names cost nothing to accept.
+#[test]
+fn ls_answers_to_the_names_agents_actually_guess() {
+    let cli = Cli::new();
+    let wt = cli.worktree("mon_2695");
+
+    for name in ["ls", "list", "instances"] {
+        cli.run(&wt, &[name])
+            .success()
+            .stdout(predicates::str::contains("mon_2695"));
+    }
+}

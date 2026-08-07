@@ -85,6 +85,9 @@ fn main() -> Result<()> {
             if !allow_main {
                 instance.refuse_in_main()?;
             }
+            for started in instance.resources()? {
+                eprintln!("started shared {started}");
+            }
             instance.render()?;
             instance.up(fresh)?;
             print_summary(&instance);
@@ -94,6 +97,12 @@ fn main() -> Result<()> {
             let mut instance = Instance::open(&cwd)?;
             instance.down()?;
             if purge {
+                // Report a failed drop without failing `down` — the services really did
+                // stop, and a leftover database is a smaller problem than a command that
+                // looks like it did nothing.
+                if let Err(e) = instance.purge_database() {
+                    eprintln!("{e:#}");
+                }
                 instance.release()?;
             }
             println!("stopped {}", instance.resolved.slug);

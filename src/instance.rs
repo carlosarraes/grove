@@ -145,6 +145,28 @@ impl Instance {
         render::all(&self.config, &self.resolved, &self.render_context())
     }
 
+    /// Bring up every declared datastore, reusing anything already answering on its port.
+    pub fn resources(&self) -> Result<Vec<String>> {
+        let mut started = Vec::new();
+        for resource in &self.config.resources {
+            if crate::resource::ensure(resource)? {
+                started.push(resource.name.clone());
+            }
+        }
+        Ok(started)
+    }
+
+    /// Drop this instance's database. Best effort: see `resource::drop_database`.
+    pub fn purge_database(&self) -> Result<()> {
+        let Some(database) = &self.entry.db_name else {
+            return Ok(());
+        };
+        let Some(resource) = self.config.resources.iter().find(|r| r.db_name.is_some()) else {
+            return Ok(());
+        };
+        crate::resource::drop_database(resource, database)
+    }
+
     /// Start every service that is not already running, waiting for each readiness probe.
     pub fn up(&mut self, fresh: bool) -> Result<()> {
         let context = self.render_context();

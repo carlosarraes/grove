@@ -5,4 +5,5 @@ pub mod ports;
 pub mod registry;
 pub mod render;
 pub mod resolve;
+pub mod resource;
 pub mod supervise;

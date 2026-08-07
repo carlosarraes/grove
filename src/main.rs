@@ -178,7 +178,15 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Some(Command::Doctor) => bail!("not implemented yet"),
+        Some(Command::Doctor) => {
+            let instance = Instance::open(&cwd)?;
+            let verdicts = treeish::doctor::check(&instance);
+            if treeish::doctor::report(&verdicts)? {
+                Ok(())
+            } else {
+                std::process::exit(1);
+            }
+        }
         Some(Command::Skill { action: _ }) => bail!("not implemented yet"),
     }
 }

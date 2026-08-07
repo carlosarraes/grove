@@ -235,6 +235,69 @@ fn an_unconfigured_repo_points_the_agent_at_the_schema() {
 }
 
 #[test]
+fn doctor_passes_in_a_worktree_that_is_ready_to_start() {
+    let cli = Cli::new();
+    let wt = cli.fx.add_worktree("mon_2695");
+
+    let out = cli
+        .run(&wt, &["doctor"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&out).into_owned();
+
+    assert!(stdout.contains("backend/.env.local"), "{stdout}");
+    assert!(stdout.contains("mon_2695"), "{stdout}");
+}
+
+/// The failure treeish exists to prevent, reported before anything is started.
+#[test]
+fn doctor_names_the_env_file_missing_from_the_main_checkout() {
+    let cli = Cli::new();
+    std::fs::remove_file(cli.fx.main.join("backend/.env.local")).expect("remove");
+    let wt = cli.fx.add_worktree("mon_2695");
+
+    let assert = cli.run(&wt, &["doctor"]).failure();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+
+    assert!(stdout.contains("backend/.env.local"), "{stdout}");
+    assert!(
+        stdout.contains(&cli.fx.main.display().to_string()),
+        "must point at the main checkout, where the fix belongs: {stdout}"
+    );
+}
+
+#[test]
+fn doctor_in_an_unconfigured_repo_points_at_the_schema() {
+    let cli = Cli::new();
+    let wt = cli.fx.add_worktree("mon_2695");
+    std::fs::remove_file(wt.join(".treeish.toml")).expect("remove config");
+
+    let assert = cli.run(&wt, &["doctor"]).failure();
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&assert.get_output().stdout),
+        String::from_utf8_lossy(&assert.get_output().stderr)
+    );
+    assert!(combined.contains("treeish --llm"), "{combined}");
+}
+
+#[test]
+fn doctor_warns_that_the_main_worktree_cannot_be_started() {
+    let cli = Cli::new();
+
+    let assert = cli.run(&cli.fx.main, &["doctor"]).failure();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+
+    assert!(
+        stdout.contains("main worktree"),
+        "must explain why this directory cannot host an instance: {stdout}"
+    );
+}
+
+#[test]
 fn ls_lists_every_running_instance() {
     let cli = Cli::new();
     let a = cli.fx.add_worktree("mon_2694");

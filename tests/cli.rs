@@ -30,6 +30,23 @@ ready = { http = "http://127.0.0.1:{{ port.web }}/", timeout = "30s" }
 struct Cli {
     state: TempDir,
     fx: Fixture,
+    started: std::cell::RefCell<Vec<std::path::PathBuf>>,
+}
+
+/// Stop whatever this test started, however the test ended. A `down` at the end of the
+/// body is skipped by a panic, and the leaked server goes on holding its port — so a
+/// single red test poisons every run after it.
+impl Drop for Cli {
+    fn drop(&mut self) {
+        for worktree in self.started.borrow().iter() {
+            let _ = Command::cargo_bin("treeish")
+                .expect("binary")
+                .current_dir(worktree)
+                .env("TREEISH_STATE_DIR", self.state.path())
+                .arg("down")
+                .output();
+        }
+    }
 }
 
 impl Cli {
@@ -51,7 +68,15 @@ impl Cli {
         Cli {
             state: TempDir::new().expect("tempdir"),
             fx,
+            started: std::cell::RefCell::new(Vec::new()),
         }
+    }
+
+    /// A worktree whose services this harness is responsible for stopping.
+    fn worktree(&self, slug: &str) -> std::path::PathBuf {
+        let path = self.fx.add_worktree(slug);
+        self.started.borrow_mut().push(path.clone());
+        path
     }
 
     fn run(&self, cwd: &Path, args: &[&str]) -> assert_cmd::assert::Assert {
@@ -69,7 +94,7 @@ impl Cli {
 #[test]
 fn up_starts_an_instance_in_a_worktree_that_had_nothing() {
     let cli = Cli::new();
-    let wt = cli.fx.add_worktree("mon_2695");
+    let wt = cli.worktree("mon_2695");
     assert!(!wt.join("backend/.env.local").exists(), "precondition");
 
     let out = cli.run(&wt, &["up"]).success().get_output().stdout.clone();
@@ -102,8 +127,8 @@ fn up_starts_an_instance_in_a_worktree_that_had_nothing() {
 #[test]
 fn two_worktrees_run_at_once_without_touching_each_other() {
     let cli = Cli::new();
-    let a = cli.fx.add_worktree("mon_2694");
-    let b = cli.fx.add_worktree("mon_2695");
+    let a = cli.worktree("mon_2694");
+    let b = cli.worktree("mon_2695");
 
     cli.run(&a, &["up"]).success();
     cli.run(&b, &["up"]).success();
@@ -137,7 +162,7 @@ fn two_worktrees_run_at_once_without_touching_each_other() {
 #[test]
 fn down_stops_a_service_started_by_an_earlier_invocation() {
     let cli = Cli::new();
-    let wt = cli.fx.add_worktree("mon_2695");
+    let wt = cli.worktree("mon_2695");
     cli.run(&wt, &["up"]).success();
     let port: u16 = std::fs::read_to_string(wt.join("backend/.env.local"))
         .expect("env")
@@ -161,7 +186,7 @@ fn down_stops_a_service_started_by_an_earlier_invocation() {
 #[test]
 fn status_reports_the_ports_as_json_for_agents() {
     let cli = Cli::new();
-    let wt = cli.fx.add_worktree("mon_2695");
+    let wt = cli.worktree("mon_2695");
     cli.run(&wt, &["up"]).success();
 
     let out = cli
@@ -183,7 +208,7 @@ fn status_reports_the_ports_as_json_for_agents() {
 #[test]
 fn logs_show_what_the_service_printed() {
     let cli = Cli::new();
-    let wt = cli.fx.add_worktree("mon_2695");
+    let wt = cli.worktree("mon_2695");
     cli.run(&wt, &["up"]).success();
 
     let out = cli
@@ -225,7 +250,7 @@ fn up_refuses_to_run_in_the_main_worktree() {
 #[test]
 fn an_unconfigured_repo_points_the_agent_at_the_schema() {
     let cli = Cli::new();
-    let wt = cli.fx.add_worktree("mon_2695");
+    let wt = cli.worktree("mon_2695");
     std::fs::remove_file(wt.join(".treeish.toml")).expect("remove config");
 
     let assert = cli.run(&wt, &["up"]).failure();
@@ -237,7 +262,7 @@ fn an_unconfigured_repo_points_the_agent_at_the_schema() {
 #[test]
 fn doctor_passes_in_a_worktree_that_is_ready_to_start() {
     let cli = Cli::new();
-    let wt = cli.fx.add_worktree("mon_2695");
+    let wt = cli.worktree("mon_2695");
 
     let out = cli
         .run(&wt, &["doctor"])
@@ -256,7 +281,7 @@ fn doctor_passes_in_a_worktree_that_is_ready_to_start() {
 fn doctor_names_the_env_file_missing_from_the_main_checkout() {
     let cli = Cli::new();
     std::fs::remove_file(cli.fx.main.join("backend/.env.local")).expect("remove");
-    let wt = cli.fx.add_worktree("mon_2695");
+    let wt = cli.worktree("mon_2695");
 
     let assert = cli.run(&wt, &["doctor"]).failure();
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
@@ -271,7 +296,7 @@ fn doctor_names_the_env_file_missing_from_the_main_checkout() {
 #[test]
 fn doctor_in_an_unconfigured_repo_points_at_the_schema() {
     let cli = Cli::new();
-    let wt = cli.fx.add_worktree("mon_2695");
+    let wt = cli.worktree("mon_2695");
     std::fs::remove_file(wt.join(".treeish.toml")).expect("remove config");
 
     let assert = cli.run(&wt, &["doctor"]).failure();
@@ -300,8 +325,8 @@ fn doctor_warns_that_the_main_worktree_cannot_be_started() {
 #[test]
 fn ls_lists_every_running_instance() {
     let cli = Cli::new();
-    let a = cli.fx.add_worktree("mon_2694");
-    let b = cli.fx.add_worktree("mon_2695");
+    let a = cli.worktree("mon_2694");
+    let b = cli.worktree("mon_2695");
     cli.run(&a, &["up"]).success();
     cli.run(&b, &["up"]).success();
 
@@ -318,7 +343,7 @@ fn ls_lists_every_running_instance() {
 #[test]
 fn run_executes_a_command_with_the_instance_environment() {
     let cli = Cli::new();
-    let wt = cli.fx.add_worktree("mon_2695");
+    let wt = cli.worktree("mon_2695");
     cli.run(&wt, &["up"]).success();
 
     let out = cli

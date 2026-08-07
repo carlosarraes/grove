@@ -1,7 +1,7 @@
 //! Port allocation: every instance gets a contiguous block nobody else holds.
 
 use anyhow::{Result, bail};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::net::TcpListener;
 use std::ops::Range;
 
@@ -14,6 +14,17 @@ pub const RANGE: Range<u16> = 20000..30000;
 const STRIDE: u16 = 10;
 
 pub fn allocate(repo_key: &str, slug: &str, names: &[String]) -> Result<BTreeMap<String, u16>> {
+    allocate_avoiding(repo_key, slug, names, &HashSet::new())
+}
+
+/// `taken` carries ports the registry has promised to other instances. They may not be
+/// listening yet, so a bind test alone would call them free and hand out a duplicate.
+pub fn allocate_avoiding(
+    repo_key: &str,
+    slug: &str,
+    names: &[String],
+    taken: &HashSet<u16>,
+) -> Result<BTreeMap<String, u16>> {
     if names.is_empty() {
         return Ok(BTreeMap::new());
     }
@@ -39,7 +50,10 @@ pub fn allocate(repo_key: &str, slug: &str, names: &[String]) -> Result<BTreeMap
             .map(|(i, n)| (n.clone(), base + i as u16))
             .collect();
 
-        if candidate.values().all(|p| is_free(*p)) {
+        if candidate
+            .values()
+            .all(|p| !taken.contains(p) && is_free(*p))
+        {
             return Ok(candidate);
         }
     }

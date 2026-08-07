@@ -125,17 +125,25 @@ fn main() -> Result<()> {
                 println!("no instances");
             }
             for entry in entries {
+                // Ask the processes, not the record. A recorded pid says only that a
+                // service was started once; reading that as "up" turns a stopped
+                // instance into an apparent port conflict.
+                let live = entry
+                    .services
+                    .values()
+                    .filter(|h| treeish::supervise::is_alive(h))
+                    .count();
+                let state = if live > 0 {
+                    format!("running ({live})")
+                } else {
+                    "stopped".to_string()
+                };
                 let ports: Vec<String> = entry
                     .ports
                     .iter()
                     .map(|(n, p)| format!("{n}={p}"))
                     .collect();
-                println!(
-                    "{:<28} {:<10} {}",
-                    entry.slug,
-                    format!("{} up", entry.services.len()),
-                    ports.join(" ")
-                );
+                println!("{:<28} {:<13} {}", entry.slug, state, ports.join(" "));
             }
             Ok(())
         }

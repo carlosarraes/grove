@@ -219,18 +219,32 @@ impl Instance {
         if marker.exists() {
             return Ok(());
         }
-        eprintln!("first run in this worktree — {name}: {setup}");
         std::fs::create_dir_all(self.instance_dir())?;
+        eprintln!("{name}: installing dependencies ({setup})");
+
+        // Setup output goes to the service log rather than the terminal. `npm ci` and
+        // `uv sync` between them emit hundreds of lines, and the port summary printed
+        // afterwards is the one thing the caller actually needs to read.
+        let sink = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+            .with_context(|| format!("opening {}", log.display()))?;
+        let errors = sink.try_clone().context("duplicating the log handle")?;
 
         let status = std::process::Command::new("sh")
             .arg("-c")
             .arg(setup)
             .current_dir(cwd)
+            .stdout(std::process::Stdio::from(sink))
+            .stderr(std::process::Stdio::from(errors))
             .status()
             .with_context(|| format!("running setup for {name}: {setup}"))?;
         if !status.success() {
             bail!(
-                "setup for {name} failed: {setup}\n{}",
+                "setup for {name} failed: {setup}\n\
+                 full output in {}\n{}",
+                log.display(),
                 tail(log, 30).unwrap_or_default()
             );
         }

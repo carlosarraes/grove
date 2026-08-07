@@ -389,3 +389,31 @@ fn skill_install_writes_a_skill_agents_can_load() {
         "the skill must point at the schema rather than restate it"
     );
 }
+
+/// Reported from real use: after `down`, `ls` still described the instance as up, which
+/// reads as a phantom port conflict when you are deciding whether a port is free.
+#[test]
+fn ls_reports_a_stopped_instance_as_stopped() {
+    let cli = Cli::new();
+    let wt = cli.worktree("mon_2695");
+    cli.run(&wt, &["up"]).success();
+
+    let running =
+        String::from_utf8_lossy(&cli.run(&wt, &["ls"]).success().get_output().stdout.clone())
+            .into_owned();
+    assert!(running.contains("running"), "while up: {running}");
+
+    cli.run(&wt, &["down"]).success();
+
+    let stopped =
+        String::from_utf8_lossy(&cli.run(&wt, &["ls"]).success().get_output().stdout.clone())
+            .into_owned();
+    assert!(
+        !stopped.contains("running"),
+        "after down, nothing is listening — ls must not claim otherwise: {stopped}"
+    );
+    assert!(
+        stopped.contains("stopped"),
+        "the instance should still be listed, but as stopped: {stopped}"
+    );
+}

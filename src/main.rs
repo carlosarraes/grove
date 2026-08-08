@@ -50,6 +50,8 @@ enum Command {
         #[arg(short, long)]
         follow: bool,
     },
+    /// Stop and forget instances whose worktree no longer exists
+    Prune,
     /// Populate this instance's datastore from the config's [[seed]] blocks
     Seed {
         /// Re-run seeds that already ran for this instance
@@ -128,12 +130,14 @@ fn main() -> Result<()> {
         }
         Some(Command::Ls) => {
             let registry = grove::instance::registry()?;
-            registry.reap()?;
+            // Listing is a read. Reaping here would discard a deleted worktree's pids
+            // without stopping its services, leaving processes grove can never reach.
             let entries = registry.list()?;
             if entries.is_empty() {
                 println!("no instances");
             }
-            for entry in entries {
+            let orphans = entries.iter().filter(|e| !e.worktree.exists()).count();
+            for entry in &entries {
                 // Ask the processes, not the record. A recorded pid says only that a
                 // service was started once; reading that as "up" turns a stopped
                 // instance into an apparent port conflict.
@@ -142,7 +146,9 @@ fn main() -> Result<()> {
                     .values()
                     .filter(|h| grove::supervise::is_alive(h))
                     .count();
-                let state = if live > 0 {
+                let state = if !entry.worktree.exists() {
+                    format!("orphaned ({live})")
+                } else if live > 0 {
                     format!("running ({live})")
                 } else {
                     "stopped".to_string()
@@ -153,6 +159,11 @@ fn main() -> Result<()> {
                     .map(|(n, p)| format!("{n}={p}"))
                     .collect();
                 println!("{:<28} {:<13} {}", entry.slug, state, ports.join(" "));
+            }
+            if orphans > 0 {
+                println!(
+                    "\n{orphans} orphaned — their worktree is gone. `grove prune` stops them."
+                );
             }
             Ok(())
         }
@@ -192,6 +203,32 @@ fn main() -> Result<()> {
                     bail!("{name} has no log yet at {}", path.display())
                 }
                 Err(e) => return Err(e).context("reading the log"),
+            }
+            Ok(())
+        }
+        Some(Command::Prune) => {
+            let registry = grove::instance::registry()?;
+            // Stop the services before dropping the entry: once it is gone the pids go
+            // with it, and nothing can reach those processes again.
+            let orphans = registry.reap()?;
+            if orphans.is_empty() {
+                println!("nothing to reclaim");
+            }
+            for orphan in orphans {
+                for handle in orphan.services.values() {
+                    grove::supervise::stop(handle)?;
+                }
+                let ports: Vec<String> = orphan
+                    .ports
+                    .iter()
+                    .map(|(n, p)| format!("{n}={p}"))
+                    .collect();
+                println!("reclaimed {:<28} {}", orphan.slug, ports.join(" "));
+                // The worktree is gone, and with it the config saying how to reach the
+                // datastore — so name the database rather than pretend we can drop it.
+                if let Some(database) = &orphan.db_name {
+                    println!("  database {database} left in place");
+                }
             }
             Ok(())
         }

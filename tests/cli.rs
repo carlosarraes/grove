@@ -603,3 +603,109 @@ fn seed_force_reruns_without_reinstalling_anything() {
 
     cli.run(&wt, &["down"]).success();
 }
+
+/// A deleted worktree cannot be `cd`-ed into, so `down` can never reach it — its services
+/// keep running and its ports stay reserved with nothing left to release them.
+#[test]
+fn prune_reclaims_instances_whose_worktree_is_gone() {
+    let cli = Cli::new();
+    let doomed = cli.worktree("mon_2694");
+    let alive = cli.worktree("mon_2695");
+    cli.run(&doomed, &["up"]).success();
+    cli.run(&alive, &["up"]).success();
+
+    let port_of = |wt: &Path| -> u16 {
+        std::fs::read_to_string(wt.join("backend/.env.local"))
+            .expect("env")
+            .lines()
+            .find_map(|l| l.strip_prefix("API_URL=http://localhost:"))
+            .expect("API_URL")
+            .parse()
+            .expect("port")
+    };
+    let (gone_port, kept_port) = (port_of(&doomed), port_of(&alive));
+
+    std::fs::remove_dir_all(&doomed).expect("delete the worktree");
+    let out = cli
+        .run(&alive, &["prune"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&out).into_owned();
+
+    assert!(
+        stdout.contains("mon_2694"),
+        "must name what it reclaimed: {stdout}"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    assert!(
+        ureq::get(format!("http://127.0.0.1:{gone_port}/"))
+            .call()
+            .is_err(),
+        "the orphan's service is still listening on {gone_port}"
+    );
+    assert!(
+        ureq::get(format!("http://127.0.0.1:{kept_port}/"))
+            .call()
+            .is_ok(),
+        "prune stopped a live instance"
+    );
+
+    let listed = String::from_utf8_lossy(
+        &cli.run(&alive, &["ls"])
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .into_owned();
+    assert!(!listed.contains("mon_2694"), "{listed}");
+    assert!(listed.contains("mon_2695"), "{listed}");
+
+    cli.run(&alive, &["down"]).success();
+}
+
+#[test]
+fn prune_says_so_when_there_is_nothing_to_reclaim() {
+    let cli = Cli::new();
+    let wt = cli.worktree("mon_2695");
+
+    cli.run(&wt, &["prune"])
+        .success()
+        .stdout(predicates::str::contains("nothing"));
+}
+
+/// `ls` used to reap, which discarded the pids of a deleted worktree's services without
+/// stopping them — leaving processes on the machine that grove could never reach again.
+/// Listing is a read; reclaiming belongs to `prune`.
+#[test]
+fn ls_reports_an_orphan_rather_than_quietly_forgetting_it() {
+    let cli = Cli::new();
+    let doomed = cli.worktree("mon_2694");
+    cli.run(&doomed, &["up"]).success();
+    std::fs::remove_dir_all(&doomed).expect("delete the worktree");
+
+    let listed = String::from_utf8_lossy(
+        &cli.run(&cli.fx.main, &["ls"])
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .into_owned();
+
+    assert!(
+        listed.contains("mon_2694"),
+        "the instance must stay listed until something stops it: {listed}"
+    );
+    assert!(
+        listed.contains("orphan"),
+        "and be marked so the state is obvious: {listed}"
+    );
+
+    // Still reclaimable, which is the whole point of not having forgotten it.
+    cli.run(&cli.fx.main, &["prune"])
+        .success()
+        .stdout(predicates::str::contains("mon_2694"));
+}

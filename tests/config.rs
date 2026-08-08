@@ -97,3 +97,32 @@ names = ["my-port"]
     let msg = format!("{err:#}");
     assert!(msg.contains("my-port"), "should name the offender: {msg}");
 }
+
+#[test]
+fn seeds_declare_a_command_and_an_optional_guard() {
+    let c = config::parse(
+        r#"
+version = 1
+
+[[seed]]
+name = "org"
+cwd = "backend"
+command = "uv run python -m tests.e2e_harness.seed"
+
+[[seed]]
+name = "propositions"
+cwd = "backend"
+if_exists = "fixtures/propositions.archive"
+command = "mongorestore --db {{ db.name }} fixtures/propositions.archive"
+"#,
+    )
+    .expect("parse");
+
+    assert_eq!(c.seeds.len(), 2);
+    assert_eq!(c.seeds[0].name, "org");
+    assert!(c.seeds[0].if_exists.is_none());
+    assert_eq!(
+        c.seeds[1].if_exists.as_deref(),
+        Some("fixtures/propositions.archive")
+    );
+}

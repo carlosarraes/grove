@@ -19,6 +19,24 @@ pub struct Config {
     pub resources: Vec<Resource>,
     #[serde(default, rename = "service")]
     pub services: Vec<Service>,
+    #[serde(default, rename = "seed")]
+    pub seeds: Vec<Seed>,
+}
+
+/// Data an instance needs before it is useful — the organisation row a guarded route
+/// looks up, a fixture dump. Distinct from a service's `setup`, which installs
+/// dependencies: these have different failure modes and different reasons to re-run.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Seed {
+    pub name: String,
+    /// Working directory, relative to the worktree root.
+    pub cwd: Option<String>,
+    pub command: String,
+    /// Skip unless this path exists, relative to `cwd`. For fixtures that may not be
+    /// present — an LFS dump nobody has pulled should mean "no sample data", not a
+    /// failed `up`.
+    pub if_exists: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

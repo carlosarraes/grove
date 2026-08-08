@@ -23,6 +23,20 @@ pub struct ServiceStatus {
     pub running: bool,
 }
 
+pub enum SeedOutcome {
+    Ran { name: String },
+    Skipped { name: String, why: String },
+}
+
+impl std::fmt::Display for SeedOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SeedOutcome::Ran { name } => write!(f, "seed {name} ... ok"),
+            SeedOutcome::Skipped { name, why } => write!(f, "seed {name} ... skipped ({why})"),
+        }
+    }
+}
+
 /// Where grove keeps the registry and per-service logs. `GROVE_STATE_DIR` overrides
 /// it, which is what lets the test suite run instances without touching real state.
 pub fn state_dir() -> Result<PathBuf> {
@@ -202,8 +216,93 @@ impl Instance {
         crate::resource::drop_database(resource, database)
     }
 
+    /// Populate this instance's datastore. Each seed runs once per worktree unless
+    /// `force`, and reports what it did — a seed that silently skipped is how you end up
+    /// debugging a 403 that names authentication rather than missing data.
+    pub fn seed(&self, force: bool) -> Result<Vec<SeedOutcome>> {
+        let mut outcomes = Vec::new();
+        let environment = self.environment()?;
+
+        for seed in &self.config.seeds {
+            let cwd = match &seed.cwd {
+                Some(dir) => self.resolved.worktree.join(dir),
+                None => self.resolved.worktree.clone(),
+            };
+
+            if let Some(guard) = &seed.if_exists
+                && !cwd.join(guard).exists()
+            {
+                outcomes.push(SeedOutcome::Skipped {
+                    name: seed.name.clone(),
+                    why: format!("{guard} not present"),
+                });
+                continue;
+            }
+
+            let marker = self.instance_dir().join(format!(".seed-{}", seed.name));
+            if marker.exists() && !force {
+                outcomes.push(SeedOutcome::Skipped {
+                    name: seed.name.clone(),
+                    why: "already seeded".to_string(),
+                });
+                continue;
+            }
+
+            std::fs::create_dir_all(self.instance_dir())?;
+            let log = self.instance_dir().join(format!("seed-{}.log", seed.name));
+            let sink = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log)
+                .with_context(|| format!("opening {}", log.display()))?;
+            let errors = sink.try_clone().context("duplicating the log handle")?;
+
+            let command = render::value(&seed.command, &self.render_context())
+                .with_context(|| format!("rendering the command for seed {}", seed.name))?;
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .current_dir(&cwd)
+                .envs(&environment)
+                .stdout(std::process::Stdio::from(sink))
+                .stderr(std::process::Stdio::from(errors))
+                .status()
+                .with_context(|| format!("running seed {}: {command}", seed.name))?;
+
+            if !status.success() {
+                bail!(
+                    "seed {} failed: {command}\nfull output in {}\n{}",
+                    seed.name,
+                    log.display(),
+                    tail(&log, 30).unwrap_or_default()
+                );
+            }
+            std::fs::write(&marker, &command)?;
+            outcomes.push(SeedOutcome::Ran {
+                name: seed.name.clone(),
+            });
+        }
+
+        Ok(outcomes)
+    }
+
     /// Start every service that is not already running, waiting for each readiness probe.
-    pub fn up(&mut self, fresh: bool) -> Result<()> {
+    ///
+    /// Dependencies first, then seeds, then the services — a seed that writes straight to
+    /// the datastore needs the dependencies but not a listening server.
+    pub fn up(&mut self, fresh: bool) -> Result<Vec<SeedOutcome>> {
+        for service in &self.config.services {
+            if let Some(setup) = &service.setup {
+                let cwd = match &service.cwd {
+                    Some(dir) => self.resolved.worktree.join(dir),
+                    None => self.resolved.worktree.clone(),
+                };
+                let log = self.instance_dir().join(format!("{}.log", service.name));
+                self.run_setup(&service.name, setup, &cwd, &log)?;
+            }
+        }
+        let seeded = self.seed(false)?;
+
         let context = self.render_context();
 
         for service in &self.config.services {
@@ -221,10 +320,6 @@ impl Instance {
                 None => self.resolved.worktree.clone(),
             };
             let log = self.instance_dir().join(format!("{}.log", service.name));
-
-            if let Some(setup) = &service.setup {
-                self.run_setup(&service.name, setup, &cwd, &log)?;
-            }
 
             let command = render::value(&service.command, &context)
                 .with_context(|| format!("rendering the command for {}", service.name))?;
@@ -246,7 +341,7 @@ impl Instance {
             }
         }
 
-        Ok(())
+        Ok(seeded)
     }
 
     /// Dependency installs run once per worktree, tracked by a marker beside the logs.

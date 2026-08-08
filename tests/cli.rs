@@ -51,6 +51,10 @@ impl Drop for Cli {
 
 impl Cli {
     fn new() -> Self {
+        Cli::with_config(CONFIG)
+    }
+
+    fn with_config(config: &str) -> Self {
         let fx = Fixture::new();
         std::fs::create_dir_all(fx.main.join("backend")).expect("mkdir");
         std::fs::write(
@@ -58,7 +62,7 @@ impl Cli {
             "WORKOS__API_KEY=sk_live\nAPI_URL=http://localhost:8000\n",
         )
         .expect("main env");
-        std::fs::write(fx.main.join(".grove.toml"), CONFIG).expect("config");
+        std::fs::write(fx.main.join(".grove.toml"), config).expect("config");
         // Gitignored, exactly as in a real repo — which is the whole reason a worktree
         // arrives without it. Committing it here would make every test a no-op.
         std::fs::write(fx.main.join(".gitignore"), ".env.local\n").expect("gitignore");
@@ -512,4 +516,90 @@ fn skill_install_removes_the_skill_from_the_old_name() {
         String::from_utf8_lossy(&out).contains("treeish"),
         "say what was removed rather than deleting silently"
     );
+}
+
+/// Every agent in a parallel batch hit `403 organization_not_found` and wrote its own
+/// seed script, because a fresh per-instance database has no organisation row. Seeding
+/// belongs to the instance, once, declared in the config.
+const SEEDED_CONFIG: &str = r#"
+version = 1
+
+[ports]
+names = ["web"]
+
+[[secrets]]
+from = "backend/.env.local"
+into = "backend/.env.local"
+
+[secrets.set]
+API_URL = "http://localhost:{{ port.web }}"
+
+[[seed]]
+name = "org"
+command = "echo $GROVE_SLUG >> seeded.log"
+
+[[seed]]
+name = "fixture"
+if_exists = "fixtures/absent.archive"
+command = "echo ran >> fixture.log"
+
+[[service]]
+name = "web"
+command = "python3 -u -m http.server {{ port.web }}"
+ready = { http = "http://127.0.0.1:{{ port.web }}/", timeout = "30s" }
+"#;
+
+#[test]
+fn seeds_run_once_per_instance_and_skip_when_their_fixture_is_absent() {
+    let cli = Cli::with_config(SEEDED_CONFIG);
+    let wt = cli.worktree("mon_2695");
+
+    cli.run(&wt, &["up"]).success();
+    let seeded = wt.join("seeded.log");
+    assert_eq!(
+        std::fs::read_to_string(&seeded).expect("seed must have run"),
+        "mon_2695\n",
+        "the seed runs with the instance environment"
+    );
+    assert!(
+        !wt.join("fixture.log").exists(),
+        "a seed guarded by a missing path must be skipped, not run"
+    );
+
+    // A second `up` must not re-seed; that is the difference between provisioning and
+    // a command you run every time.
+    cli.run(&wt, &["up"]).success();
+    assert_eq!(
+        std::fs::read_to_string(&seeded).expect("read"),
+        "mon_2695\n"
+    );
+
+    cli.run(&wt, &["down"]).success();
+}
+
+#[test]
+fn seed_force_reruns_without_reinstalling_anything() {
+    let cli = Cli::with_config(SEEDED_CONFIG);
+    let wt = cli.worktree("mon_2695");
+    cli.run(&wt, &["up"]).success();
+
+    let out = cli
+        .run(&wt, &["seed", "--force"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(
+        std::fs::read_to_string(wt.join("seeded.log")).expect("read"),
+        "mon_2695\nmon_2695\n"
+    );
+    let stdout = String::from_utf8_lossy(&out).into_owned();
+    assert!(stdout.contains("org"), "{stdout}");
+    assert!(
+        stdout.contains("skipped"),
+        "the guarded seed should say why it did nothing: {stdout}"
+    );
+
+    cli.run(&wt, &["down"]).success();
 }

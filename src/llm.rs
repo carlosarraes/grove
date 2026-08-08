@@ -66,6 +66,14 @@ cwd = "frontend"
 setup = "npm install"
 command = "npm run dev -- --port {{ port.frontend }} --strictPort"
 ready = { http = "http://localhost:{{ port.frontend }}/", timeout = "180s" }
+
+# A fresh per-instance database has no organisation row, so every org-guarded route
+# answers 403 -- and the error names authentication, not missing data, which sends you
+# looking in the wrong place. Seed it once, here, rather than in six agents' prompts.
+[[seed]]
+name = "org"
+cwd = "backend"
+command = "uv run python -m tests.e2e_harness.seed"
 "#;
 
 pub fn reference() -> String {
@@ -114,6 +122,13 @@ Any string value in [secrets.set], [[resource]].db_name, [[service]].command, an
   port               port to probe, and to publish if grove starts it
   init               one-time command against a freshly started resource
   db_name            per-instance database name; a template
+
+  [[seed]]           repeatable; data the instance needs before it is useful
+  name               identifier, also the marker and log file name
+  cwd                working directory relative to the worktree root
+  command            run once per instance, after dependencies, before services
+  if_exists          skip unless this path exists, relative to cwd -- for a fixture
+                     that may not have been fetched
 
   [[service]]        repeatable; a long-running process
   name               identifier, also the log file name

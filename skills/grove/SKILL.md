@@ -49,6 +49,21 @@ unwrapped, because `up` wrote those files to disk.
 `grove status` shows what is running now, and `--json` makes it parseable. Stop the
 instance with `grove down` when the work is finished.
 
+## Seeding
+
+`up` runs the config's `[[seed]]` blocks once per worktree, after dependencies and before
+the services, and prints what each one did. A fresh instance has its own empty database,
+so whatever guarded routes need — an organisation row, a fixture — comes from there.
+
+To re-run them against the current database:
+
+```
+grove seed --force
+```
+
+A route answering 403 or "not found" in a fresh instance usually means missing seed data
+rather than a broken login, because the error names authentication either way.
+
 ## When something is wrong
 
 A service that never started is a precondition problem:

@@ -50,6 +50,12 @@ enum Command {
         #[arg(short, long)]
         follow: bool,
     },
+    /// Populate this instance's datastore from the config's [[seed]] blocks
+    Seed {
+        /// Re-run seeds that already ran for this instance
+        #[arg(long)]
+        force: bool,
+    },
     /// Check that this worktree can start: env, resources, ports, config
     Doctor,
     /// Manage the agent-facing skill
@@ -90,7 +96,9 @@ fn main() -> Result<()> {
                 eprintln!("started shared {started}");
             }
             instance.render()?;
-            instance.up(fresh)?;
+            for outcome in instance.up(fresh)? {
+                eprintln!("{outcome}");
+            }
             print_summary(&instance);
             Ok(())
         }
@@ -184,6 +192,14 @@ fn main() -> Result<()> {
                     bail!("{name} has no log yet at {}", path.display())
                 }
                 Err(e) => return Err(e).context("reading the log"),
+            }
+            Ok(())
+        }
+        Some(Command::Seed { force }) => {
+            let instance = Instance::open(&cwd)?;
+            instance.refuse_in_main()?;
+            for outcome in instance.seed(force)? {
+                println!("{outcome}");
             }
             Ok(())
         }

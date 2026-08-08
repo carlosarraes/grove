@@ -1,9 +1,9 @@
+use grove::{config, llm};
 use tempfile::TempDir;
-use treeish::{config, llm};
 
 fn worktree_with(toml: &str) -> TempDir {
     let dir = TempDir::new().expect("tempdir");
-    std::fs::write(dir.path().join(".treeish.toml"), toml).expect("write .treeish.toml");
+    std::fs::write(dir.path().join(".grove.toml"), toml).expect("write .grove.toml");
     dir
 }
 
@@ -33,18 +33,18 @@ command = "uv run uvicorn src.main:app --reload --port {{ port.backend }}"
 fn missing_config_routes_the_agent_to_the_schema() {
     let dir = TempDir::new().expect("tempdir");
 
-    let err = config::load(dir.path()).expect_err("must fail with no .treeish.toml");
+    let err = config::load(dir.path()).expect_err("must fail with no .grove.toml");
 
     let msg = format!("{err:#}");
-    assert!(msg.contains(".treeish.toml"), "should name the file: {msg}");
+    assert!(msg.contains(".grove.toml"), "should name the file: {msg}");
     assert!(
-        msg.contains("treeish --llm"),
+        msg.contains("grove --llm"),
         "should point at the schema so an agent can author one: {msg}"
     );
 }
 
-/// `treeish --llm` hands this example to agents to copy. If it stops parsing, every agent
-/// that follows the docs writes a config treeish rejects.
+/// `grove --llm` hands this example to agents to copy. If it stops parsing, every agent
+/// that follows the docs writes a config grove rejects.
 #[test]
 fn the_documented_example_parses() {
     let c = config::parse(llm::MONDRIO_EXAMPLE).expect("the --llm example must parse");
@@ -81,7 +81,7 @@ fn secrets_carry_the_per_instance_overrides() {
 }
 
 /// Port names reach two places that constrain them: `{{ port.<name> }}` in a template,
-/// where minijinja would read a hyphen as subtraction, and `TREEISH_PORT_<NAME>`, which
+/// where minijinja would read a hyphen as subtraction, and `GROVE_PORT_<NAME>`, which
 /// must be a legal environment variable. Both are silent corruptions, so refuse early.
 #[test]
 fn a_port_name_that_would_break_templates_is_refused() {

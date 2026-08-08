@@ -1,4 +1,4 @@
-//! Locating the pieces of an instance from wherever treeish was invoked.
+//! Locating the pieces of an instance from wherever grove was invoked.
 //!
 //! Everything hangs off `git worktree list --porcelain` rather than path shape, so the
 //! several worktree layouts in the wild all resolve identically.
@@ -9,7 +9,7 @@ use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolved {
-    /// Root of the worktree treeish was invoked from.
+    /// Root of the worktree grove was invoked from.
     pub worktree: PathBuf,
     /// The main worktree — the only place gitignored secrets reliably live.
     pub main_worktree: PathBuf,
@@ -19,7 +19,7 @@ pub struct Resolved {
 }
 
 impl Resolved {
-    /// True when treeish was invoked from the main checkout. Mutating commands refuse
+    /// True when grove was invoked from the main checkout. Mutating commands refuse
     /// here: rendering would overwrite the real `.env.local` every instance reads from.
     pub fn is_main(&self) -> bool {
         self.worktree == self.main_worktree

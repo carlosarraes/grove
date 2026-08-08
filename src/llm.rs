@@ -1,12 +1,12 @@
-//! Agent-facing schema reference, emitted by `treeish --llm`.
+//! Agent-facing schema reference, emitted by `grove --llm`.
 //!
 //! The examples here are parsed by the test suite against the same structs that read a
-//! real `.treeish.toml`, so this file cannot document a config treeish would reject.
+//! real `.grove.toml`, so this file cannot document a config grove would reject.
 
-/// A worked `.treeish.toml` for a Vite + FastAPI + MongoDB repo.
+/// A worked `.grove.toml` for a Vite + FastAPI + MongoDB repo.
 pub const MONDRIO_EXAMPLE: &str = r#"version = 1
 
-# Port names this repo needs. treeish assigns the numbers and exposes them to every
+# Port names this repo needs. grove assigns the numbers and exposes them to every
 # template below as {{ port.<name> }}.
 [ports]
 names = ["frontend", "backend"]
@@ -39,7 +39,7 @@ into = "frontend/.env.local"
 VITE_API_URL = "http://localhost:{{ port.backend }}"
 VITE_PROXY_TARGET = "http://localhost:{{ port.backend }}"
 
-# One container shared by every instance. treeish probes the port first and reuses
+# One container shared by every instance. grove probes the port first and reuses
 # whatever already answers, so a Mongo from Docker, from a VM, or forwarded over SSH all
 # work without changing this block. Instances are isolated by database name.
 [[resource]]
@@ -70,16 +70,16 @@ ready = { http = "http://localhost:{{ port.frontend }}/", timeout = "180s" }
 
 pub fn reference() -> String {
     format!(
-        r#"# treeish
+        r#"# grove
 
 Each git worktree gets its own running instance of the repo: its own ports, its own env
 files, its own database. Agents work in parallel without colliding and without copying
 configuration by hand.
 
-## Authoring .treeish.toml
+## Authoring .grove.toml
 
 Write it at the worktree root and commit it. It is checked in, so every later agent in
-every worktree just runs `treeish up`.
+every worktree just runs `grove up`.
 
 ### Template variables
 
@@ -87,7 +87,7 @@ Any string value in [secrets.set], [[resource]].db_name, [[service]].command, an
 [[service]].ready.http is a template. Available:
 
   {{{{ slug }}}}           this instance's name, [a-z0-9_], from the worktree directory
-  {{{{ port.<name> }}}}    a port from [ports].names, assigned by treeish
+  {{{{ port.<name> }}}}    a port from [ports].names, assigned by grove
   {{{{ db.name }}}}        this instance's database, from [[resource]].db_name
   {{{{ main_worktree }}}}  absolute path of the main checkout
 
@@ -111,7 +111,7 @@ Any string value in [secrets.set], [[resource]].db_name, [[service]].command, an
   kind               "docker-shared"
   image              container image, used only if nothing answers on `port` already
   args               extra arguments to the container command
-  port               port to probe, and to publish if treeish starts it
+  port               port to probe, and to publish if grove starts it
   init               one-time command against a freshly started resource
   db_name            per-instance database name; a template
 
@@ -142,7 +142,7 @@ Any string value in [secrets.set], [[resource]].db_name, [[service]].command, an
 
 Not yet supported. Repos whose ports are baked into a compose file rather than passed on
 the command line, that need a database created per instance, or that run several
-repositories as one unit, need a treeish newer than this one. Run `treeish --version` and
+repositories as one unit, need a grove newer than this one. Run `grove --version` and
 check the project for a release that lists them.
 "#,
         MONDRIO_EXAMPLE

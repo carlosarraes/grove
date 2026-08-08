@@ -1,6 +1,6 @@
-# treeish development and release tasks.
+# grove development and release tasks.
 
-binary := "treeish"
+binary := "grove"
 install_dir := env_var("HOME") / ".local/bin"
 
 default: build

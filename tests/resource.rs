@@ -1,6 +1,6 @@
+use grove::config;
+use grove::resource::{self, Decision};
 use std::net::TcpListener;
-use treeish::config;
-use treeish::resource::{self, Decision};
 
 fn mongo(port: u16) -> config::Resource {
     let toml = format!(
@@ -30,7 +30,7 @@ fn a_free_port() -> u16 {
 }
 
 /// The arch box runs rootful Docker; the mac runs Docker under lima and forwards 27017
-/// over SSH. "Start a container" is wrong there, so treeish asks the port, not the
+/// over SSH. "Start a container" is wrong there, so grove asks the port, not the
 /// runtime.
 #[test]
 fn a_reachable_datastore_is_reused_rather_than_started() {
@@ -63,7 +63,7 @@ fn an_absent_datastore_is_started_from_its_declared_image() {
         "declared args must reach the container command: {line}"
     );
     assert!(
-        line.contains("treeish-mongo"),
+        line.contains("grove-mongo"),
         "the container needs a stable name so a second run reuses it: {line}"
     );
 }

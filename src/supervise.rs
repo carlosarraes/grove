@@ -1,7 +1,7 @@
 //! Starting and stopping an instance's services.
 //!
 //! No daemon. Each service runs in its own process group with its output on disk, so
-//! treeish can exit immediately after `up` and still stop the whole tree later.
+//! grove can exit immediately after `up` and still stop the whole tree later.
 
 use anyhow::{Context, Result, bail};
 use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
@@ -99,7 +99,7 @@ pub fn stop(handle: &Handle) -> Result<()> {
 }
 
 /// Poll until the service answers. Any HTTP response counts, including an error status:
-/// a health endpoint may report degraded by design, and treeish is checking that the
+/// a health endpoint may report degraded by design, and grove is checking that the
 /// process is up, not that it is happy.
 pub fn wait_ready(url: &str, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;

@@ -29,7 +29,7 @@ impl Fixture {
     }
 
     /// Add a linked worktree as a sibling of the repo, matching the
-    /// `<repo-parent>/worktrees/<slug>` convention treeish expects.
+    /// `<repo-parent>/worktrees/<slug>` convention grove expects.
     pub fn add_worktree(&self, slug: &str) -> PathBuf {
         let path = self.main.parent().unwrap().join("worktrees").join(slug);
         git(

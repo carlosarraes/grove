@@ -58,7 +58,7 @@ pub fn allocate_avoiding(
         }
     }
 
-    bail!("no free port block in {RANGE:?}; run `treeish ls` and stop instances you are done with")
+    bail!("no free port block in {RANGE:?}; run `grove ls` and stop instances you are done with")
 }
 
 /// Bound on all interfaces rather than loopback alone: a dev server listening on 0.0.0.0

@@ -34,7 +34,7 @@ pub fn check(instance: &Instance) -> Vec<Verdict> {
                 "this is the main worktree ({})",
                 instance.resolved.worktree.display()
             ),
-            fix: "treeish reads secrets from here, so it will not write over them. \
+            fix: "grove reads secrets from here, so it will not write over them. \
                   Run from a linked worktree."
                 .to_string(),
         });
@@ -58,7 +58,7 @@ pub fn check(instance: &Instance) -> Vec<Verdict> {
                 what: format!("{} is missing from the main checkout", secrets.from),
                 fix: format!(
                     "create {} — a worktree never inherits gitignored files, so this is \
-                     the only copy treeish can read",
+                     the only copy grove can read",
                     source.display()
                 ),
             });
@@ -73,7 +73,7 @@ pub fn check(instance: &Instance) -> Vec<Verdict> {
             )));
         } else if declared.image.is_some() {
             verdicts.push(Verdict::Warn(format!(
-                "{} is not running; `treeish up` will start {} on port {}",
+                "{} is not running; `grove up` will start {} on port {}",
                 declared.name,
                 declared.image.as_deref().unwrap_or("it"),
                 declared.port
@@ -82,7 +82,7 @@ pub fn check(instance: &Instance) -> Vec<Verdict> {
             verdicts.push(Verdict::Fail {
                 what: format!("{} is not answering on {}", declared.name, declared.port),
                 fix: format!(
-                    "start it yourself — `{}` declares no image for treeish to run",
+                    "start it yourself — `{}` declares no image for grove to run",
                     declared.name
                 ),
             });

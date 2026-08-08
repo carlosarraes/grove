@@ -1,7 +1,7 @@
 mod common;
 
 use common::Fixture;
-use treeish::resolve;
+use grove::resolve;
 
 #[test]
 fn finds_the_main_worktree_from_inside_a_linked_worktree() {

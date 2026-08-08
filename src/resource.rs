@@ -1,6 +1,6 @@
 //! Shared datastores: one per machine, not one per instance.
 //!
-//! treeish asks the port, never the runtime. The same config has to work where Docker is
+//! grove asks the port, never the runtime. The same config has to work where Docker is
 //! rootful, where it runs inside a VM, and where the port is simply forwarded from
 //! another host — so "is something answering?" is the only question worth asking.
 
@@ -19,7 +19,7 @@ pub enum Decision {
 }
 
 pub fn container_name(resource: &Resource) -> String {
-    format!("treeish-{}", resource.name)
+    format!("grove-{}", resource.name)
 }
 
 pub fn decide(resource: &Resource) -> Decision {
@@ -67,7 +67,7 @@ pub fn ensure(resource: &Resource) -> Result<bool> {
             docker(&argv).with_context(|| {
                 format!(
                     "starting `{}` on port {}. If you provide {} yourself, start it and \
-                     run `treeish up` again.",
+                     run `grove up` again.",
                     resource.name, resource.port, resource.name
                 )
             })?;
@@ -116,7 +116,7 @@ pub fn drop_database_command(resource: &Resource, database: &str) -> Vec<String>
     ]
 }
 
-/// Drop an instance's database. Best effort by design: the datastore may be one treeish
+/// Drop an instance's database. Best effort by design: the datastore may be one grove
 /// did not start and cannot reach with `docker exec`, and failing `down` over a leftover
 /// database would be worse than leaving it. Says what to run by hand either way.
 pub fn drop_database(resource: &Resource, database: &str) -> Result<()> {
@@ -124,7 +124,7 @@ pub fn drop_database(resource: &Resource, database: &str) -> Result<()> {
         Ok(_) => Ok(()),
         Err(_) => bail!(
             "could not drop `{database}` automatically.\n\
-             treeish did not start this {}, so it cannot reach it. Drop it with:\n  \
+             grove did not start this {}, so it cannot reach it. Drop it with:\n  \
              mongosh --eval \"db.getSiblingDB('{database}').dropDatabase()\"",
             resource.name
         ),

@@ -1,12 +1,12 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use treeish::{instance::Instance, llm};
+use grove::{instance::Instance, llm};
 
 /// Per-worktree dev instances: each git worktree gets its own ports, env, and database.
 #[derive(Parser)]
-#[command(name = "treeish", version, about, disable_help_subcommand = true)]
+#[command(name = "grove", version, about, disable_help_subcommand = true)]
 struct Cli {
-    /// Emit the .treeish.toml schema and worked examples, then exit
+    /// Emit the .grove.toml schema and worked examples, then exit
     #[arg(long, global = true)]
     llm: bool,
 
@@ -61,7 +61,7 @@ enum Command {
 
 #[derive(Subcommand)]
 enum SkillAction {
-    /// Install the skill to ~/.claude/skills/treeish/
+    /// Install the skill to ~/.claude/skills/grove/
     Install,
 }
 
@@ -119,7 +119,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Command::Ls) => {
-            let registry = treeish::instance::registry()?;
+            let registry = grove::instance::registry()?;
             registry.reap()?;
             let entries = registry.list()?;
             if entries.is_empty() {
@@ -132,7 +132,7 @@ fn main() -> Result<()> {
                 let live = entry
                     .services
                     .values()
-                    .filter(|h| treeish::supervise::is_alive(h))
+                    .filter(|h| grove::supervise::is_alive(h))
                     .count();
                 let state = if live > 0 {
                     format!("running ({live})")
@@ -189,8 +189,8 @@ fn main() -> Result<()> {
         }
         Some(Command::Doctor) => {
             let instance = Instance::open(&cwd)?;
-            let verdicts = treeish::doctor::check(&instance);
-            if treeish::doctor::report(&verdicts)? {
+            let verdicts = grove::doctor::check(&instance);
+            if grove::doctor::report(&verdicts)? {
                 Ok(())
             } else {
                 std::process::exit(1);
@@ -199,8 +199,11 @@ fn main() -> Result<()> {
         Some(Command::Skill {
             action: SkillAction::Install,
         }) => {
-            let path = treeish::skill::install()?;
-            println!("installed the treeish skill to {}", path.display());
+            let installed = grove::skill::install()?;
+            println!("installed the grove skill to {}", installed.path.display());
+            if let Some(removed) = installed.removed {
+                println!("removed the old treeish skill at {}", removed.display());
+            }
             Ok(())
         }
     }
@@ -237,6 +240,6 @@ fn print_summary(instance: &Instance) {
         .first()
         .map(|s| s.name.as_str())
         .unwrap_or("<service>");
-    println!("  treeish run -- <your test command>");
-    println!("  treeish logs {first} -f");
+    println!("  grove run -- <your test command>");
+    println!("  grove logs {first} -f");
 }

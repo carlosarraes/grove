@@ -1,8 +1,8 @@
 mod common;
 
 use common::Fixture;
+use grove::{registry::Registry, resolve};
 use tempfile::TempDir;
-use treeish::{registry::Registry, resolve};
 
 fn names() -> Vec<String> {
     vec!["frontend".into(), "backend".into()]
@@ -148,7 +148,7 @@ fn reaping_releases_the_ports_of_worktrees_that_are_gone() {
     );
 }
 
-/// Two `treeish up` calls racing must not hand out one port twice. The registry file is
+/// Two `grove up` calls racing must not hand out one port twice. The registry file is
 /// the shared resource, so the lock lives there.
 #[test]
 fn concurrent_reservations_never_overlap() {

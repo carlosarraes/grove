@@ -1,9 +1,9 @@
+use grove::supervise;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::net::TcpListener;
 use std::time::Duration;
 use tempfile::TempDir;
-use treeish::supervise;
 
 fn no_env() -> BTreeMap<String, String> {
     BTreeMap::new()
@@ -40,10 +40,10 @@ fn captures_stdout_and_stderr_into_the_services_log() {
 fn passes_the_instance_environment_to_the_service() {
     let dir = TempDir::new().expect("tempdir");
     let log = dir.path().join("backend.log");
-    let env = BTreeMap::from([("TREEISH_TEST_PORT".to_string(), "24311".to_string())]);
+    let env = BTreeMap::from([("GROVE_TEST_PORT".to_string(), "24311".to_string())]);
 
     let handle =
-        supervise::spawn("echo port=$TREEISH_TEST_PORT", dir.path(), &env, &log).expect("spawn");
+        supervise::spawn("echo port=$GROVE_TEST_PORT", dir.path(), &env, &log).expect("spawn");
     settle();
 
     let body = std::fs::read_to_string(&log).expect("read log");
@@ -68,7 +68,7 @@ fn runs_the_service_in_its_configured_directory() {
 }
 
 /// `npm run dev` is a shell that spawns Vite. Killing only the shell leaves Vite holding
-/// the port, and the next `treeish up` cannot bind it.
+/// the port, and the next `grove up` cannot bind it.
 #[test]
 fn stopping_a_service_kills_its_children_too() {
     let dir = TempDir::new().expect("tempdir");

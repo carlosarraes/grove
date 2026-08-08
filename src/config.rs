@@ -1,11 +1,11 @@
-//! The committed `.treeish.toml` that tells treeish how to run a repo.
+//! The committed `.grove.toml` that tells grove how to run a repo.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-pub const FILENAME: &str = ".treeish.toml";
+pub const FILENAME: &str = ".grove.toml";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -24,7 +24,7 @@ pub struct Config {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Ports {
-    /// Port names this repo needs. treeish assigns the numbers; templates reference them
+    /// Port names this repo needs. grove assigns the numbers; templates reference them
     /// as `{{ port.<name> }}`.
     #[serde(default)]
     pub names: Vec<String>,
@@ -64,7 +64,7 @@ pub struct Resource {
 #[serde(rename_all = "kebab-case")]
 pub enum ResourceKind {
     /// One container shared by every instance; instances are isolated by database name.
-    /// treeish reuses anything already answering on `port` rather than starting its own.
+    /// grove reuses anything already answering on `port` rather than starting its own.
     DockerShared,
 }
 
@@ -97,8 +97,8 @@ pub fn load(worktree: &Path) -> Result<Config> {
         // spends one command here instead of a diagnosis.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => anyhow::bail!(
             "no {FILENAME} in {}\n\
-             This repo has not been set up for treeish yet. \
-             Run `treeish --llm` for the schema and worked examples, \
+             This repo has not been set up for grove yet. \
+             Run `grove --llm` for the schema and worked examples, \
              then write {FILENAME} at the worktree root and commit it.",
             worktree.display()
         ),
@@ -117,7 +117,7 @@ impl Config {
     fn validate(&self) -> Result<()> {
         for name in &self.ports.names {
             // A port name lands in `{{ port.<name> }}`, where a hyphen parses as
-            // subtraction, and in `TREEISH_PORT_<NAME>`, which must be a legal shell
+            // subtraction, and in `GROVE_PORT_<NAME>`, which must be a legal shell
             // variable. Both corrupt silently, so the name is constrained up front.
             let legal = !name.is_empty()
                 && name
@@ -128,7 +128,7 @@ impl Config {
                 anyhow::bail!(
                     "port name {name:?} must be lowercase letters, digits, and underscores, \
                      starting with a letter — it becomes both `{{{{ port.{name} }}}}` in \
-                     templates and TREEISH_PORT_<NAME> in the environment"
+                     templates and GROVE_PORT_<NAME> in the environment"
                 );
             }
         }

@@ -2,7 +2,7 @@
 //!
 //! `ports::allocate` reads live machine state, so on its own it cannot promise an
 //! instance the same ports twice. Writing the decision down is what makes it stable, and
-//! the file lock is what keeps two simultaneous `treeish up` calls from picking the same
+//! the file lock is what keeps two simultaneous `grove up` calls from picking the same
 //! block before either has started listening.
 
 use anyhow::{Context, Result};
@@ -42,7 +42,7 @@ impl Registry {
         Registry { path: path.into() }
     }
 
-    /// Default location: `$XDG_STATE_HOME/treeish/registry.json`.
+    /// Default location: `$XDG_STATE_HOME/grove/registry.json`.
     pub fn default_path() -> Result<PathBuf> {
         let base = match std::env::var_os("XDG_STATE_HOME") {
             Some(dir) if !dir.is_empty() => PathBuf::from(dir),
@@ -51,7 +51,7 @@ impl Registry {
                 PathBuf::from(home).join(".local/state")
             }
         };
-        Ok(base.join("treeish/registry.json"))
+        Ok(base.join("grove/registry.json"))
     }
 
     /// Ports for this worktree, allocating a block the first time and returning the same

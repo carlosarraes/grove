@@ -39,10 +39,10 @@ struct Cli {
 impl Drop for Cli {
     fn drop(&mut self) {
         for worktree in self.started.borrow().iter() {
-            let _ = Command::cargo_bin("treeish")
+            let _ = Command::cargo_bin("grove")
                 .expect("binary")
                 .current_dir(worktree)
-                .env("TREEISH_STATE_DIR", self.state.path())
+                .env("GROVE_STATE_DIR", self.state.path())
                 .arg("down")
                 .output();
         }
@@ -58,12 +58,12 @@ impl Cli {
             "WORKOS__API_KEY=sk_live\nAPI_URL=http://localhost:8000\n",
         )
         .expect("main env");
-        std::fs::write(fx.main.join(".treeish.toml"), CONFIG).expect("config");
+        std::fs::write(fx.main.join(".grove.toml"), CONFIG).expect("config");
         // Gitignored, exactly as in a real repo — which is the whole reason a worktree
         // arrives without it. Committing it here would make every test a no-op.
         std::fs::write(fx.main.join(".gitignore"), ".env.local\n").expect("gitignore");
         common::git(&fx.main, &["add", "."]);
-        common::git(&fx.main, &["commit", "-m", "add treeish config"]);
+        common::git(&fx.main, &["commit", "-m", "add grove config"]);
 
         Cli {
             state: TempDir::new().expect("tempdir"),
@@ -80,10 +80,10 @@ impl Cli {
     }
 
     fn run(&self, cwd: &Path, args: &[&str]) -> assert_cmd::assert::Assert {
-        Command::cargo_bin("treeish")
+        Command::cargo_bin("grove")
             .expect("binary")
             .current_dir(cwd)
-            .env("TREEISH_STATE_DIR", self.state.path())
+            .env("GROVE_STATE_DIR", self.state.path())
             .args(args)
             .assert()
     }
@@ -251,12 +251,12 @@ fn up_refuses_to_run_in_the_main_worktree() {
 fn an_unconfigured_repo_points_the_agent_at_the_schema() {
     let cli = Cli::new();
     let wt = cli.worktree("mon_2695");
-    std::fs::remove_file(wt.join(".treeish.toml")).expect("remove config");
+    std::fs::remove_file(wt.join(".grove.toml")).expect("remove config");
 
     let assert = cli.run(&wt, &["up"]).failure();
 
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
-    assert!(stderr.contains("treeish --llm"), "{stderr}");
+    assert!(stderr.contains("grove --llm"), "{stderr}");
 }
 
 #[test]
@@ -276,7 +276,7 @@ fn doctor_passes_in_a_worktree_that_is_ready_to_start() {
     assert!(stdout.contains("mon_2695"), "{stdout}");
 }
 
-/// The failure treeish exists to prevent, reported before anything is started.
+/// The failure grove exists to prevent, reported before anything is started.
 #[test]
 fn doctor_names_the_env_file_missing_from_the_main_checkout() {
     let cli = Cli::new();
@@ -297,7 +297,7 @@ fn doctor_names_the_env_file_missing_from_the_main_checkout() {
 fn doctor_in_an_unconfigured_repo_points_at_the_schema() {
     let cli = Cli::new();
     let wt = cli.worktree("mon_2695");
-    std::fs::remove_file(wt.join(".treeish.toml")).expect("remove config");
+    std::fs::remove_file(wt.join(".grove.toml")).expect("remove config");
 
     let assert = cli.run(&wt, &["doctor"]).failure();
 
@@ -306,7 +306,7 @@ fn doctor_in_an_unconfigured_repo_points_at_the_schema() {
         String::from_utf8_lossy(&assert.get_output().stdout),
         String::from_utf8_lossy(&assert.get_output().stderr)
     );
-    assert!(combined.contains("treeish --llm"), "{combined}");
+    assert!(combined.contains("grove --llm"), "{combined}");
 }
 
 #[test]
@@ -347,7 +347,7 @@ fn run_executes_a_command_with_the_instance_environment() {
     cli.run(&wt, &["up"]).success();
 
     let out = cli
-        .run(&wt, &["run", "--", "sh", "-c", "echo $TREEISH_PORT_WEB"])
+        .run(&wt, &["run", "--", "sh", "-c", "echo $GROVE_PORT_WEB"])
         .success()
         .get_output()
         .stdout
@@ -367,7 +367,7 @@ fn skill_install_writes_a_skill_agents_can_load() {
     let cli = Cli::new();
     let home = TempDir::new().expect("tempdir");
 
-    Command::cargo_bin("treeish")
+    Command::cargo_bin("grove")
         .expect("binary")
         .current_dir(&cli.fx.main)
         .env("HOME", home.path())
@@ -375,15 +375,15 @@ fn skill_install_writes_a_skill_agents_can_load() {
         .assert()
         .success();
 
-    let body = std::fs::read_to_string(home.path().join(".claude/skills/treeish/SKILL.md"))
+    let body = std::fs::read_to_string(home.path().join(".claude/skills/grove/SKILL.md"))
         .expect("skill installed to the global skills directory");
-    assert!(body.starts_with("---\nname: treeish\n"), "{body}");
+    assert!(body.starts_with("---\nname: grove\n"), "{body}");
     assert!(
         body.contains("description:"),
         "a model-invoked skill needs a description to be discoverable"
     );
     // The schema lives in the binary and is reached by pointer, so it cannot drift.
-    assert!(body.contains("treeish --llm"), "{body}");
+    assert!(body.contains("grove --llm"), "{body}");
     assert!(
         !body.contains("[[secrets]]"),
         "the skill must point at the schema rather than restate it"
@@ -418,7 +418,7 @@ fn ls_reports_a_stopped_instance_as_stopped() {
     );
 }
 
-/// Two agents independently guessed `treeish list` and `treeish instances` and got an
+/// Two agents independently guessed `grove list` and `grove instances` and got an
 /// error before recovering. The names cost nothing to accept.
 #[test]
 fn ls_answers_to_the_names_agents_actually_guess() {
@@ -460,7 +460,7 @@ fn run_isolates_the_browser_session_per_instance() {
 
 /// Code that reads `os.environ` before its settings library loads the .env file sees the
 /// wrong value otherwise — mondrio logged "ENVIRONMENT not set, defaulting to production"
-/// while ENVIRONMENT=test sat on line 8 of the file treeish had just written.
+/// while ENVIRONMENT=test sat on line 8 of the file grove had just written.
 #[test]
 fn the_instance_overrides_are_in_the_environment_not_only_the_file() {
     let cli = Cli::new();
@@ -480,4 +480,36 @@ fn the_instance_overrides_are_in_the_environment_not_only_the_file() {
         "{printed}"
     );
     cli.run(&wt, &["down"]).success();
+}
+
+/// The project was called treeish until 0.1.1. Leaving its skill installed means agents
+/// see two skills describing the same tool, one of them naming a binary that is gone.
+#[test]
+fn skill_install_removes_the_skill_from_the_old_name() {
+    let cli = Cli::new();
+    let home = TempDir::new().expect("tempdir");
+    let stale = home.path().join(".claude/skills/treeish");
+    std::fs::create_dir_all(&stale).expect("mkdir");
+    std::fs::write(stale.join("SKILL.md"), "---\nname: treeish\n---\n").expect("stale skill");
+
+    let out = Command::cargo_bin("grove")
+        .expect("binary")
+        .current_dir(&cli.fx.main)
+        .env("HOME", home.path())
+        .args(["skill", "install"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert!(!stale.exists(), "the treeish skill directory must be gone");
+    assert!(
+        home.path().join(".claude/skills/grove/SKILL.md").exists(),
+        "the grove skill must be installed"
+    );
+    assert!(
+        String::from_utf8_lossy(&out).contains("treeish"),
+        "say what was removed rather than deleting silently"
+    );
 }

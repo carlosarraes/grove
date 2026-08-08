@@ -46,15 +46,15 @@ esac
 UNAME
 chmod +x "$temporary/bin/uname"
 
-cat >"$temporary/archive/treeish" <<'BINARY'
+cat >"$temporary/archive/grove" <<'BINARY'
 #!/usr/bin/env sh
-if test "${1:-}" = '--version'; then echo 'treeish 9.9.9'; exit 0; fi
-echo "fixture treeish"
+if test "${1:-}" = '--version'; then echo 'grove 9.9.9'; exit 0; fi
+echo "fixture grove"
 BINARY
-chmod +x "$temporary/archive/treeish"
+chmod +x "$temporary/archive/grove"
 
-asset="treeish-x86_64-unknown-linux-gnu.tar.gz"
-tar -C "$temporary/archive" -czf "$temporary/assets/$asset" treeish
+asset="grove-x86_64-unknown-linux-gnu.tar.gz"
+tar -C "$temporary/archive" -czf "$temporary/assets/$asset" grove
 if command -v sha256sum >/dev/null 2>&1; then
   (cd "$temporary/assets" && sha256sum "$asset" >"$asset.sha256")
 else
@@ -86,19 +86,38 @@ cp "$FIXTURE_ASSETS/${url##*/}" "$destination"
 CURL
 chmod +x "$temporary/bin/curl"
 
-destination="$temporary/install/treeish"
+destination="$temporary/install/grove"
 output="$(
   PATH="$temporary/bin:$PATH" \
     FIXTURE_ASSETS="$temporary/assets" \
-    TREEISH_VERSION="v0.1.0" \
-    TREEISH_INSTALL_PATH="$destination" \
+    GROVE_VERSION="v0.1.0" \
+    GROVE_INSTALL_PATH="$destination" \
     "$root/install.sh"
 )"
 
 test -x "$destination" || fail "installer did not install an executable"
-test "$("$destination")" = "fixture treeish" || fail "installed the wrong binary"
+
+# The old binary must be noticed, and left alone when the answer is no.
+former="$temporary/install/treeish"
+printf '#!/usr/bin/env sh\necho old\n' >"$former"
+chmod +x "$former"
+legacy_output="$(
+  PATH="$temporary/bin:$PATH" \
+    FIXTURE_ASSETS="$temporary/assets" \
+    GROVE_VERSION="v0.1.0" \
+    GROVE_INSTALL_PATH="$destination" \
+    "$root/install.sh" </dev/null
+)"
+case "$legacy_output" in
+  *"$former"*) ;;
+  *) fail "installer did not mention the old treeish binary" ;;
+esac
+test -x "$former" || fail "installer removed the old binary without being told to"
+rm -f "$former"
+
+test "$("$destination")" = "fixture grove" || fail "installed the wrong binary"
 case "$output" in
-  *"treeish 9.9.9"*) ;;
+  *"grove 9.9.9"*) ;;
   *) fail "installer did not echo the installed version" ;;
 esac
 

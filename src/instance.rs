@@ -23,10 +23,10 @@ pub struct ServiceStatus {
     pub running: bool,
 }
 
-/// Where treeish keeps the registry and per-service logs. `TREEISH_STATE_DIR` overrides
+/// Where grove keeps the registry and per-service logs. `GROVE_STATE_DIR` overrides
 /// it, which is what lets the test suite run instances without touching real state.
 pub fn state_dir() -> Result<PathBuf> {
-    if let Some(dir) = std::env::var_os("TREEISH_STATE_DIR")
+    if let Some(dir) = std::env::var_os("GROVE_STATE_DIR")
         && !dir.is_empty()
     {
         return Ok(PathBuf::from(dir));
@@ -37,7 +37,7 @@ pub fn state_dir() -> Result<PathBuf> {
             PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?).join(".local/state")
         }
     };
-    Ok(base.join("treeish"))
+    Ok(base.join("grove"))
 }
 
 pub fn registry() -> Result<Registry> {
@@ -67,7 +67,7 @@ impl Instance {
         if self.resolved.is_main() {
             bail!(
                 "this is the main worktree ({})\n\
-                 treeish reads secrets from here, so it will not write over them. \
+                 grove reads secrets from here, so it will not write over them. \
                  Run it from a linked worktree, or pass --allow-main if you are certain.",
                 self.resolved.main_worktree.display()
             );
@@ -98,29 +98,29 @@ impl Instance {
         }
     }
 
-    /// The environment a service or `treeish run` command receives.
+    /// The environment a service or `grove run` command receives.
     ///
-    /// Beyond treeish's own variables this carries every `[secrets.set]` override, because
+    /// Beyond grove's own variables this carries every `[secrets.set]` override, because
     /// writing them to a file is not enough: code that reads the process environment
     /// before its settings library loads the file sees the wrong value and says so
     /// confusingly — a backend logging "ENVIRONMENT not set, defaulting to production"
-    /// with `ENVIRONMENT=test` sitting in the file treeish just wrote.
+    /// with `ENVIRONMENT=test` sitting in the file grove just wrote.
     pub fn environment(&self) -> Result<BTreeMap<String, String>> {
         let mut env = BTreeMap::from([
-            ("TREEISH_SLUG".to_string(), self.resolved.slug.clone()),
+            ("GROVE_SLUG".to_string(), self.resolved.slug.clone()),
             (
-                "TREEISH_WORKTREE".to_string(),
+                "GROVE_WORKTREE".to_string(),
                 self.resolved.worktree.display().to_string(),
             ),
         ]);
         for (name, port) in &self.entry.ports {
             env.insert(
-                format!("TREEISH_PORT_{}", name.to_uppercase()),
+                format!("GROVE_PORT_{}", name.to_uppercase()),
                 port.to_string(),
             );
         }
         if let Some(db) = &self.entry.db_name {
-            env.insert("TREEISH_DB_NAME".to_string(), db.clone());
+            env.insert("GROVE_DB_NAME".to_string(), db.clone());
         }
 
         // Browser automation defaults to one shared session per machine, so parallel

@@ -21,6 +21,7 @@ pub struct Instance {
 pub struct ServiceStatus {
     pub name: String,
     pub running: bool,
+    pub pid: Option<u32>,
 }
 
 pub enum SeedOutcome {
@@ -216,6 +217,34 @@ impl Instance {
         crate::resource::drop_database(resource, database)
     }
 
+    /// Stop the named service (or all of them) so the next `up` starts it fresh.
+    /// Returns what it stopped, so a caller can say which name it did not recognise.
+    pub fn stop_services(&mut self, only: Option<&str>) -> Result<Vec<String>> {
+        if let Some(name) = only
+            && !self.config.services.iter().any(|s| s.name == name)
+        {
+            let known: Vec<&str> = self
+                .config
+                .services
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect();
+            bail!("this repo declares no service named {name:?}; it has {known:?}");
+        }
+
+        let mut stopped = Vec::new();
+        for (name, handle) in self.entry.services.clone() {
+            if only.is_some_and(|wanted| wanted != name) {
+                continue;
+            }
+            supervise::stop(&handle)?;
+            self.entry.services.remove(&name);
+            stopped.push(name);
+        }
+        self.registry.record(&self.entry)?;
+        Ok(stopped)
+    }
+
     /// Populate this instance's datastore. Each seed runs once per worktree unless
     /// `force`, and reports what it did — a seed that silently skipped is how you end up
     /// debugging a 403 that names authentication rather than missing data.
@@ -363,14 +392,29 @@ impl Instance {
             .with_context(|| format!("opening {}", log.display()))?;
         let errors = sink.try_clone().context("duplicating the log handle")?;
 
-        let status = std::process::Command::new("sh")
+        // A silent multi-minute install is indistinguishable from a hang, and an agent
+        // watching it will eventually kill it. Tick while the child runs.
+        let mut child = std::process::Command::new("sh")
             .arg("-c")
             .arg(setup)
             .current_dir(cwd)
             .stdout(std::process::Stdio::from(sink))
             .stderr(std::process::Stdio::from(errors))
-            .status()
+            .spawn()
             .with_context(|| format!("running setup for {name}: {setup}"))?;
+
+        let began = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let elapsed = began.elapsed().as_secs();
+            if elapsed > 0 && elapsed.is_multiple_of(15) {
+                eprintln!("{name}: still installing ({elapsed}s)");
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        };
         if !status.success() {
             bail!(
                 "setup for {name} failed: {setup}\n\
@@ -396,6 +440,51 @@ impl Instance {
         self.registry.release(&self.resolved.worktree)
     }
 
+    /// Unix seconds of the newest change to the worktree's own source, or None when git
+    /// cannot say. Tracked plus untracked-not-ignored: that is the tree a developer edits,
+    /// and it skips node_modules and .venv, which would otherwise dominate the answer.
+    pub fn newest_source_change(&self) -> Option<u64> {
+        let listed = |args: &[&str]| -> Vec<PathBuf> {
+            std::process::Command::new("git")
+                .current_dir(&self.resolved.worktree)
+                .args(args)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .map(|l| self.resolved.worktree.join(l))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        let mut paths = listed(&["ls-files"]);
+        paths.extend(listed(&["ls-files", "-o", "--exclude-standard"]));
+
+        paths
+            .iter()
+            .filter_map(|p| p.metadata().ok()?.modified().ok())
+            .filter_map(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .max()
+    }
+
+    /// Services running from before the newest edit. They keep serving the old code, and
+    /// a service without hot reload gives no hint that it is doing so.
+    pub fn stale_services(&self) -> Vec<String> {
+        let Some(changed) = self.newest_source_change() else {
+            return Vec::new();
+        };
+        self.entry
+            .services
+            .iter()
+            .filter(|(_, h)| supervise::is_alive(h) && h.started_at > 0 && h.started_at < changed)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     pub fn status(&self) -> Vec<ServiceStatus> {
         self.config
             .services
@@ -407,6 +496,7 @@ impl Instance {
                     .services
                     .get(&s.name)
                     .is_some_and(supervise::is_alive),
+                pid: self.entry.services.get(&s.name).map(|h| h.pid),
             })
             .collect()
     }

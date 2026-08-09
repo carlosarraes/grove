@@ -49,7 +49,15 @@ enum Command {
         service: Option<String>,
         #[arg(short, long)]
         follow: bool,
+        /// Show only the last N lines
+        #[arg(short = 'n', long)]
+        lines: Option<usize>,
+        /// Show only what this service printed since it last started
+        #[arg(long)]
+        since_restart: bool,
     },
+    /// Stop a service and start it again; all of them if none is named
+    Restart { service: Option<String> },
     /// Stop and forget instances whose worktree no longer exists
     Prune,
     /// Populate this instance's datastore from the config's [[seed]] blocks
@@ -125,6 +133,7 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&status_json(&instance))?);
             } else {
                 print_summary(&instance);
+                warn_if_stale(&instance);
             }
             Ok(())
         }
@@ -177,7 +186,12 @@ fn main() -> Result<()> {
                 .with_context(|| format!("running `{}`", argv.join(" ")))?;
             std::process::exit(status.code().unwrap_or(1));
         }
-        Some(Command::Logs { service, follow }) => {
+        Some(Command::Logs {
+            service,
+            follow,
+            lines,
+            since_restart,
+        }) => {
             let instance = Instance::open(&cwd)?;
             let name = match service {
                 Some(name) => name,
@@ -198,12 +212,44 @@ fn main() -> Result<()> {
                 std::process::exit(status.code().unwrap_or(0));
             }
             match std::fs::read_to_string(&path) {
-                Ok(body) => print!("{body}"),
+                Ok(body) => {
+                    // The build log is replayed first otherwise, so the head of `logs`
+                    // shows dependency resolution rather than the service booting.
+                    let body = if since_restart {
+                        match body.rfind(grove::supervise::START_MARKER) {
+                            Some(at) => body[at..].to_string(),
+                            None => body,
+                        }
+                    } else {
+                        body
+                    };
+                    let body = match lines {
+                        Some(n) => {
+                            let kept: Vec<&str> = body.lines().collect();
+                            let from = kept.len().saturating_sub(n);
+                            format!("{}\n", kept[from..].join("\n"))
+                        }
+                        None => body,
+                    };
+                    print!("{body}");
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     bail!("{name} has no log yet at {}", path.display())
                 }
                 Err(e) => return Err(e).context("reading the log"),
             }
+            Ok(())
+        }
+        Some(Command::Restart { service }) => {
+            let mut instance = Instance::open(&cwd)?;
+            instance.refuse_in_main()?;
+            for name in instance.stop_services(service.as_deref())? {
+                println!("stopped {name}");
+            }
+            // `up` only starts what is not already running, so stopping first is what
+            // makes this a restart rather than a no-op.
+            instance.up(false)?;
+            print_summary(&instance);
             Ok(())
         }
         Some(Command::Prune) => {
@@ -262,11 +308,30 @@ fn main() -> Result<()> {
     }
 }
 
+/// A service older than the newest edit is serving code you have already changed. Without
+/// this, the next surprising response reads as a bug in the code you are looking at.
+fn warn_if_stale(instance: &Instance) {
+    let stale = instance.stale_services();
+    if stale.is_empty() {
+        return;
+    }
+    println!();
+    for name in &stale {
+        println!("{name} started before your newest edit and may be serving stale code");
+    }
+    println!("  grove restart {}", stale.join(" "));
+}
+
 fn status_json(instance: &Instance) -> serde_json::Value {
     let services: serde_json::Map<String, serde_json::Value> = instance
         .status()
         .into_iter()
-        .map(|s| (s.name, serde_json::json!({ "running": s.running })))
+        .map(|s| {
+            (
+                s.name,
+                serde_json::json!({ "running": s.running, "pid": s.pid }),
+            )
+        })
         .collect();
     serde_json::json!({
         "slug": instance.resolved.slug,

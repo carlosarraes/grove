@@ -709,3 +709,138 @@ fn ls_reports_an_orphan_rather_than_quietly_forgetting_it() {
         .success()
         .stdout(predicates::str::contains("mon_2694"));
 }
+
+/// The natural reach after editing a service that does not hot-reload. Today that means
+/// `down && up`, which also stops everything else in the instance.
+#[test]
+fn restart_replaces_one_service_and_leaves_the_rest_alone() {
+    let cli = Cli::new();
+    let wt = cli.worktree("mon_2695");
+    cli.run(&wt, &["up"]).success();
+
+    let pid_of = |name: &str| -> u64 {
+        let out = cli
+            .run(&wt, &["status", "--json"])
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let v: serde_json::Value = serde_json::from_slice(&out).expect("json");
+        v["services"][name]["pid"]
+            .as_u64()
+            .expect("a pid in status")
+    };
+    let before = pid_of("web");
+
+    cli.run(&wt, &["restart", "web"]).success();
+
+    let after = pid_of("web");
+    assert_ne!(before, after, "restart must actually replace the process");
+
+    // And it is serving again, not merely respawned.
+    let port: u16 = std::fs::read_to_string(wt.join("backend/.env.local"))
+        .expect("env")
+        .lines()
+        .find_map(|l| l.strip_prefix("API_URL=http://localhost:"))
+        .expect("API_URL")
+        .parse()
+        .expect("port");
+    assert!(
+        ureq::get(format!("http://127.0.0.1:{port}/"))
+            .call()
+            .is_ok()
+    );
+
+    cli.run(&wt, &["down"]).success();
+}
+
+/// The failure that nearly produced a false bug report: a service started before your
+/// last edit keeps serving the old code, and nothing says so.
+#[test]
+fn status_warns_when_a_service_predates_the_newest_source_change() {
+    let cli = Cli::new();
+    let wt = cli.worktree("mon_2695");
+    cli.run(&wt, &["up"]).success();
+
+    let clean = String::from_utf8_lossy(
+        &cli.run(&wt, &["status"])
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .into_owned();
+    assert!(!clean.contains("stale"), "nothing edited yet: {clean}");
+
+    // Edit a tracked source file, the way you would mid-ticket.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(wt.join("README.md"), "changed\n").expect("edit");
+
+    let warned = String::from_utf8_lossy(
+        &cli.run(&wt, &["status"])
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .into_owned();
+    assert!(
+        warned.contains("stale"),
+        "a service older than the newest edit must be flagged: {warned}"
+    );
+    assert!(
+        warned.contains("grove restart"),
+        "and say how to fix it: {warned}"
+    );
+
+    cli.run(&wt, &["down"]).success();
+}
+
+/// `logs` replayed the whole build first, so its head showed dependency resolution rather
+/// than the service booting.
+#[test]
+fn logs_can_show_only_this_run_and_only_the_tail() {
+    let cli = Cli::new();
+    let wt = cli.worktree("mon_2695");
+    cli.run(&wt, &["up"]).success();
+    cli.run(&wt, &["restart", "web"]).success();
+
+    let all = String::from_utf8_lossy(
+        &cli.run(&wt, &["logs", "web"])
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .into_owned();
+    let since = String::from_utf8_lossy(
+        &cli.run(&wt, &["logs", "web", "--since-restart"])
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .into_owned();
+
+    assert!(
+        all.len() > since.len(),
+        "--since-restart must drop earlier output"
+    );
+    assert_eq!(
+        since.matches("Serving HTTP").count(),
+        1,
+        "exactly the current run: {since}"
+    );
+
+    let tail = String::from_utf8_lossy(
+        &cli.run(&wt, &["logs", "web", "-n", "1"])
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .into_owned();
+    assert_eq!(tail.lines().count(), 1, "{tail}");
+
+    cli.run(&wt, &["down"]).success();
+}

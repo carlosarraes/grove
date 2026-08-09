@@ -49,6 +49,15 @@ unwrapped, because `up` wrote those files to disk.
 `grove status` shows what is running now, and `--json` makes it parseable. Stop the
 instance with `grove down` when the work is finished.
 
+After editing a service that does not reload itself, replace just that one:
+
+```
+grove restart backend
+```
+
+`status` flags a service that started before your newest edit, because it goes on serving
+the code you already changed and nothing else says so.
+
 ## Seeding
 
 `up` runs the config's `[[seed]]` blocks once per worktree, after dependencies and before
@@ -87,8 +96,11 @@ A service that started and then crashed is a different problem, and `doctor` wil
 it. Read what the service itself said:
 
 ```
-grove logs <service>
+grove logs <service> --since-restart
 ```
+
+The log keeps the whole history including the dependency install, so `--since-restart`
+starts at the current run and `-n` limits it to the last lines.
 
 ## When the repo has no .grove.toml
 

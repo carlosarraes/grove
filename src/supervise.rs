@@ -15,7 +15,15 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Handle {
     pub pid: u32,
+    /// Unix seconds at spawn. Recorded rather than read back from `ps`, whose output
+    /// format differs between macOS and Linux and would need parsing on both.
+    #[serde(default)]
+    pub started_at: u64,
 }
+
+/// Written to a service's log at each spawn, so `logs --since-restart` can find where
+/// this run began amid the replayed build output.
+pub const START_MARKER: &str = "=== grove: service started ===";
 
 /// Start a service detached, with its output appended to `log`.
 ///
@@ -40,6 +48,11 @@ pub fn spawn(
         .open(log)
         .with_context(|| format!("opening {}", log.display()))?;
     let err = out.try_clone().context("duplicating the log handle")?;
+    {
+        use std::io::Write;
+        let mut marker = out.try_clone().context("duplicating the log handle")?;
+        let _ = writeln!(marker, "{START_MARKER}");
+    }
 
     let mut child = Command::new("sh")
         .arg("-c")
@@ -62,7 +75,12 @@ pub fn spawn(
         let _ = child.wait();
     });
 
-    Ok(Handle { pid })
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    Ok(Handle { pid, started_at })
 }
 
 /// True while any process in the group survives. `process_group(0)` makes the group id

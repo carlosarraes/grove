@@ -22,6 +22,16 @@ emit refactor "Changed"
 emit docs     "Documentation"
 emit test     "Tests"
 
+# Catch-all, so a type nobody anticipated is never silently dropped from a changelog.
+# Only the release commit itself is excluded, since it carries no information.
+other="$(git log --no-merges --pretty=format:'%s' "$range" \
+  | grep -vE '^(feat|fix|perf|refactor|docs|test)(\([^)]*\))?!?: ' \
+  | grep -vE '^chore(\([^)]*\))?!?: release ' \
+  | sed 's/^/- /')"
+if [ -n "$other" ]; then
+  printf '### Other\n%s\n\n' "$other"
+fi
+
 if [ -n "$prev" ]; then
   printf '**Full changelog:** %s...%s\n' "$prev" "$tag"
 fi

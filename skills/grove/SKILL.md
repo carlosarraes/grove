@@ -64,11 +64,19 @@ the code you already changed and nothing else says so.
 the services, and prints what each one did. A fresh instance has its own empty database,
 so whatever guarded routes need — an organisation row, a fixture — comes from there.
 
-To re-run them against the current database:
+### Putting the data back
+
+Testing dirties an instance — records renamed, rows deleted, states flipped. To discard
+all of that and rebuild the instance's data from scratch:
 
 ```
 grove seed --force
 ```
+
+This re-runs every `[[seed]]` block against the current database, which for a seed that
+drops and rebuilds is a full reset. Reach for it whenever the data is in a shape you no
+longer want, before a demo, or when a test needs a known starting point. Ordinary `up`
+never re-seeds, so an instance keeps whatever you did to it until you ask for this.
 
 A route answering 403 or "not found" in a fresh instance usually means missing seed data
 rather than a broken login, because the error names authentication either way.
@@ -101,6 +109,18 @@ grove logs <service> --since-restart
 
 The log keeps the whole history including the dependency install, so `--since-restart`
 starts at the current run and `-n` limits it to the last lines.
+
+## Browser testing on an instance's port
+
+Each instance serves on a port assigned at run time, which an external identity provider
+will not have in its redirect allowlist — a login bounces with an invalid-redirect error
+that looks like broken auth. Where the repo offers a bypass, prefer it; otherwise open a
+static path first and seed the session there rather than starting at `/`.
+
+`grove run` sets `AGENT_BROWSER_SESSION` to this instance's slug, so browser automation
+invoked through it gets its own session. Driving a browser outside `grove run` shares one
+session across every instance on the machine, and a sibling's navigation will take the
+tab out from under you.
 
 ## When the repo has no .grove.toml
 

@@ -403,16 +403,19 @@ impl Instance {
             .spawn()
             .with_context(|| format!("running setup for {name}: {setup}"))?;
 
+        // First tick at 10s, then every 15s. The opening silence is what reads as a
+        // hang, so it is the interval worth shortening.
         let began = std::time::Instant::now();
+        let mut next_tick = 10u64;
         let status = loop {
             if let Some(status) = child.try_wait()? {
                 break status;
             }
             std::thread::sleep(std::time::Duration::from_millis(200));
             let elapsed = began.elapsed().as_secs();
-            if elapsed > 0 && elapsed.is_multiple_of(15) {
+            if elapsed >= next_tick {
                 eprintln!("{name}: still installing ({elapsed}s)");
-                std::thread::sleep(std::time::Duration::from_secs(1));
+                next_tick = elapsed + 15;
             }
         };
         if !status.success() {
@@ -424,6 +427,12 @@ impl Instance {
             );
         }
         std::fs::write(&marker, setup)?;
+        // Closure matters as much as the ticks: an install that ends without saying so
+        // leaves the reader wondering whether it finished or was skipped.
+        eprintln!(
+            "{name}: dependencies installed ({}s)",
+            began.elapsed().as_secs()
+        );
         Ok(())
     }
 

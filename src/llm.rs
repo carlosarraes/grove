@@ -123,7 +123,9 @@ Any string value in [secrets.set], [[resource]].db_name, [[service]].command, an
   init               one-time command against a freshly started resource
   db_name            per-instance database name; a template
 
-  [[seed]]           repeatable; data the instance needs before it is useful
+  [[seed]]           repeatable; data the instance needs before it is useful.
+                     `grove seed --force` re-runs them all, which is how a dirtied
+                     instance gets back to a known shape.
   name               identifier, also the marker and log file name
   cwd                working directory relative to the worktree root
   command            run once per instance, after dependencies, before services

@@ -47,7 +47,7 @@ fn missing_config_routes_the_agent_to_the_schema() {
 /// that follows the docs writes a config grove rejects.
 #[test]
 fn the_documented_example_parses() {
-    let c = config::parse(llm::MONDRIO_EXAMPLE).expect("the --llm example must parse");
+    let c = config::parse(llm::EXAMPLE).expect("the --llm example must parse");
 
     let names: Vec<_> = c.services.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names, ["backend", "frontend"]);
@@ -59,7 +59,7 @@ fn the_documented_example_parses() {
 
 #[test]
 fn secrets_carry_the_per_instance_overrides() {
-    let c = config::parse(llm::MONDRIO_EXAMPLE).expect("parse");
+    let c = config::parse(llm::EXAMPLE).expect("parse");
     let backend = c
         .secrets
         .iter()

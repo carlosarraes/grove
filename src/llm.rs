@@ -4,7 +4,7 @@
 //! real `.grove.toml`, so this file cannot document a config grove would reject.
 
 /// A worked `.grove.toml` for a Vite + FastAPI + MongoDB repo.
-pub const MONDRIO_EXAMPLE: &str = r#"version = 1
+pub const EXAMPLE: &str = r#"version = 1
 
 # Port names this repo needs. grove assigns the numbers and exposes them to every
 # template below as {{ port.<name> }}.
@@ -18,15 +18,15 @@ names = ["frontend", "backend"]
 from = "backend/.env.local"
 into = "backend/.env.local"
 
+# CORS_ORIGINS is an exact-match list, so it has to name THIS instance's frontend
+# port. Any auth callback URL needs the same treatment, for the same reason.
 [secrets.set]
 CORS_ORIGINS = "http://localhost:{{ port.frontend }}"
 MONGODB_URI = "mongodb://localhost:27017/?directConnection=true&replicaSet=rs0"
 MONGODB_DATABASE = "{{ db.name }}"
 ENVIRONMENT = "development"
 DEBUG = "True"
-"WORKOS__REDIRECT_URI" = "http://localhost:{{ port.frontend }}/auth/callback"
-"WORKOS__OAUTH_REDIRECT_URI" = "http://localhost:{{ port.frontend }}/dashboard"
-"WORKOS__POST_LOGOUT_REDIRECT_URI" = "http://localhost:{{ port.frontend }}/"
+AUTH_REDIRECT_URI = "http://localhost:{{ port.frontend }}/auth/callback"
 
 [[secrets]]
 from = "frontend/.env.local"
@@ -49,12 +49,12 @@ image = "mongo:8.0.23"
 args = ["--replSet", "rs0"]
 port = 27017
 init = "rs.initiate()"
-db_name = "mondrio_{{ slug }}"
+db_name = "app_{{ slug }}"
 
 [[service]]
 name = "backend"
 cwd = "backend"
-setup = "uv sync --extra dev --extra mcp"
+setup = "uv sync"
 command = "uv run uvicorn src.main:app --reload --port {{ port.backend }}"
 ready = { http = "http://localhost:{{ port.backend }}/openapi.json", timeout = "180s" }
 
@@ -67,13 +67,14 @@ setup = "npm install"
 command = "npm run dev -- --port {{ port.frontend }} --strictPort"
 ready = { http = "http://localhost:{{ port.frontend }}/", timeout = "180s" }
 
-# A fresh per-instance database has no organisation row, so every org-guarded route
-# answers 403 -- and the error names authentication, not missing data, which sends you
-# looking in the wrong place. Seed it once, here, rather than in six agents' prompts.
+# A fresh per-instance database is empty, so any route that looks up a tenant or
+# account answers 403 or 404 -- and the error names authentication, not missing data,
+# which sends you looking in the wrong place. Seed it here once, rather than in every
+# agent's prompt. `grove seed --force` re-runs this to reset a dirtied instance.
 [[seed]]
-name = "org"
+name = "account"
 cwd = "backend"
-command = "uv run python -m tests.e2e_harness.seed"
+command = "uv run python -m tests.seed"
 "#;
 
 pub fn reference() -> String {
@@ -162,6 +163,6 @@ the command line, that need a database created per instance, or that run several
 repositories as one unit, need a grove newer than this one. Run `grove --version` and
 check the project for a release that lists them.
 "#,
-        MONDRIO_EXAMPLE
+        EXAMPLE
     )
 }

@@ -148,9 +148,9 @@ fn waiting_for_ready_returns_once_the_service_answers() {
     .expect("should become ready");
 }
 
-/// mondrio's `/health` reports degraded by design, which is why its readiness probe points
-/// at `/openapi.json`. Any HTTP answer means the process is up; the status is not ours to
-/// judge.
+/// A health endpoint may report degraded by design when an optional dependency is
+/// unset, which is why readiness is measured on any answer at all. The process being up
+/// is the question; its opinion of itself is not ours to judge.
 #[test]
 fn an_error_status_still_counts_as_answering() {
     let port = serving("503 Service Unavailable");

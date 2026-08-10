@@ -35,7 +35,7 @@ impl Harness {
 #[test]
 fn an_instance_keeps_its_ports_across_restarts() {
     let h = Harness::new();
-    let r = h.resolved("mon_2695");
+    let r = h.resolved("feat_search");
 
     let first = h.registry.reserve(&r, &names()).expect("reserve");
     let second = h.registry.reserve(&r, &names()).expect("reserve again");
@@ -48,11 +48,11 @@ fn a_second_worktree_never_gets_the_first_worktrees_ports() {
     let h = Harness::new();
     let a = h
         .registry
-        .reserve(&h.resolved("mon_2694"), &names())
+        .reserve(&h.resolved("fix_login"), &names())
         .expect("reserve a");
     let b = h
         .registry
-        .reserve(&h.resolved("mon_2695"), &names())
+        .reserve(&h.resolved("feat_search"), &names())
         .expect("reserve b");
 
     for port in b.ports.values() {
@@ -66,7 +66,7 @@ fn a_second_worktree_never_gets_the_first_worktrees_ports() {
 #[test]
 fn reserving_records_the_instance_so_it_can_be_looked_up() {
     let h = Harness::new();
-    let r = h.resolved("mon_2695");
+    let r = h.resolved("feat_search");
 
     let reserved = h.registry.reserve(&r, &names()).expect("reserve");
     let found = h
@@ -76,7 +76,7 @@ fn reserving_records_the_instance_so_it_can_be_looked_up() {
         .expect("the instance must be recorded");
 
     assert_eq!(found.ports, reserved.ports);
-    assert_eq!(found.slug, "mon_2695");
+    assert_eq!(found.slug, "feat_search");
 }
 
 #[test]
@@ -92,10 +92,10 @@ fn an_unknown_worktree_is_simply_absent() {
 fn listing_reports_every_reserved_instance() {
     let h = Harness::new();
     h.registry
-        .reserve(&h.resolved("mon_2694"), &names())
+        .reserve(&h.resolved("fix_login"), &names())
         .expect("reserve a");
     h.registry
-        .reserve(&h.resolved("mon_2695"), &names())
+        .reserve(&h.resolved("feat_search"), &names())
         .expect("reserve b");
 
     let mut slugs: Vec<String> = h
@@ -107,13 +107,13 @@ fn listing_reports_every_reserved_instance() {
         .collect();
     slugs.sort();
 
-    assert_eq!(slugs, ["mon_2694", "mon_2695"]);
+    assert_eq!(slugs, ["feat_search", "fix_login"]);
 }
 
 #[test]
 fn releasing_frees_the_ports_for_the_next_instance() {
     let h = Harness::new();
-    let a = h.resolved("mon_2694");
+    let a = h.resolved("fix_login");
     let reserved = h.registry.reserve(&a, &names()).expect("reserve");
 
     h.registry.release(&a.worktree).expect("release");

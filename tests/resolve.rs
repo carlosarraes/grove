@@ -6,7 +6,7 @@ use grove::resolve;
 #[test]
 fn finds_the_main_worktree_from_inside_a_linked_worktree() {
     let fx = Fixture::new();
-    let wt = fx.add_worktree("mon-2695-fe-scope-guard");
+    let wt = fx.add_worktree("checkout-redesign");
 
     let r = resolve::resolve(&wt).expect("resolve");
 
@@ -16,7 +16,7 @@ fn finds_the_main_worktree_from_inside_a_linked_worktree() {
 #[test]
 fn finds_the_worktree_root_from_a_subdirectory() {
     let fx = Fixture::new();
-    let wt = fx.add_worktree("mon-2695-fe-scope-guard");
+    let wt = fx.add_worktree("checkout-redesign");
     let sub = wt.join("backend");
     std::fs::create_dir(&sub).expect("mkdir backend");
 
@@ -37,7 +37,7 @@ fn knows_it_is_in_the_main_worktree() {
 #[test]
 fn knows_it_is_in_a_linked_worktree() {
     let fx = Fixture::new();
-    let wt = fx.add_worktree("mon-2695-fe-scope-guard");
+    let wt = fx.add_worktree("checkout-redesign");
 
     let r = resolve::resolve(&wt).expect("resolve");
 
@@ -50,13 +50,13 @@ fn knows_it_is_in_a_linked_worktree() {
 #[test]
 fn slug_lowercases_and_underscores_the_worktree_directory_name() {
     let fx = Fixture::new();
-    // Real shape, from zapsign: uppercase ticket prefix and hyphens. The slug becomes a
+    // Real shape: an uppercase ticket prefix with hyphens. The slug becomes a
     // Mongo database name, so it has to come out as [a-z0-9_].
-    let wt = fx.add_worktree("ZEX-797-overage-scripts");
+    let wt = fx.add_worktree("PROJ-797-Overage-Scripts");
 
     let r = resolve::resolve(&wt).expect("resolve");
 
-    assert_eq!(r.slug, "zex_797_overage_scripts");
+    assert_eq!(r.slug, "proj_797_overage_scripts");
 }
 
 #[test]
@@ -70,7 +70,7 @@ fn every_worktree_of_a_repo_shares_one_state_key() {
 
 #[test]
 fn repos_with_the_same_directory_name_get_different_state_keys() {
-    // `~/a/mondrio-platform` and `~/b/mondrio-platform` must not share a registry entry.
+    // `~/a/checkout` and `~/b/checkout` must not share a registry entry.
     let one = Fixture::new();
     let two = Fixture::new();
     assert_eq!(

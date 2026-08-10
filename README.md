@@ -7,10 +7,10 @@ Built for the case where you have four agents on four tickets and all four want 
 
 ```
 $ grove up
-instance  mon-2695
+instance  checkout_redesign
 frontend  http://localhost:24310
 backend   http://localhost:24311
-database  app_mon_2695
+database  app_checkout_redesign
 ```
 
 ## The problem

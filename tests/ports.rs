@@ -11,15 +11,15 @@ fn names() -> Vec<String> {
 
 #[test]
 fn allocation_is_stable_while_the_block_stays_free() {
-    let a = ports::allocate("repo-stable", "mon_2695", &names()).expect("allocate");
-    let b = ports::allocate("repo-stable", "mon_2695", &names()).expect("allocate");
+    let a = ports::allocate("repo-stable", "feat_search", &names()).expect("allocate");
+    let b = ports::allocate("repo-stable", "feat_search", &names()).expect("allocate");
 
     assert_eq!(a, b);
 }
 
 #[test]
 fn ports_land_far_from_the_defaults_a_stale_config_falls_back_to() {
-    let a = ports::allocate("repo-range", "mon_2695", &names()).expect("allocate");
+    let a = ports::allocate("repo-range", "feat_search", &names()).expect("allocate");
 
     for (name, port) in &a {
         assert!(
@@ -32,8 +32,8 @@ fn ports_land_far_from_the_defaults_a_stale_config_falls_back_to() {
 
 #[test]
 fn two_worktrees_of_one_repo_get_different_ports() {
-    let a = ports::allocate("repo-distinct", "mon_2694", &names()).expect("allocate");
-    let b = ports::allocate("repo-distinct", "mon_2695", &names()).expect("allocate");
+    let a = ports::allocate("repo-distinct", "fix_login", &names()).expect("allocate");
+    let b = ports::allocate("repo-distinct", "feat_search", &names()).expect("allocate");
 
     assert_ne!(a["frontend"], b["frontend"]);
     assert_ne!(a["backend"], b["backend"]);

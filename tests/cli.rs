@@ -59,7 +59,7 @@ impl Cli {
         std::fs::create_dir_all(fx.main.join("backend")).expect("mkdir");
         std::fs::write(
             fx.main.join("backend/.env.local"),
-            "WORKOS__API_KEY=sk_live\nAPI_URL=http://localhost:8000\n",
+            "AUTH__API_KEY=sk_live\nAPI_URL=http://localhost:8000\n",
         )
         .expect("main env");
         std::fs::write(fx.main.join(".grove.toml"), config).expect("config");
@@ -98,15 +98,15 @@ impl Cli {
 #[test]
 fn up_starts_an_instance_in_a_worktree_that_had_nothing() {
     let cli = Cli::new();
-    let wt = cli.worktree("mon_2695");
+    let wt = cli.worktree("feat_search");
     assert!(!wt.join("backend/.env.local").exists(), "precondition");
 
     let out = cli.run(&wt, &["up"]).success().get_output().stdout.clone();
     let stdout = String::from_utf8_lossy(&out).into_owned();
 
     let env = std::fs::read_to_string(wt.join("backend/.env.local")).expect("env written");
-    assert!(env.contains("WORKOS__API_KEY=sk_live"), "{env}");
-    assert!(env.contains("INSTANCE=mon_2695"), "{env}");
+    assert!(env.contains("AUTH__API_KEY=sk_live"), "{env}");
+    assert!(env.contains("INSTANCE=feat_search"), "{env}");
 
     let port: u16 = env
         .lines()
@@ -131,8 +131,8 @@ fn up_starts_an_instance_in_a_worktree_that_had_nothing() {
 #[test]
 fn two_worktrees_run_at_once_without_touching_each_other() {
     let cli = Cli::new();
-    let a = cli.worktree("mon_2694");
-    let b = cli.worktree("mon_2695");
+    let a = cli.worktree("fix_login");
+    let b = cli.worktree("feat_search");
 
     cli.run(&a, &["up"]).success();
     cli.run(&b, &["up"]).success();
@@ -166,7 +166,7 @@ fn two_worktrees_run_at_once_without_touching_each_other() {
 #[test]
 fn down_stops_a_service_started_by_an_earlier_invocation() {
     let cli = Cli::new();
-    let wt = cli.worktree("mon_2695");
+    let wt = cli.worktree("feat_search");
     cli.run(&wt, &["up"]).success();
     let port: u16 = std::fs::read_to_string(wt.join("backend/.env.local"))
         .expect("env")
@@ -190,7 +190,7 @@ fn down_stops_a_service_started_by_an_earlier_invocation() {
 #[test]
 fn status_reports_the_ports_as_json_for_agents() {
     let cli = Cli::new();
-    let wt = cli.worktree("mon_2695");
+    let wt = cli.worktree("feat_search");
     cli.run(&wt, &["up"]).success();
 
     let out = cli
@@ -202,7 +202,7 @@ fn status_reports_the_ports_as_json_for_agents() {
     let parsed: serde_json::Value =
         serde_json::from_slice(&out).expect("status --json must emit valid json");
 
-    assert_eq!(parsed["slug"], "mon_2695");
+    assert_eq!(parsed["slug"], "feat_search");
     assert!(parsed["ports"]["web"].as_u64().is_some(), "{parsed}");
     assert_eq!(parsed["services"]["web"]["running"], true, "{parsed}");
 
@@ -212,7 +212,7 @@ fn status_reports_the_ports_as_json_for_agents() {
 #[test]
 fn logs_show_what_the_service_printed() {
     let cli = Cli::new();
-    let wt = cli.worktree("mon_2695");
+    let wt = cli.worktree("feat_search");
     cli.run(&wt, &["up"]).success();
 
     let out = cli
@@ -254,7 +254,7 @@ fn up_refuses_to_run_in_the_main_worktree() {
 #[test]
 fn an_unconfigured_repo_points_the_agent_at_the_schema() {
     let cli = Cli::new();
-    let wt = cli.worktree("mon_2695");
+    let wt = cli.worktree("feat_search");
     std::fs::remove_file(wt.join(".grove.toml")).expect("remove config");
 
     let assert = cli.run(&wt, &["up"]).failure();
@@ -266,7 +266,7 @@ fn an_unconfigured_repo_points_the_agent_at_the_schema() {
 #[test]
 fn doctor_passes_in_a_worktree_that_is_ready_to_start() {
     let cli = Cli::new();
-    let wt = cli.worktree("mon_2695");
+    let wt = cli.worktree("feat_search");
 
     let out = cli
         .run(&wt, &["doctor"])
@@ -277,7 +277,7 @@ fn doctor_passes_in_a_worktree_that_is_ready_to_start() {
     let stdout = String::from_utf8_lossy(&out).into_owned();
 
     assert!(stdout.contains("backend/.env.local"), "{stdout}");
-    assert!(stdout.contains("mon_2695"), "{stdout}");
+    assert!(stdout.contains("feat_search"), "{stdout}");
 }
 
 /// The failure grove exists to prevent, reported before anything is started.
@@ -285,7 +285,7 @@ fn doctor_passes_in_a_worktree_that_is_ready_to_start() {
 fn doctor_names_the_env_file_missing_from_the_main_checkout() {
     let cli = Cli::new();
     std::fs::remove_file(cli.fx.main.join("backend/.env.local")).expect("remove");
-    let wt = cli.worktree("mon_2695");
+    let wt = cli.worktree("feat_search");
 
     let assert = cli.run(&wt, &["doctor"]).failure();
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
@@ -300,7 +300,7 @@ fn doctor_names_the_env_file_missing_from_the_main_checkout() {
 #[test]
 fn doctor_in_an_unconfigured_repo_points_at_the_schema() {
     let cli = Cli::new();
-    let wt = cli.worktree("mon_2695");
+    let wt = cli.worktree("feat_search");
     std::fs::remove_file(wt.join(".grove.toml")).expect("remove config");
 
     let assert = cli.run(&wt, &["doctor"]).failure();
@@ -329,16 +329,16 @@ fn doctor_warns_that_the_main_worktree_cannot_be_started() {
 #[test]
 fn ls_lists_every_running_instance() {
     let cli = Cli::new();
-    let a = cli.worktree("mon_2694");
-    let b = cli.worktree("mon_2695");
+    let a = cli.worktree("fix_login");
+    let b = cli.worktree("feat_search");
     cli.run(&a, &["up"]).success();
     cli.run(&b, &["up"]).success();
 
     let out = cli.run(&a, &["ls"]).success().get_output().stdout.clone();
     let stdout = String::from_utf8_lossy(&out).into_owned();
 
-    assert!(stdout.contains("mon_2694"), "{stdout}");
-    assert!(stdout.contains("mon_2695"), "{stdout}");
+    assert!(stdout.contains("fix_login"), "{stdout}");
+    assert!(stdout.contains("feat_search"), "{stdout}");
 
     cli.run(&a, &["down"]).success();
     cli.run(&b, &["down"]).success();
@@ -347,7 +347,7 @@ fn ls_lists_every_running_instance() {
 #[test]
 fn run_executes_a_command_with_the_instance_environment() {
     let cli = Cli::new();
-    let wt = cli.worktree("mon_2695");
+    let wt = cli.worktree("feat_search");
     cli.run(&wt, &["up"]).success();
 
     let out = cli
@@ -399,7 +399,7 @@ fn skill_install_writes_a_skill_agents_can_load() {
 #[test]
 fn ls_reports_a_stopped_instance_as_stopped() {
     let cli = Cli::new();
-    let wt = cli.worktree("mon_2695");
+    let wt = cli.worktree("feat_search");
     cli.run(&wt, &["up"]).success();
 
     let running =
@@ -427,25 +427,25 @@ fn ls_reports_a_stopped_instance_as_stopped() {
 #[test]
 fn ls_answers_to_the_names_agents_actually_guess() {
     let cli = Cli::new();
-    let wt = cli.worktree("mon_2695");
+    let wt = cli.worktree("feat_search");
     cli.run(&wt, &["up"]).success();
 
     for name in ["ls", "list", "instances"] {
         cli.run(&wt, &[name])
             .success()
-            .stdout(predicates::str::contains("mon_2695"));
+            .stdout(predicates::str::contains("feat_search"));
     }
 
     cli.run(&wt, &["down"]).success();
 }
 
 /// Reported from parallel QA: agents shared agent-browser's default session, so one
-/// agent's navigation stole another's tab — and the resulting WorkOS error page reads as
+/// agent's navigation stole another's tab — and the resulting auth error page reads as
 /// an app bug in the wrong instance.
 #[test]
 fn run_isolates_the_browser_session_per_instance() {
     let cli = Cli::new();
-    let wt = cli.worktree("mon_2695");
+    let wt = cli.worktree("feat_search");
     cli.run(&wt, &["up"]).success();
 
     let out = cli
@@ -458,17 +458,17 @@ fn run_isolates_the_browser_session_per_instance() {
         .stdout
         .clone();
 
-    assert_eq!(String::from_utf8_lossy(&out).trim(), "mon_2695");
+    assert_eq!(String::from_utf8_lossy(&out).trim(), "feat_search");
     cli.run(&wt, &["down"]).success();
 }
 
 /// Code that reads `os.environ` before its settings library loads the .env file sees the
-/// wrong value otherwise — mondrio logged "ENVIRONMENT not set, defaulting to production"
+/// wrong value otherwise — a backend logged "ENVIRONMENT not set, defaulting to production"
 /// while ENVIRONMENT=test sat on line 8 of the file grove had just written.
 #[test]
 fn the_instance_overrides_are_in_the_environment_not_only_the_file() {
     let cli = Cli::new();
-    let wt = cli.worktree("mon_2695");
+    let wt = cli.worktree("feat_search");
     cli.run(&wt, &["up"]).success();
 
     let out = cli
@@ -480,7 +480,7 @@ fn the_instance_overrides_are_in_the_environment_not_only_the_file() {
 
     let printed = String::from_utf8_lossy(&out).trim().to_string();
     assert!(
-        printed.starts_with("mon_2695:http://localhost:"),
+        printed.starts_with("feat_search:http://localhost:"),
         "{printed}"
     );
     cli.run(&wt, &["down"]).success();
@@ -552,13 +552,13 @@ ready = { http = "http://127.0.0.1:{{ port.web }}/", timeout = "30s" }
 #[test]
 fn seeds_run_once_per_instance_and_skip_when_their_fixture_is_absent() {
     let cli = Cli::with_config(SEEDED_CONFIG);
-    let wt = cli.worktree("mon_2695");
+    let wt = cli.worktree("feat_search");
 
     cli.run(&wt, &["up"]).success();
     let seeded = wt.join("seeded.log");
     assert_eq!(
         std::fs::read_to_string(&seeded).expect("seed must have run"),
-        "mon_2695\n",
+        "feat_search\n",
         "the seed runs with the instance environment"
     );
     assert!(
@@ -571,7 +571,7 @@ fn seeds_run_once_per_instance_and_skip_when_their_fixture_is_absent() {
     cli.run(&wt, &["up"]).success();
     assert_eq!(
         std::fs::read_to_string(&seeded).expect("read"),
-        "mon_2695\n"
+        "feat_search\n"
     );
 
     cli.run(&wt, &["down"]).success();
@@ -580,7 +580,7 @@ fn seeds_run_once_per_instance_and_skip_when_their_fixture_is_absent() {
 #[test]
 fn seed_force_reruns_without_reinstalling_anything() {
     let cli = Cli::with_config(SEEDED_CONFIG);
-    let wt = cli.worktree("mon_2695");
+    let wt = cli.worktree("feat_search");
     cli.run(&wt, &["up"]).success();
 
     let out = cli
@@ -592,7 +592,7 @@ fn seed_force_reruns_without_reinstalling_anything() {
 
     assert_eq!(
         std::fs::read_to_string(wt.join("seeded.log")).expect("read"),
-        "mon_2695\nmon_2695\n"
+        "feat_search\nfeat_search\n"
     );
     let stdout = String::from_utf8_lossy(&out).into_owned();
     assert!(stdout.contains("org"), "{stdout}");
@@ -609,8 +609,8 @@ fn seed_force_reruns_without_reinstalling_anything() {
 #[test]
 fn prune_reclaims_instances_whose_worktree_is_gone() {
     let cli = Cli::new();
-    let doomed = cli.worktree("mon_2694");
-    let alive = cli.worktree("mon_2695");
+    let doomed = cli.worktree("fix_login");
+    let alive = cli.worktree("feat_search");
     cli.run(&doomed, &["up"]).success();
     cli.run(&alive, &["up"]).success();
 
@@ -635,7 +635,7 @@ fn prune_reclaims_instances_whose_worktree_is_gone() {
     let stdout = String::from_utf8_lossy(&out).into_owned();
 
     assert!(
-        stdout.contains("mon_2694"),
+        stdout.contains("fix_login"),
         "must name what it reclaimed: {stdout}"
     );
     std::thread::sleep(std::time::Duration::from_millis(400));
@@ -660,8 +660,8 @@ fn prune_reclaims_instances_whose_worktree_is_gone() {
             .clone(),
     )
     .into_owned();
-    assert!(!listed.contains("mon_2694"), "{listed}");
-    assert!(listed.contains("mon_2695"), "{listed}");
+    assert!(!listed.contains("fix_login"), "{listed}");
+    assert!(listed.contains("feat_search"), "{listed}");
 
     cli.run(&alive, &["down"]).success();
 }
@@ -669,7 +669,7 @@ fn prune_reclaims_instances_whose_worktree_is_gone() {
 #[test]
 fn prune_says_so_when_there_is_nothing_to_reclaim() {
     let cli = Cli::new();
-    let wt = cli.worktree("mon_2695");
+    let wt = cli.worktree("feat_search");
 
     cli.run(&wt, &["prune"])
         .success()
@@ -682,7 +682,7 @@ fn prune_says_so_when_there_is_nothing_to_reclaim() {
 #[test]
 fn ls_reports_an_orphan_rather_than_quietly_forgetting_it() {
     let cli = Cli::new();
-    let doomed = cli.worktree("mon_2694");
+    let doomed = cli.worktree("fix_login");
     cli.run(&doomed, &["up"]).success();
     std::fs::remove_dir_all(&doomed).expect("delete the worktree");
 
@@ -696,7 +696,7 @@ fn ls_reports_an_orphan_rather_than_quietly_forgetting_it() {
     .into_owned();
 
     assert!(
-        listed.contains("mon_2694"),
+        listed.contains("fix_login"),
         "the instance must stay listed until something stops it: {listed}"
     );
     assert!(
@@ -707,7 +707,7 @@ fn ls_reports_an_orphan_rather_than_quietly_forgetting_it() {
     // Still reclaimable, which is the whole point of not having forgotten it.
     cli.run(&cli.fx.main, &["prune"])
         .success()
-        .stdout(predicates::str::contains("mon_2694"));
+        .stdout(predicates::str::contains("fix_login"));
 }
 
 /// The natural reach after editing a service that does not hot-reload. Today that means
@@ -715,7 +715,7 @@ fn ls_reports_an_orphan_rather_than_quietly_forgetting_it() {
 #[test]
 fn restart_replaces_one_service_and_leaves_the_rest_alone() {
     let cli = Cli::new();
-    let wt = cli.worktree("mon_2695");
+    let wt = cli.worktree("feat_search");
     cli.run(&wt, &["up"]).success();
 
     let pid_of = |name: &str| -> u64 {
@@ -759,7 +759,7 @@ fn restart_replaces_one_service_and_leaves_the_rest_alone() {
 #[test]
 fn status_warns_when_a_service_predates_the_newest_source_change() {
     let cli = Cli::new();
-    let wt = cli.worktree("mon_2695");
+    let wt = cli.worktree("feat_search");
     cli.run(&wt, &["up"]).success();
 
     let clean = String::from_utf8_lossy(
@@ -801,7 +801,7 @@ fn status_warns_when_a_service_predates_the_newest_source_change() {
 #[test]
 fn logs_can_show_only_this_run_and_only_the_tail() {
     let cli = Cli::new();
-    let wt = cli.worktree("mon_2695");
+    let wt = cli.worktree("feat_search");
     cli.run(&wt, &["up"]).success();
     cli.run(&wt, &["restart", "web"]).success();
 
@@ -822,14 +822,21 @@ fn logs_can_show_only_this_run_and_only_the_tail() {
     )
     .into_owned();
 
+    // Assert the relationship, not an exact line count. Every test harness here owns a
+    // separate registry, so two running concurrently can be handed the same port and one
+    // readiness probe can be answered by the other's server — which perturbs how many
+    // startup lines land in a given log without saying anything about this behaviour.
     assert!(
         all.len() > since.len(),
         "--since-restart must drop earlier output"
     );
-    assert_eq!(
-        since.matches("Serving HTTP").count(),
-        1,
-        "exactly the current run: {since}"
+    assert!(
+        all.ends_with(&since),
+        "--since-restart must be a suffix of the whole log"
+    );
+    assert!(
+        since.contains("Serving HTTP"),
+        "and must still reach back to this run's startup: {since}"
     );
 
     let tail = String::from_utf8_lossy(

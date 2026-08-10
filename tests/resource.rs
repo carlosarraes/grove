@@ -14,7 +14,7 @@ image = "mongo:8.0.23"
 args = ["--replSet", "rs0"]
 port = {port}
 init = "rs.initiate()"
-db_name = "mondrio_{{{{ slug }}}}"
+db_name = "app_{{{{ slug }}}}"
 "#
     );
     config::parse(&toml)
@@ -89,10 +89,10 @@ fn container_arguments_come_after_the_image() {
 
 #[test]
 fn the_instance_database_name_is_reported_for_purging() {
-    let command = resource::drop_database_command(&mongo(27017), "mondrio_mon_2695");
+    let command = resource::drop_database_command(&mongo(27017), "app_feat_search");
 
     let line = command.join(" ");
-    assert!(line.contains("mondrio_mon_2695"), "{line}");
+    assert!(line.contains("app_feat_search"), "{line}");
     assert!(line.contains("dropDatabase"), "{line}");
 }
 
@@ -102,13 +102,13 @@ fn the_instance_database_name_is_reported_for_purging() {
 /// VM, or a forwarded socket.
 #[test]
 fn dropping_a_database_reaches_the_datastore_by_port() {
-    let command = resource::drop_database_command(&mongo(27017), "mondrio_mon_2695").join(" ");
+    let command = resource::drop_database_command(&mongo(27017), "app_feat_search").join(" ");
 
     assert!(
         command.contains("27017"),
         "must address the port: {command}"
     );
-    assert!(command.contains("mondrio_mon_2695"), "{command}");
+    assert!(command.contains("app_feat_search"), "{command}");
     assert!(command.contains("dropDatabase"), "{command}");
     assert!(
         !command.contains("exec"),

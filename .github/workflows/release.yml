@@ -50,12 +50,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Tags and full history, so the notes can diff against the previous release.
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           pattern: grove-*
           merge-multiple: true
+      - name: Release notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: bash scripts/release-notes.sh "$TAG" > RELEASE_NOTES.md
       - uses: softprops/action-gh-release@v2
         with:
+          body_path: RELEASE_NOTES.md
           files: |
             *.tar.gz
             *.sha256

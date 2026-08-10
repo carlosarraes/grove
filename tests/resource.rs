@@ -95,3 +95,23 @@ fn the_instance_database_name_is_reported_for_purging() {
     assert!(line.contains("mondrio_mon_2695"), "{line}");
     assert!(line.contains("dropDatabase"), "{line}");
 }
+
+/// `ensure` asks the port rather than the container runtime, and dropping has to work the
+/// same way — the datastore is often one grove did not start, whose container has a name
+/// grove never chose. Reaching it over the port works whether it is a local container, a
+/// VM, or a forwarded socket.
+#[test]
+fn dropping_a_database_reaches_the_datastore_by_port() {
+    let command = resource::drop_database_command(&mongo(27017), "mondrio_mon_2695").join(" ");
+
+    assert!(
+        command.contains("27017"),
+        "must address the port: {command}"
+    );
+    assert!(command.contains("mondrio_mon_2695"), "{command}");
+    assert!(command.contains("dropDatabase"), "{command}");
+    assert!(
+        !command.contains("exec"),
+        "a `docker exec` only reaches a container grove started: {command}"
+    );
+}

@@ -105,12 +105,13 @@ fn wait_reachable(resource: &Resource) -> Result<()> {
     )
 }
 
+/// Arguments for a host `mongosh` addressed at the datastore's port. The port is the one
+/// thing grove always knows: `ensure` found the datastore by asking it, and dropping has
+/// to work for a datastore grove never started.
 pub fn drop_database_command(resource: &Resource, database: &str) -> Vec<String> {
     vec![
-        "exec".to_string(),
-        container_name(resource),
-        "mongosh".to_string(),
         "--quiet".to_string(),
+        format!("mongodb://localhost:{}", resource.port),
         "--eval".to_string(),
         format!("db.getSiblingDB('{database}').dropDatabase()"),
     ]
@@ -120,15 +121,32 @@ pub fn drop_database_command(resource: &Resource, database: &str) -> Vec<String>
 /// did not start and cannot reach with `docker exec`, and failing `down` over a leftover
 /// database would be worse than leaving it. Says what to run by hand either way.
 pub fn drop_database(resource: &Resource, database: &str) -> Result<()> {
-    match docker(&drop_database_command(resource, database)) {
-        Ok(_) => Ok(()),
-        Err(_) => bail!(
-            "could not drop `{database}` automatically.\n\
-             grove did not start this {}, so it cannot reach it. Drop it with:\n  \
-             mongosh --eval \"db.getSiblingDB('{database}').dropDatabase()\"",
-            resource.name
-        ),
+    let argv = drop_database_command(resource, database);
+
+    // A host client first: it reaches the datastore however it is provided.
+    if let Ok(out) = std::process::Command::new("mongosh").args(&argv).output()
+        && out.status.success()
+    {
+        return Ok(());
     }
+
+    // Then a container grove started itself, for machines with no client installed.
+    let mut inside = vec![
+        "exec".to_string(),
+        container_name(resource),
+        "mongosh".to_string(),
+    ];
+    inside.extend(argv.iter().cloned());
+    if docker(&inside).is_ok() {
+        return Ok(());
+    }
+
+    bail!(
+        "could not drop `{database}` automatically — no mongosh on PATH, and no container \
+         grove started to run one in. Drop it with:\n  \
+         mongosh mongodb://localhost:{} --eval \"db.getSiblingDB('{database}').dropDatabase()\"",
+        resource.port
+    )
 }
 
 fn docker(argv: &[String]) -> Result<String> {

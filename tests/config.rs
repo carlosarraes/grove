@@ -65,6 +65,10 @@ fn llm_reference_explains_the_container_limit_and_existing_container_boundary() 
     assert!(reference.contains("after the image"), "{reference}");
     assert!(reference.contains("preserve"), "{reference}");
     assert!(reference.contains("recreate"), "{reference}");
+    assert!(reference.contains("dotenv"), "{reference}");
+    assert!(reference.contains("disable dotenv loading"), "{reference}");
+    assert!(reference.contains("process variables"), "{reference}");
+    assert!(reference.contains("container incarnation"), "{reference}");
 }
 
 #[test]

@@ -117,6 +117,11 @@ Any string value in [secrets.set], [[resource]].db_name, [[service]].command, an
                      code that reads the environment before its settings library loads
                      the file would otherwise see the pre-instance value.
 
+Grove renders configured dotenv files and overlays per-instance variables on commands it
+starts; it does not provide an empty settings environment. Tests that assert application
+defaults must disable dotenv loading and clear the relevant process variables in the
+repo's own fixture or settings constructor.
+
   [[resource]]       repeatable; a datastore shared across instances
   name               identifier
   kind               "docker-shared"; grove-started containers use
@@ -133,7 +138,8 @@ needed data, then deliberately remove and recreate that container.
 
   [[seed]]           repeatable; data the instance needs before it is useful.
                      `grove seed --force` re-runs them all, which is how a dirtied
-                     instance gets back to a known shape.
+                     instance gets back to a known shape. Grove records each managed
+                     container incarnation and re-runs seeds after resource recreation.
   name               identifier, also the marker and log file name
   cwd                working directory relative to the worktree root
   command            run once per instance, after dependencies, before services

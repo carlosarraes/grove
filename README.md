@@ -103,6 +103,11 @@ ready = { http = "http://localhost:{{ port.backend }}/health", timeout = "180s" 
 `grove --llm` prints the full schema and a worked example — that's what an agent reads to
 write one of these.
 
+Grove renders configured dotenv files and overlays per-instance variables on commands it
+starts; it does not provide an empty settings environment. Tests that assert application
+defaults must disable dotenv loading and clear the relevant process variables in the
+repo's own fixture or settings constructor.
+
 ## Commands
 
 | | |
@@ -113,9 +118,9 @@ write one of these.
 | `restart [service]` | replace one service without touching the others |
 | `status [--json]` | ports, pids, health — and a warning if a service predates your last edit |
 | `ls [--json]` | every instance on the machine, most neglected first, with the machine's load |
-| `run -- <cmd>` | run a command with this instance's environment |
+| `run -- <cmd>` | run a command with this instance's environment overlaid |
 | `logs [service] [--since-restart] [-n N]` | what a service printed |
-| `seed [--force]` | populate the datastore; `--force` rebuilds a dirtied instance |
+| `seed [--force]` | populate the datastore; markers follow the managed container incarnation, while `--force` rebuilds dirtied data |
 | `prune` | stop and forget instances whose worktree is gone |
 | `doctor` | check everything needed to start, and say what to fix |
 

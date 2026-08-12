@@ -44,6 +44,11 @@ sharing one session — see *Browser testing* below.
 Commands that read the worktree's own env files — the ordinary unit-test loop — work
 unwrapped, because `up` wrote those files to disk.
 
+Grove renders configured dotenv files and overlays per-instance variables on commands it
+starts; it does not provide an empty settings environment. Tests that assert application
+defaults must disable dotenv loading and clear the relevant process variables in the
+repo's own fixture or settings constructor.
+
 `grove status` shows what is running now, and `--json` makes it parseable.
 
 After editing a service that does not reload itself, replace just that one:
@@ -89,6 +94,8 @@ tell whose instance is whose, `grove down` in each worktree you own is the certa
 `up` runs the config's `[[seed]]` blocks once per worktree, after dependencies and before
 the services, and prints what each one did. A fresh instance has its own empty database,
 so whatever guarded routes need — an organisation row, a fixture — comes from there.
+Grove records the managed container incarnation with each seed marker, so recreating a
+shared resource makes every worktree seed again on its next `up`.
 
 ### Putting the data back
 

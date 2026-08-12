@@ -139,7 +139,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Run a command with this instance's environment exported
+    /// Run a command with this instance's environment overlaid
     Run {
         #[arg(trailing_var_arg = true, required = true)]
         argv: Vec<String>,
@@ -160,7 +160,7 @@ enum Command {
     Restart { service: Option<String> },
     /// Stop and forget instances whose worktree no longer exists
     Prune,
-    /// Populate this instance's datastore from the config's [[seed]] blocks
+    /// Populate data once per command and managed-resource recreation
     Seed {
         /// Re-run seeds that already ran for this instance
         #[arg(long)]

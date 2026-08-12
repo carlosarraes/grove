@@ -167,6 +167,8 @@ fn help_names_the_shared_container_open_file_limit() {
     let stdout = String::from_utf8_lossy(&out);
 
     assert!(stdout.contains("nofile=64000"), "{stdout}");
+    assert!(stdout.contains("environment overlaid"), "{stdout}");
+    assert!(stdout.contains("resource recreation"), "{stdout}");
 }
 
 /// The headline: a worktree with no env file, no ports, and no setup becomes a running
@@ -567,6 +569,10 @@ fn skill_install_writes_a_skill_agents_can_load() {
     );
     // The schema lives in the binary and is reached by pointer, so it cannot drift.
     assert!(body.contains("grove --llm"), "{body}");
+    assert!(body.contains("dotenv"), "{body}");
+    assert!(body.contains("disable dotenv loading"), "{body}");
+    assert!(body.contains("process variables"), "{body}");
+    assert!(body.contains("container incarnation"), "{body}");
     assert!(
         !body.contains("[[secrets]]"),
         "the skill must point at the schema rather than restate it"

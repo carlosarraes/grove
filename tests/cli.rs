@@ -76,6 +76,10 @@ impl FakeDocker {
         std::fs::write(&self.inspect, "docker daemon response was unavailable")
             .expect("write unreadable inspect fixture");
     }
+
+    fn set_logs(&self, root: &Path, body: &str) {
+        std::fs::write(root.join("docker.log"), body).expect("write docker logs fixture");
+    }
 }
 
 /// Stop whatever this test started, however the test ended. A `down` at the end of the
@@ -395,6 +399,109 @@ fn doctor_warns_that_the_main_worktree_cannot_be_started() {
     assert!(
         stdout.contains("main worktree"),
         "must explain why this directory cannot host an instance: {stdout}"
+    );
+}
+
+#[test]
+fn doctor_reports_a_healthy_managed_resource_identity_and_limit() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listen");
+    let port = listener.local_addr().expect("address").port();
+    let cli = Cli::with_fake_docker(
+        &resource_seed_config(port, "true"),
+        "healthy-container-abcdef",
+    );
+    let wt = cli.worktree("feat_search");
+
+    let output = cli.run(&wt, &["doctor"]).success();
+    let stdout = String::from_utf8_lossy(&output.get_output().stdout);
+
+    assert!(stdout.contains("healthy-cont"), "{stdout}");
+    assert!(stdout.contains("nofile=64000:64000"), "{stdout}");
+}
+
+#[test]
+fn doctor_warns_when_a_managed_resource_has_an_old_limit() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listen");
+    let port = listener.local_addr().expect("address").port();
+    let cli = Cli::with_fake_docker(&resource_seed_config(port, "true"), "old-limit-container");
+    cli.docker.as_ref().expect("fake docker").set_container(
+        "old-limit-container",
+        true,
+        0,
+        Some((1024, 1024)),
+    );
+    let wt = cli.worktree("feat_search");
+
+    let output = cli.run(&wt, &["doctor"]).success();
+    let stdout = String::from_utf8_lossy(&output.get_output().stdout);
+
+    assert!(stdout.contains("warn"), "{stdout}");
+    assert!(stdout.contains("expected 64000:64000"), "{stdout}");
+    assert!(stdout.contains("observed 1024:1024"), "{stdout}");
+}
+
+#[test]
+fn doctor_explains_a_stopped_managed_resource() {
+    let port = TcpListener::bind("127.0.0.1:0")
+        .expect("find port")
+        .local_addr()
+        .expect("address")
+        .port();
+    let cli = Cli::with_fake_docker(
+        &resource_seed_config(port, "true"),
+        "stopped-container-abcdef",
+    );
+    let docker = cli.docker.as_ref().expect("fake docker");
+    docker.set_container("stopped-container-abcdef", false, 133, None);
+    docker.set_logs(cli.state.path(), "MongoDB abort: Too many open files\n");
+    let wt = cli.worktree("feat_search");
+
+    let output = cli.run(&wt, &["doctor"]).failure();
+    let stdout = String::from_utf8_lossy(&output.get_output().stdout);
+
+    assert!(stdout.contains("exit 133"), "{stdout}");
+    assert!(stdout.contains("Too many open files"), "{stdout}");
+    assert!(stdout.contains("preserve"), "{stdout}");
+    assert!(stdout.contains("recreate"), "{stdout}");
+}
+
+#[test]
+fn doctor_keeps_an_answering_external_resource_valid_when_docker_is_unavailable() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listen");
+    let port = listener.local_addr().expect("address").port();
+    let cli = Cli::with_fake_docker(&resource_seed_config(port, "true"), "unused");
+    cli.docker
+        .as_ref()
+        .expect("fake docker")
+        .set_unreadable_inspect();
+    let wt = cli.worktree("feat_search");
+
+    let output = cli.run(&wt, &["doctor"]).success();
+    let stdout = String::from_utf8_lossy(&output.get_output().stdout);
+
+    assert!(stdout.contains("external or unobserved"), "{stdout}");
+}
+
+#[test]
+fn doctor_fails_when_an_absent_resource_needs_unavailable_docker() {
+    let port = TcpListener::bind("127.0.0.1:0")
+        .expect("find port")
+        .local_addr()
+        .expect("address")
+        .port();
+    let cli = Cli::with_fake_docker(&resource_seed_config(port, "true"), "unused");
+    cli.docker
+        .as_ref()
+        .expect("fake docker")
+        .set_unreadable_inspect();
+    let wt = cli.worktree("feat_search");
+
+    let output = cli.run(&wt, &["doctor"]).failure();
+    let stdout = String::from_utf8_lossy(&output.get_output().stdout);
+
+    assert!(
+        stdout.contains("Docker cannot inspect or start"),
+        "{stdout}"
     );
 }
 

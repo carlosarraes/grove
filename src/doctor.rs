@@ -8,6 +8,7 @@ use std::fmt;
 
 use crate::instance::Instance;
 use crate::resource;
+use crate::resource::{NOFILE_LIMIT, Observation};
 
 pub enum Verdict {
     Ok(String),
@@ -66,27 +67,7 @@ pub fn check(instance: &Instance) -> Vec<Verdict> {
     }
 
     for declared in &instance.config.resources {
-        if resource::is_reachable(declared.port) {
-            verdicts.push(Verdict::Ok(format!(
-                "{} answering on {}",
-                declared.name, declared.port
-            )));
-        } else if declared.image.is_some() {
-            verdicts.push(Verdict::Warn(format!(
-                "{} is not running; `grove up` will start {} on port {}",
-                declared.name,
-                declared.image.as_deref().unwrap_or("it"),
-                declared.port
-            )));
-        } else {
-            verdicts.push(Verdict::Fail {
-                what: format!("{} is not answering on {}", declared.name, declared.port),
-                fix: format!(
-                    "start it yourself — `{}` declares no image for grove to run",
-                    declared.name
-                ),
-            });
-        }
+        verdicts.push(check_resource(declared, resource::observe(declared)));
     }
 
     for (name, port) in &instance.entry.ports {
@@ -100,6 +81,110 @@ pub fn check(instance: &Instance) -> Vec<Verdict> {
     }
 
     verdicts
+}
+
+fn check_resource(declared: &crate::config::Resource, observed: Observation) -> Verdict {
+    let expected = format!("{NOFILE_LIMIT}:{NOFILE_LIMIT}");
+    if observed.reachable {
+        return match observed.container {
+            Some(container)
+                if container.running && container.nofile == Some((NOFILE_LIMIT, NOFILE_LIMIT)) =>
+            {
+                Verdict::Ok(format!(
+                    "{} answering on {}, container {}, nofile={expected}",
+                    declared.name,
+                    declared.port,
+                    short_id(&container.id)
+                ))
+            }
+            Some(container) if container.running => {
+                let actual = container
+                    .nofile
+                    .map(|(soft, hard)| format!("{soft}:{hard}"))
+                    .unwrap_or_else(|| "not explicitly set".to_string());
+                Verdict::Warn(format!(
+                    "{} answering on {}, container {} has nofile observed {actual}, expected {expected}. \
+                     Preserve needed data, then deliberately remove and recreate it to adopt the limit.",
+                    declared.name,
+                    declared.port,
+                    short_id(&container.id)
+                ))
+            }
+            Some(container) => Verdict::Warn(format!(
+                "{} answers on {}, but stopped container {} (exit {}) still owns Grove's name. \
+                 Preserve needed data, then remove it before Grove ever needs to recreate the resource.",
+                declared.name,
+                declared.port,
+                short_id(&container.id),
+                container.exit_code
+            )),
+            None => Verdict::Ok(format!(
+                "{} answering on {} (external or unobserved; Docker launch limits unavailable{})",
+                declared.name,
+                declared.port,
+                observed
+                    .docker_error
+                    .as_deref()
+                    .map(|error| format!(": {error}"))
+                    .unwrap_or_default()
+            )),
+        };
+    }
+
+    if let Some(container) = observed.container {
+        let logs = resource::logs(declared, 10)
+            .map(|body| body.trim().to_string())
+            .unwrap_or_else(|error| format!("resource logs unavailable: {error:#}"));
+        let state = if container.running {
+            "running"
+        } else {
+            "stopped"
+        };
+        return Verdict::Fail {
+            what: format!(
+                "{} is not answering on {}; managed container {} is {state} (exit {})",
+                declared.name,
+                declared.port,
+                short_id(&container.id),
+                container.exit_code
+            ),
+            fix: format!(
+                "the existing container name blocks `grove up`; first preserve any needed data, then remove \
+                 and recreate the container. Last resource log lines:\n{logs}"
+            ),
+        };
+    }
+
+    if let Some(error) = observed.docker_error
+        && declared.image.is_some()
+    {
+        return Verdict::Fail {
+            what: format!(
+                "{} is not answering on {}, and Docker cannot inspect or start it",
+                declared.name, declared.port
+            ),
+            fix: format!("make Docker available, then run `grove up` again: {error}"),
+        };
+    }
+
+    if let Some(image) = &declared.image {
+        Verdict::Warn(format!(
+            "{} is not running; `grove up` will start {image} on port {}",
+            declared.name, declared.port
+        ))
+    } else {
+        Verdict::Fail {
+            what: format!("{} is not answering on {}", declared.name, declared.port),
+            fix: format!(
+                "start it yourself — `{}` declares no image for grove to run",
+                declared.name
+            ),
+        }
+    }
+}
+
+fn short_id(id: &str) -> String {
+    id.chars().take(12).collect()
 }
 
 /// Print the report and return whether everything needed to start is in place.

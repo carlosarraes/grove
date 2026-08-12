@@ -23,6 +23,10 @@ Two things break the moment you run more than one worktree at a time:
 - **Everything wants the same port.** Two worktrees, and the second one loses. Or worse,
   half-wins: a frontend that can't reach its own backend quietly talks to the *other*
   instance's backend instead.
+- **Nothing tells you when there are too many.** Starting an instance is cheap and leaving
+  one running is invisible, so they accumulate — and the bill arrives disguised as flaky
+  tests on somebody's unrelated branch. `grove ls` reports the machine's load alongside
+  the instances, and `grove down --idle 2h` reclaims the forgotten ones.
 
 grove reads secrets from your main checkout, rewrites the handful of values that must
 differ, assigns each worktree a port block it keeps across restarts, and gives each its
@@ -102,9 +106,10 @@ write one of these.
 |---|---|
 | `up` | render config, start services, wait until ready |
 | `down [--purge]` | stop services; `--purge` also drops the database |
+| `down --idle 2h` \| `--all-but-this` | stop instances across the machine, keeping their ports; `--dry-run` names them first |
 | `restart [service]` | replace one service without touching the others |
 | `status [--json]` | ports, pids, health — and a warning if a service predates your last edit |
-| `ls` | every instance on the machine |
+| `ls [--json]` | every instance on the machine, most neglected first, with the machine's load |
 | `run -- <cmd>` | run a command with this instance's environment |
 | `logs [service] [--since-restart] [-n N]` | what a service printed |
 | `seed [--force]` | populate the datastore; `--force` rebuilds a dirtied instance |

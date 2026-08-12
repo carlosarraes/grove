@@ -1,6 +1,6 @@
 ---
 name: grove
-description: Run this repo's dev servers inside a git worktree - each worktree gets its own ports, env files, and database. Use when starting or restarting a dev server, when a port is already in use, when a service fails to start on a missing .env or config error, or when a test needs a live server.
+description: Run this repo's dev servers inside a git worktree - each worktree gets its own ports, env files, and database. Use when starting or restarting a dev server, when a port is already in use, when a service fails to start on a missing .env or config error, when a test needs a live server, when tests fail or time out in ways your change does not explain, or when work in a worktree is finished.
 ---
 
 # grove
@@ -38,16 +38,13 @@ grove run -- sh -c 'curl localhost:$GROVE_PORT_BACKEND/health'
 `GROVE_PORT_WEB` — plus `GROVE_SLUG`, `GROVE_DB_NAME`, `GROVE_WORKTREE`, and every
 per-instance override the config declares.
 
-It also sets `AGENT_BROWSER_SESSION` to this instance's slug, so browser automation run
-through `grove run` gets its own session. Driving a browser outside `grove run` shares
-one session across every instance on the machine, and a sibling's navigation will steal
-the tab — which then reads as an authentication bug in whichever instance was watching.
+It also sets `AGENT_BROWSER_SESSION`, which is what keeps parallel browser automation from
+sharing one session — see *Browser testing* below.
 
 Commands that read the worktree's own env files — the ordinary unit-test loop — work
 unwrapped, because `up` wrote those files to disk.
 
-`grove status` shows what is running now, and `--json` makes it parseable. Stop the
-instance with `grove down` when the work is finished.
+`grove status` shows what is running now, and `--json` makes it parseable.
 
 After editing a service that does not reload itself, replace just that one:
 
@@ -57,6 +54,35 @@ grove restart backend
 
 `status` flags a service that started before your newest edit, because it goes on serving
 the code you already changed and nothing else says so.
+
+## Finishing
+
+```
+grove down
+```
+
+Starting an instance is cheap and leaving one running is invisible, so a machine
+accumulates them until they start costing someone else — see *When tests fail* below.
+Stopping one when the ticket is done is what keeps that from happening.
+
+When several have already piled up, stop the ones nobody is working in:
+
+```
+grove down --idle 2h --dry-run   # name them first
+grove down --idle 2h             # then stop them
+grove down --all-but-this        # everything except the worktree you are in
+```
+
+These keep each instance's port reservation, so a URL written down while one was running
+still works when it comes back. (`grove prune` is the other case: instances whose worktree
+has been deleted.)
+
+**Read the list before sweeping when other agents share the machine.** grove counts an
+instance as busy while its services are still writing to their logs, which covers an agent
+driving a browser through a long QA pass. A box that is quiet for some other reason — a
+review paused mid-read, a session waiting on a human — looks exactly like an abandoned
+one. `--dry-run` names every casualty, generous windows cost little, and where you cannot
+tell whose instance is whose, `grove down` in each worktree you own is the certain move.
 
 ## Seeding
 
@@ -80,6 +106,33 @@ never re-seeds, so an instance keeps whatever you did to it until you ask for th
 
 A route answering 403 or "not found" in a fresh instance usually means missing seed data
 rather than a broken login, because the error names authentication either way.
+
+## When tests fail in ways your change does not explain
+
+One dev stack per worktree means a machine can end up carrying a dozen of them. That cost
+never arrives as a grove error. It arrives as a **noisy neighbour**: the box is
+oversubscribed, and your tests time out on a branch that did not break them.
+
+The signature — any one of these is enough to suspect it:
+
+- Timeouts rather than assertion failures, especially where a test mounts a real component.
+- Failures in files your change never touched.
+- A failure count that drifts between runs — six, then four, then two.
+- A clean checkout of the base branch fails the same tests.
+
+Check the machine before you check the branch:
+
+```
+grove ls
+```
+
+The footer reports load against core count and how many instances are up. Load at or past
+the core count, with a crowd of instances behind it, means the machine is the suspect and
+the branch is probably innocent. `grove ls --json` carries the same numbers plus each
+instance's idle age, for a decision made in code rather than by reading.
+
+The fix is *Finishing* above: stop what nobody is using, then re-run the failing tests
+before changing any code.
 
 ## When something is wrong
 

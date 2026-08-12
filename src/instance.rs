@@ -216,7 +216,7 @@ impl Instance {
     pub fn resources(&self) -> Result<Vec<String>> {
         let mut started = Vec::new();
         for resource in &self.config.resources {
-            if crate::resource::ensure(resource)? {
+            if crate::resource::ensure(resource)?.started {
                 started.push(resource.name.clone());
             }
         }

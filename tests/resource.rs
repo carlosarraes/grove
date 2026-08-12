@@ -84,11 +84,8 @@ fn docker_flags_precede_the_image_and_container_arguments_follow_it() {
     let publish = argv.iter().position(|a| a == "-p").expect("publish");
     let ulimit = argv.iter().position(|a| a == "--ulimit").expect("ulimit");
 
-    assert_eq!(
-        argv.get(ulimit + 1).map(String::as_str),
-        Some("nofile=64000:64000"),
-        "{argv:?}"
-    );
+    let expected_limit = format!("nofile={0}:{0}", resource::NOFILE_LIMIT);
+    assert_eq!(argv.get(ulimit + 1), Some(&expected_limit), "{argv:?}");
     assert!(publish < image, "{argv:?}");
     assert!(ulimit < image, "{argv:?}");
     assert!(image < repl, "{argv:?}");

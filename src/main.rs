@@ -160,7 +160,7 @@ enum Command {
     Restart { service: Option<String> },
     /// Stop and forget instances whose worktree no longer exists
     Prune,
-    /// Populate data once per command and managed-resource recreation
+    /// Populate data; rerun after seed changes or resource recreation
     Seed {
         /// Re-run seeds that already ran for this instance
         #[arg(long)]

@@ -102,6 +102,11 @@ fn seed_decision(
                     why: Some("command changed".to_string()),
                 };
             }
+            if let Some(name) = recently_started.iter().next() {
+                return SeedDecision::Run {
+                    why: Some(format!("resource {name} was recreated")),
+                };
+            }
             for (name, id) in current_resources {
                 if previous.resources.get(name) != Some(id) {
                     return SeedDecision::Run {
@@ -723,13 +728,31 @@ pub fn parse_duration(text: &str) -> Result<std::time::Duration> {
 
 #[cfg(test)]
 mod seed_marker_tests {
-    use super::{SeedDecision, StoredSeedMarker, seed_decision};
+    use super::{SeedDecision, SeedMarker, StoredSeedMarker, seed_decision};
     use std::collections::{BTreeMap, BTreeSet};
 
     #[test]
     fn a_resource_started_now_invalidates_a_matching_legacy_marker() {
         let command = "seed the database";
         let stored = StoredSeedMarker::Legacy(command.to_string());
+        let started = BTreeSet::from(["mongo".to_string()]);
+
+        let decision = seed_decision(Some(&stored), command, &BTreeMap::new(), &started, false);
+
+        assert!(matches!(
+            decision,
+            SeedDecision::Run { why: Some(why) } if why == "resource mongo was recreated"
+        ));
+    }
+
+    #[test]
+    fn a_resource_started_now_invalidates_a_matching_structured_marker() {
+        let command = "seed the database";
+        let stored = StoredSeedMarker::Structured(SeedMarker {
+            version: 1,
+            command: command.to_string(),
+            resources: BTreeMap::from([("mongo".to_string(), "old-id".to_string())]),
+        });
         let started = BTreeSet::from(["mongo".to_string()]);
 
         let decision = seed_decision(Some(&stored), command, &BTreeMap::new(), &started, false);

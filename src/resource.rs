@@ -32,6 +32,8 @@ pub fn decide(resource: &Resource) -> Decision {
     let mut argv = vec![
         "run".to_string(),
         "-d".to_string(),
+        "--ulimit".to_string(),
+        "nofile=64000:64000".to_string(),
         "--name".to_string(),
         container_name(resource),
         "-p".to_string(),

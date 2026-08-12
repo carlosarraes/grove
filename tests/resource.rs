@@ -68,10 +68,10 @@ fn an_absent_datastore_is_started_from_its_declared_image() {
     );
 }
 
-/// Container args belong after the image; publishing and naming belong before it. Getting
-/// this backwards makes docker treat `--replSet` as its own flag and fail obscurely.
+/// Docker flags belong before the image; container args belong after it. Getting this
+/// backwards makes docker treat `--replSet` as its own flag and fail obscurely.
 #[test]
-fn container_arguments_come_after_the_image() {
+fn docker_flags_precede_the_image_and_container_arguments_follow_it() {
     let Decision::Start(argv) = resource::decide(&mongo(a_free_port())) else {
         panic!("should start");
     };
@@ -82,9 +82,16 @@ fn container_arguments_come_after_the_image() {
         .expect("image");
     let repl = argv.iter().position(|a| a == "--replSet").expect("replSet");
     let publish = argv.iter().position(|a| a == "-p").expect("publish");
+    let ulimit = argv.iter().position(|a| a == "--ulimit").expect("ulimit");
 
-    assert!(image < repl, "{argv:?}");
+    assert_eq!(
+        argv.get(ulimit + 1).map(String::as_str),
+        Some("nofile=64000:64000"),
+        "{argv:?}"
+    );
     assert!(publish < image, "{argv:?}");
+    assert!(ulimit < image, "{argv:?}");
+    assert!(image < repl, "{argv:?}");
 }
 
 #[test]

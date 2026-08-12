@@ -25,6 +25,78 @@ pub struct Entry {
     pub services: BTreeMap<String, crate::supervise::Handle>,
     #[serde(default)]
     pub db_name: Option<String>,
+    /// Unix seconds at the last command that meant someone was working here. Optional
+    /// because entries written before this existed have no answer, and guessing one would
+    /// make every instance on an upgraded machine look abandoned.
+    #[serde(default)]
+    pub last_used: Option<u64>,
+    /// Where this instance's service logs live. Persisted because it derives from
+    /// `Resolved::state_key`, which hangs off the main worktree — a path `ls` has no other
+    /// way to reach, since it reads the registry and never resolves a worktree.
+    #[serde(default)]
+    pub instance_dir: Option<PathBuf>,
+}
+
+impl Entry {
+    /// Seconds since the last evidence that anyone was using this instance, or None when
+    /// there is no evidence either way.
+    ///
+    /// Two sources, because neither is sufficient alone. `last_used` misses an agent
+    /// forty minutes into browser-driven QA, which issues no grove commands while being
+    /// maximally busy; the service logs catch exactly that, because a backend serving it
+    /// is writing request lines the whole time.
+    ///
+    /// It errs toward looking busy — a chatty reload watcher keeps an idle instance off
+    /// the list. For a number that decides what gets killed, that is the right direction
+    /// to be wrong in.
+    pub fn idle_seconds(&self, now: u64) -> Option<u64> {
+        let logged = self
+            .services
+            .keys()
+            .filter_map(|name| self.log_touched(name))
+            .max();
+        let freshest = self.last_used.into_iter().chain(logged).max()?;
+        Some(now.saturating_sub(freshest))
+    }
+
+    fn log_touched(&self, service: &str) -> Option<u64> {
+        let dir = self.instance_dir.as_ref()?;
+        dir.join(format!("{service}.log"))
+            .metadata()
+            .ok()?
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs())
+    }
+
+    /// Any service still answering. A recorded pid says only that something started once.
+    pub fn is_running(&self) -> bool {
+        self.services.values().any(crate::supervise::is_alive)
+    }
+}
+
+/// An age as a person would say it, for a column read at a glance while deciding what to
+/// stop. Two units at most: "1h30m" is worth the extra word, "1h30m12s" is not.
+pub fn human_age(seconds: u64) -> String {
+    let (days, hours) = (seconds / 86_400, seconds % 86_400 / 3600);
+    let (minutes, secs) = (seconds % 3600 / 60, seconds % 60);
+    match (days, hours, minutes) {
+        (0, 0, 0) => format!("{secs}s"),
+        (0, 0, _) => format!("{minutes}m"),
+        (0, _, 0) => format!("{hours}h"),
+        (0, _, _) => format!("{hours}h{minutes}m"),
+        (_, 0, _) => format!("{days}d"),
+        (_, _, _) => format!("{days}d{hours}h"),
+    }
+}
+
+pub fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -86,6 +158,8 @@ impl Registry {
                 )?,
                 services: BTreeMap::new(),
                 db_name: None,
+                last_used: None,
+                instance_dir: None,
             };
             state.instances.insert(key, entry.clone());
             Ok(entry)
@@ -95,7 +169,25 @@ impl Registry {
     /// Persist an entry that changed — new service pids, a resolved database name.
     pub fn record(&self, entry: &Entry) -> Result<()> {
         self.with_lock(|state| {
-            state.instances.insert(key(&entry.worktree), entry.clone());
+            let mut entry = entry.clone();
+            // The idle clock only ever moves forward. Callers hold an `Entry` read before
+            // they started working, and writing it back verbatim would roll the touch
+            // that command just made back to whatever it was minutes earlier.
+            if let Some(stored) = state.instances.get(&key(&entry.worktree)) {
+                entry.last_used = entry.last_used.max(stored.last_used);
+            }
+            state.instances.insert(key(&entry.worktree), entry);
+            Ok(())
+        })
+    }
+
+    /// Mark this instance as worked in. Separate from `record` because it must not
+    /// overwrite service pids a concurrent `up` has just written.
+    pub fn touch(&self, worktree: &Path) -> Result<()> {
+        self.with_lock(|state| {
+            if let Some(entry) = state.instances.get_mut(&key(worktree)) {
+                entry.last_used = Some(now());
+            }
             Ok(())
         })
     }

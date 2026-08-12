@@ -2,6 +2,7 @@ pub mod config;
 pub mod doctor;
 pub mod instance;
 pub mod llm;
+pub mod load;
 pub mod ports;
 pub mod registry;
 pub mod render;

@@ -199,3 +199,157 @@ fn concurrent_reservations_never_overlap() {
         "a port was handed to two instances at once"
     );
 }
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs()
+}
+
+/// Idle age is what `grove down --idle` acts on, so an entry that predates the field must
+/// not be readable as "idle forever" — or a v0.1.9 registry would hand the first sweep a
+/// list of every instance on the machine.
+#[test]
+fn an_entry_written_before_idle_tracking_still_parses() {
+    let state = TempDir::new().expect("tempdir");
+    let path = state.path().join("registry.json");
+    std::fs::write(
+        &path,
+        r#"{"instances":{"/tmp/old":{"worktree":"/tmp/old","slug":"old",
+           "ports":{"web":24310},"services":{},"db_name":null}}}"#,
+    )
+    .expect("write a registry from before these fields existed");
+
+    let entry = Registry::at(&path)
+        .get(std::path::Path::new("/tmp/old"))
+        .expect("get")
+        .expect("the old entry must still be readable");
+
+    assert_eq!(entry.slug, "old");
+    assert_eq!(entry.last_used, None);
+    assert_eq!(entry.instance_dir, None);
+    assert_eq!(entry.idle_seconds(now()), None);
+}
+
+#[test]
+fn touching_records_that_someone_is_working_here() {
+    let h = Harness::new();
+    let r = h.resolved("feat_search");
+    h.registry.reserve(&r, &names()).expect("reserve");
+
+    h.registry.touch(&r.worktree).expect("touch");
+
+    let entry = h.registry.get(&r.worktree).expect("get").expect("entry");
+    let idle = entry
+        .idle_seconds(now())
+        .expect("a touched instance has an age");
+    assert!(idle < 60, "just touched, but reads as {idle}s idle");
+}
+
+/// The hazard this exists to prevent. An agent forty minutes into browser-driven QA —
+/// clicking dialogs, waiting on autosave, reading DOM — issues no grove commands at all
+/// while being maximally busy. On `last_used` alone its box reads as abandoned, and a
+/// sibling's `grove down --idle 30m` kills its backend mid-run.
+///
+/// A backend serving that QA is writing request logs the whole time, so the log is the
+/// evidence `last_used` cannot supply.
+#[test]
+fn an_instance_serving_traffic_is_not_idle_though_no_grove_command_ran() {
+    let h = Harness::new();
+    let r = h.resolved("feat_search");
+    let mut entry = h.registry.reserve(&r, &names()).expect("reserve");
+
+    let logs = TempDir::new().expect("tempdir");
+    entry.instance_dir = Some(logs.path().to_path_buf());
+    entry.last_used = Some(now() - 3600);
+    entry.services.insert(
+        "backend".to_string(),
+        grove::supervise::Handle {
+            pid: 1,
+            started_at: now() - 28_800,
+        },
+    );
+    std::fs::write(logs.path().join("backend.log"), "GET /api/quotes 200\n").expect("log");
+
+    let idle = entry.idle_seconds(now()).expect("age");
+    assert!(
+        idle < 60,
+        "an instance whose backend is still logging requests must not read as idle: {idle}s"
+    );
+}
+
+/// A log belonging to a service that is no longer running says nothing about now.
+#[test]
+fn a_stale_log_does_not_keep_an_instance_looking_busy() {
+    let h = Harness::new();
+    let r = h.resolved("feat_search");
+    let mut entry = h.registry.reserve(&r, &names()).expect("reserve");
+
+    let logs = TempDir::new().expect("tempdir");
+    let log = logs.path().join("backend.log");
+    std::fs::write(&log, "old\n").expect("log");
+    std::fs::File::options()
+        .write(true)
+        .open(&log)
+        .expect("open")
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200))
+        .expect("backdate the log");
+
+    entry.instance_dir = Some(logs.path().to_path_buf());
+    entry.last_used = Some(now() - 3600);
+    entry.services.insert(
+        "backend".to_string(),
+        grove::supervise::Handle {
+            pid: 1,
+            started_at: now() - 28_800,
+        },
+    );
+
+    let idle = entry.idle_seconds(now()).expect("age");
+    assert!(
+        (3500..3700).contains(&idle),
+        "with an older log, the last grove command is the freshest evidence: {idle}s"
+    );
+}
+
+/// Never sweep what cannot be measured.
+#[test]
+fn an_instance_with_no_evidence_of_use_has_no_idle_age() {
+    let h = Harness::new();
+    let r = h.resolved("feat_search");
+    let entry = h.registry.reserve(&r, &names()).expect("reserve");
+
+    assert_eq!(entry.idle_seconds(now()), None);
+}
+
+/// These ages are read at a glance while deciding what to stop, so they round to the
+/// largest unit that still says something useful.
+#[test]
+fn ages_read_the_way_a_person_says_them() {
+    use grove::registry::human_age;
+    assert_eq!(human_age(45), "45s");
+    assert_eq!(human_age(12 * 60), "12m");
+    assert_eq!(human_age(90 * 60), "1h30m");
+    assert_eq!(human_age(6 * 3600), "6h");
+    assert_eq!(human_age(50 * 3600), "2d2h");
+}
+
+/// A command holds the `Entry` it read at startup and writes it back when it starts a
+/// service. Doing that verbatim would roll back the touch the same command just made, so
+/// every instance would look as idle as it was before anyone worked in it.
+#[test]
+fn recording_a_stale_entry_does_not_roll_back_the_idle_clock() {
+    let h = Harness::new();
+    let r = h.resolved("feat_search");
+    let read_before_working = h.registry.reserve(&r, &names()).expect("reserve");
+
+    h.registry.touch(&r.worktree).expect("touch");
+    h.registry.record(&read_before_working).expect("record");
+
+    let entry = h.registry.get(&r.worktree).expect("get").expect("entry");
+    assert!(
+        entry.last_used.is_some(),
+        "recording an entry read before the touch must not undo it"
+    );
+}

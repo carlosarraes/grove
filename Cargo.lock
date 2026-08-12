@@ -294,6 +294,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "insta",
+ "libc",
  "minijinja",
  "predicates",
  "rustix",

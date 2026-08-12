@@ -67,13 +67,30 @@ impl Instance {
         let registry = registry()?;
         let entry = registry.reserve(&resolved, &config.ports.names)?;
         let state_dir = state_dir()?;
-        Ok(Instance {
+        let mut instance = Instance {
             resolved,
             config,
             entry,
             registry,
             state_dir,
-        })
+        };
+
+        // Recorded here because `ls` reads the registry without resolving a worktree, and
+        // this path derives from the main worktree — which the registry does not store.
+        // Written once and then left alone, so the common case is a lock-free read.
+        let dir = instance.instance_dir();
+        if instance.entry.instance_dir.as_deref() != Some(dir.as_path()) {
+            instance.entry.instance_dir = Some(dir);
+            instance.registry.record(&instance.entry)?;
+        }
+
+        Ok(instance)
+    }
+
+    /// Record that work is happening here, so a later `grove down --idle` can tell this
+    /// instance from one nobody has opened since Tuesday.
+    pub fn touch(&self) -> Result<()> {
+        self.registry.touch(&self.resolved.worktree)
     }
 
     /// Mutating commands refuse in the main checkout: rendering there would overwrite the
@@ -520,15 +537,25 @@ pub fn tail(path: &Path, lines: usize) -> Option<String> {
     Some(collected[start..].join("\n"))
 }
 
-fn parse_duration(text: &str) -> Result<std::time::Duration> {
+/// `"180s"`, `"2m"`, `"6h"`, `"2d"`, `"500ms"`, or a bare number of seconds. Readiness
+/// timeouts and `--idle` windows are the same kind of value written by the same hands, so
+/// they parse the same way.
+pub fn parse_duration(text: &str) -> Result<std::time::Duration> {
     let trimmed = text.trim();
+    // "ms" is tested before "s", or every millisecond value would parse as seconds.
     let (value, multiplier) = match trimmed.strip_suffix("ms") {
         Some(v) => (v, 1u64),
         None => match trimmed.strip_suffix('s') {
             Some(v) => (v, 1000),
             None => match trimmed.strip_suffix('m') {
                 Some(v) => (v, 60_000),
-                None => (trimmed, 1000),
+                None => match trimmed.strip_suffix('h') {
+                    Some(v) => (v, 3_600_000),
+                    None => match trimmed.strip_suffix('d') {
+                        Some(v) => (v, 86_400_000),
+                        None => (trimmed, 1000),
+                    },
+                },
             },
         },
     };

@@ -42,6 +42,8 @@ VITE_PROXY_TARGET = "http://localhost:{{ port.backend }}"
 # One container shared by every instance. grove probes the port first and reuses
 # whatever already answers, so a Mongo from Docker, from a VM, or forwarded over SSH all
 # work without changing this block. Instances are isolated by database name.
+# Containers grove starts use --ulimit nofile=64000:64000. `args` below belong to
+# mongod and follow the image; they are not Docker flags.
 [[resource]]
 name = "mongo"
 kind = "docker-shared"
@@ -117,12 +119,17 @@ Any string value in [secrets.set], [[resource]].db_name, [[service]].command, an
 
   [[resource]]       repeatable; a datastore shared across instances
   name               identifier
-  kind               "docker-shared"
+  kind               "docker-shared"; grove-started containers use
+                     --ulimit nofile=64000:64000
   image              container image, used only if nothing answers on `port` already
-  args               extra arguments to the container command
+  args               extra arguments to the container command, after the image
   port               port to probe, and to publish if grove starts it
   init               one-time command against a freshly started resource
   db_name            per-instance database name; a template
+
+Grove reuses anything already answering on a resource's port and does not alter its
+launch configuration. To adopt the fixed limit in an existing container, preserve any
+needed data, then deliberately remove and recreate that container.
 
   [[seed]]           repeatable; data the instance needs before it is useful.
                      `grove seed --force` re-runs them all, which is how a dirtied

@@ -93,6 +93,21 @@ impl Cli {
     }
 }
 
+#[test]
+fn help_names_the_shared_container_open_file_limit() {
+    let out = Command::cargo_bin("grove")
+        .expect("binary")
+        .arg("--help")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&out);
+
+    assert!(stdout.contains("nofile=64000"), "{stdout}");
+}
+
 /// The headline: a worktree with no env file, no ports, and no setup becomes a running
 /// instance in one command.
 #[test]

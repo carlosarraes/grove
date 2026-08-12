@@ -34,7 +34,9 @@ own database on a shared server.
 
 It is **not** a Docker wrapper. Your services run as ordinary processes on your machine.
 Docker appears only for an optional shared datastore, and only if one isn't already
-running.
+running. A container grove starts receives `nofile=64000:64000`; an existing container
+keeps its original launch configuration. Preserve any needed data before deliberately
+removing and recreating one to adopt the limit.
 
 ## Install
 
@@ -77,6 +79,7 @@ into = "backend/.env.local"
 CORS_ORIGINS = "http://localhost:{{ port.frontend }}"
 DATABASE_NAME = "{{ db.name }}"
 
+# Containers grove starts receive nofile=64000:64000.
 [[resource]]
 name = "mongo"
 kind = "docker-shared"
@@ -104,7 +107,7 @@ write one of these.
 
 | | |
 |---|---|
-| `up` | render config, start services, wait until ready |
+| `up` | render config, start missing shared containers with `nofile=64000`, start services |
 | `down [--purge]` | stop services; `--purge` also drops the database |
 | `down --idle 2h` \| `--all-but-this` | stop instances across the machine, keeping their ports; `--dry-run` names them first |
 | `restart [service]` | replace one service without touching the others |

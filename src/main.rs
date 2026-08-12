@@ -104,7 +104,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Render config, ensure resources, start services, wait for ready
+    /// Render config, start missing shared containers with nofile=64000, start services
     Up {
         /// Restart services that are already running
         #[arg(long)]

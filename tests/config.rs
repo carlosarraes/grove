@@ -58,6 +58,16 @@ fn the_documented_example_parses() {
 }
 
 #[test]
+fn llm_reference_explains_the_container_limit_and_existing_container_boundary() {
+    let reference = llm::reference();
+
+    assert!(reference.contains("nofile=64000:64000"), "{reference}");
+    assert!(reference.contains("after the image"), "{reference}");
+    assert!(reference.contains("preserve"), "{reference}");
+    assert!(reference.contains("recreate"), "{reference}");
+}
+
+#[test]
 fn secrets_carry_the_per_instance_overrides() {
     let c = config::parse(llm::EXAMPLE).expect("parse");
     let backend = c

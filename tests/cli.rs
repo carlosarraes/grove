@@ -2,6 +2,7 @@ mod common;
 
 use assert_cmd::Command;
 use common::Fixture;
+use std::net::TcpListener;
 use std::path::Path;
 use tempfile::TempDir;
 
@@ -31,6 +32,50 @@ struct Cli {
     state: TempDir,
     fx: Fixture,
     started: std::cell::RefCell<Vec<std::path::PathBuf>>,
+    docker: Option<FakeDocker>,
+}
+
+struct FakeDocker {
+    program: std::path::PathBuf,
+    inspect: std::path::PathBuf,
+}
+
+impl FakeDocker {
+    fn at(root: &Path, id: &str) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+
+        let program = root.join("fake-docker");
+        let inspect = root.join("docker-inspect.json");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\ncase \"$1\" in\n  inspect) cat \"$GROVE_DOCKER_INSPECT\" ;;\n  logs) cat \"$GROVE_DOCKER_LOGS\" ;;\n  *) exit 0 ;;\nesac\n",
+        )
+        .expect("write fake docker");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake docker");
+        let fake = FakeDocker { program, inspect };
+        fake.set_container(id, true, 0, Some((64_000, 64_000)));
+        fake
+    }
+
+    fn set_container(&self, id: &str, running: bool, exit_code: i64, nofile: Option<(u64, u64)>) {
+        let ulimits = nofile.map_or_else(
+            || "[]".to_string(),
+            |(soft, hard)| format!(r#"[{{"Name":"nofile","Soft":{soft},"Hard":{hard}}}]"#),
+        );
+        std::fs::write(
+            &self.inspect,
+            format!(
+                r#"[{{"Id":"{id}","State":{{"Running":{running},"ExitCode":{exit_code}}},"HostConfig":{{"Ulimits":{ulimits}}}}}]"#
+            ),
+        )
+        .expect("write docker inspect fixture");
+    }
+
+    fn set_unreadable_inspect(&self) {
+        std::fs::write(&self.inspect, "docker daemon response was unavailable")
+            .expect("write unreadable inspect fixture");
+    }
 }
 
 /// Stop whatever this test started, however the test ended. A `down` at the end of the
@@ -73,7 +118,14 @@ impl Cli {
             state: TempDir::new().expect("tempdir"),
             fx,
             started: std::cell::RefCell::new(Vec::new()),
+            docker: None,
         }
+    }
+
+    fn with_fake_docker(config: &str, id: &str) -> Self {
+        let mut cli = Cli::with_config(config);
+        cli.docker = Some(FakeDocker::at(cli.state.path(), id));
+        cli
     }
 
     /// A worktree whose services this harness is responsible for stopping.
@@ -84,12 +136,17 @@ impl Cli {
     }
 
     fn run(&self, cwd: &Path, args: &[&str]) -> assert_cmd::assert::Assert {
-        Command::cargo_bin("grove")
-            .expect("binary")
+        let mut command = Command::cargo_bin("grove").expect("binary");
+        command
             .current_dir(cwd)
-            .env("GROVE_STATE_DIR", self.state.path())
-            .args(args)
-            .assert()
+            .env("GROVE_STATE_DIR", self.state.path());
+        if let Some(docker) = &self.docker {
+            command
+                .env("GROVE_DOCKER", &docker.program)
+                .env("GROVE_DOCKER_INSPECT", &docker.inspect)
+                .env("GROVE_DOCKER_LOGS", self.state.path().join("docker.log"));
+        }
+        command.args(args).assert()
     }
 }
 
@@ -622,6 +679,169 @@ fn seed_force_reruns_without_reinstalling_anything() {
     );
 
     cli.run(&wt, &["down"]).success();
+}
+
+fn resource_seed_config(port: u16, command: &str) -> String {
+    format!(
+        r#"
+version = 1
+
+[[resource]]
+name = "mongo"
+kind = "docker-shared"
+image = "mongo:8"
+port = {port}
+
+[[seed]]
+name = "org"
+command = "{command}"
+"#
+    )
+}
+
+fn seed_marker(root: &Path) -> std::path::PathBuf {
+    fn find(dir: &Path) -> Option<std::path::PathBuf> {
+        for entry in std::fs::read_dir(dir).ok()? {
+            let path = entry.ok()?.path();
+            if path.file_name().and_then(|name| name.to_str()) == Some(".seed-org") {
+                return Some(path);
+            }
+            if path.is_dir()
+                && let Some(found) = find(&path)
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+    find(root).expect("seed marker")
+}
+
+#[test]
+fn seed_marker_is_invalidated_when_a_managed_resource_is_recreated() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listen");
+    let port = listener.local_addr().expect("address").port();
+    let cli = Cli::with_fake_docker(
+        &resource_seed_config(port, "echo $GROVE_SLUG >> seeded.log"),
+        "mongo-generation-a",
+    );
+    let wt = cli.worktree("feat_search");
+
+    cli.run(&wt, &["up"]).success();
+    cli.run(&wt, &["up"]).success();
+    assert_eq!(
+        std::fs::read_to_string(wt.join("seeded.log")).expect("seed log"),
+        "feat_search\n"
+    );
+
+    cli.docker.as_ref().expect("fake docker").set_container(
+        "mongo-generation-b",
+        true,
+        0,
+        Some((64_000, 64_000)),
+    );
+    let output = cli.run(&wt, &["up"]).success();
+    assert_eq!(
+        std::fs::read_to_string(wt.join("seeded.log")).expect("seed log"),
+        "feat_search\nfeat_search\n"
+    );
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    assert!(stderr.contains("resource mongo was recreated"), "{stderr}");
+}
+
+#[test]
+fn a_matching_legacy_seed_marker_migrates_without_rerunning() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listen");
+    let port = listener.local_addr().expect("address").port();
+    let command = "echo $GROVE_SLUG >> seeded.log";
+    let cli = Cli::with_fake_docker(&resource_seed_config(port, command), "mongo-generation-a");
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+    let marker = seed_marker(cli.state.path());
+    std::fs::write(&marker, command).expect("write legacy marker");
+
+    cli.run(&wt, &["up"]).success();
+
+    assert_eq!(
+        std::fs::read_to_string(wt.join("seeded.log")).expect("seed log"),
+        "feat_search\n"
+    );
+    let migrated: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(marker).expect("read migrated marker"))
+            .expect("marker should migrate to json");
+    assert_eq!(migrated["resources"]["mongo"], "mongo-generation-a");
+}
+
+#[test]
+fn changing_a_seed_command_invalidates_its_marker() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listen");
+    let port = listener.local_addr().expect("address").port();
+    let cli = Cli::with_fake_docker(
+        &resource_seed_config(port, "echo first >> seeded.log"),
+        "mongo-generation-a",
+    );
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+    std::fs::write(
+        wt.join(".grove.toml"),
+        resource_seed_config(port, "echo second >> seeded.log"),
+    )
+    .expect("change seed command");
+
+    let output = cli.run(&wt, &["up"]).success();
+
+    assert_eq!(
+        std::fs::read_to_string(wt.join("seeded.log")).expect("seed log"),
+        "first\nsecond\n"
+    );
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    assert!(stderr.contains("command changed"), "{stderr}");
+}
+
+#[test]
+fn a_malformed_structured_seed_marker_is_not_trusted() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listen");
+    let port = listener.local_addr().expect("address").port();
+    let cli = Cli::with_fake_docker(
+        &resource_seed_config(port, "echo $GROVE_SLUG >> seeded.log"),
+        "mongo-generation-a",
+    );
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+    std::fs::write(seed_marker(cli.state.path()), "{not valid json").expect("corrupt seed marker");
+
+    let output = cli.run(&wt, &["up"]).success();
+
+    assert_eq!(
+        std::fs::read_to_string(wt.join("seeded.log")).expect("seed log"),
+        "feat_search\nfeat_search\n"
+    );
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    assert!(stderr.contains("seed marker was invalid"), "{stderr}");
+}
+
+#[test]
+fn an_unobservable_resource_does_not_invalidate_a_seed_marker() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listen");
+    let port = listener.local_addr().expect("address").port();
+    let cli = Cli::with_fake_docker(
+        &resource_seed_config(port, "echo $GROVE_SLUG >> seeded.log"),
+        "mongo-generation-a",
+    );
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+    cli.docker
+        .as_ref()
+        .expect("fake docker")
+        .set_unreadable_inspect();
+
+    cli.run(&wt, &["up"]).success();
+
+    assert_eq!(
+        std::fs::read_to_string(wt.join("seeded.log")).expect("seed log"),
+        "feat_search\n",
+        "a Docker observation failure is not evidence that the datastore was recreated"
+    );
 }
 
 /// A deleted worktree cannot be `cd`-ed into, so `down` can never reach it — its services

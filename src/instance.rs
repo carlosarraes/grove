@@ -1,7 +1,8 @@
 //! One worktree's instance: its ports, its rendered config, its running services.
 
 use anyhow::{Context, Result, bail};
-use std::collections::BTreeMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::config::{self, Config};
@@ -16,6 +17,7 @@ pub struct Instance {
     pub entry: Entry,
     registry: Registry,
     state_dir: PathBuf,
+    recently_started_resources: BTreeSet<String>,
 }
 
 pub struct ServiceStatus {
@@ -25,14 +27,128 @@ pub struct ServiceStatus {
 }
 
 pub enum SeedOutcome {
-    Ran { name: String },
+    Ran { name: String, why: Option<String> },
     Skipped { name: String, why: String },
+}
+
+const SEED_MARKER_VERSION: u8 = 1;
+
+#[derive(Deserialize, Serialize)]
+struct SeedMarker {
+    version: u8,
+    command: String,
+    #[serde(default)]
+    resources: BTreeMap<String, String>,
+}
+
+enum StoredSeedMarker {
+    Structured(SeedMarker),
+    Legacy(String),
+    Invalid,
+}
+
+enum SeedDecision {
+    Run { why: Option<String> },
+    Skip,
+}
+
+fn read_seed_marker(path: &Path) -> Result<Option<StoredSeedMarker>> {
+    let body = match std::fs::read_to_string(path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    if !body.trim_start().starts_with('{') {
+        return Ok(Some(StoredSeedMarker::Legacy(body)));
+    }
+    let stored = match serde_json::from_str::<SeedMarker>(&body) {
+        Ok(marker) if marker.version == SEED_MARKER_VERSION => StoredSeedMarker::Structured(marker),
+        Ok(_) | Err(_) => StoredSeedMarker::Invalid,
+    };
+    Ok(Some(stored))
+}
+
+fn seed_decision(
+    stored: Option<&StoredSeedMarker>,
+    command: &str,
+    current_resources: &BTreeMap<String, String>,
+    recently_started: &BTreeSet<String>,
+    force: bool,
+) -> SeedDecision {
+    if force {
+        return SeedDecision::Run { why: None };
+    }
+    match stored {
+        None => SeedDecision::Run { why: None },
+        Some(StoredSeedMarker::Invalid) => SeedDecision::Run {
+            why: Some("seed marker was invalid".to_string()),
+        },
+        Some(StoredSeedMarker::Legacy(previous)) => {
+            if previous != command {
+                return SeedDecision::Run {
+                    why: Some("command changed".to_string()),
+                };
+            }
+            match recently_started.iter().next() {
+                Some(name) => SeedDecision::Run {
+                    why: Some(format!("resource {name} was recreated")),
+                },
+                None => SeedDecision::Skip,
+            }
+        }
+        Some(StoredSeedMarker::Structured(previous)) => {
+            if previous.command != command {
+                return SeedDecision::Run {
+                    why: Some("command changed".to_string()),
+                };
+            }
+            for (name, id) in current_resources {
+                if previous.resources.get(name) != Some(id) {
+                    return SeedDecision::Run {
+                        why: Some(format!("resource {name} was recreated")),
+                    };
+                }
+            }
+            SeedDecision::Skip
+        }
+    }
+}
+
+fn merged_resources(
+    stored: Option<&StoredSeedMarker>,
+    current: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut resources = match stored {
+        Some(StoredSeedMarker::Structured(marker)) => marker.resources.clone(),
+        _ => BTreeMap::new(),
+    };
+    resources.extend(current.clone());
+    resources
+}
+
+fn write_seed_marker(
+    path: &Path,
+    command: &str,
+    resources: BTreeMap<String, String>,
+) -> Result<()> {
+    let marker = SeedMarker {
+        version: SEED_MARKER_VERSION,
+        command: command.to_string(),
+        resources,
+    };
+    let mut body = serde_json::to_string_pretty(&marker)?;
+    body.push('\n');
+    std::fs::write(path, body).with_context(|| format!("writing {}", path.display()))
 }
 
 impl std::fmt::Display for SeedOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SeedOutcome::Ran { name } => write!(f, "seed {name} ... ok"),
+            SeedOutcome::Ran { name, why: None } => write!(f, "seed {name} ... ok"),
+            SeedOutcome::Ran {
+                name,
+                why: Some(why),
+            } => write!(f, "seed {name} ... ok ({why})"),
             SeedOutcome::Skipped { name, why } => write!(f, "seed {name} ... skipped ({why})"),
         }
     }
@@ -73,6 +189,7 @@ impl Instance {
             entry,
             registry,
             state_dir,
+            recently_started_resources: BTreeSet::new(),
         };
 
         // Recorded here because `ls` reads the registry without resolving a worktree, and
@@ -213,11 +330,13 @@ impl Instance {
     }
 
     /// Bring up every declared datastore, reusing anything already answering on its port.
-    pub fn resources(&self) -> Result<Vec<String>> {
+    pub fn resources(&mut self) -> Result<Vec<String>> {
         let mut started = Vec::new();
         for resource in &self.config.resources {
             if crate::resource::ensure(resource)?.started {
                 started.push(resource.name.clone());
+                self.recently_started_resources
+                    .insert(resource.name.clone());
             }
         }
         Ok(started)
@@ -268,6 +387,7 @@ impl Instance {
     pub fn seed(&self, force: bool) -> Result<Vec<SeedOutcome>> {
         let mut outcomes = Vec::new();
         let environment = self.environment()?;
+        let current_resources = self.resource_incarnations();
 
         for seed in &self.config.seeds {
             let cwd = match &seed.cwd {
@@ -285,8 +405,24 @@ impl Instance {
                 continue;
             }
 
+            let command = render::value(&seed.command, &self.render_context())
+                .with_context(|| format!("rendering the command for seed {}", seed.name))?;
             let marker = self.instance_dir().join(format!(".seed-{}", seed.name));
-            if marker.exists() && !force {
+            let stored = read_seed_marker(&marker)?;
+            let decision = seed_decision(
+                stored.as_ref(),
+                &command,
+                &current_resources,
+                &self.recently_started_resources,
+                force,
+            );
+            if matches!(decision, SeedDecision::Skip) {
+                std::fs::create_dir_all(self.instance_dir())?;
+                write_seed_marker(
+                    &marker,
+                    &command,
+                    merged_resources(stored.as_ref(), &current_resources),
+                )?;
                 outcomes.push(SeedOutcome::Skipped {
                     name: seed.name.clone(),
                     why: "already seeded".to_string(),
@@ -303,8 +439,6 @@ impl Instance {
                 .with_context(|| format!("opening {}", log.display()))?;
             let errors = sink.try_clone().context("duplicating the log handle")?;
 
-            let command = render::value(&seed.command, &self.render_context())
-                .with_context(|| format!("rendering the command for seed {}", seed.name))?;
             let status = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(&command)
@@ -323,13 +457,34 @@ impl Instance {
                     tail(&log, 30).unwrap_or_default()
                 );
             }
-            std::fs::write(&marker, &command)?;
+            write_seed_marker(
+                &marker,
+                &command,
+                merged_resources(stored.as_ref(), &current_resources),
+            )?;
             outcomes.push(SeedOutcome::Ran {
                 name: seed.name.clone(),
+                why: match decision {
+                    SeedDecision::Run { why } => why,
+                    SeedDecision::Skip => unreachable!(),
+                },
             });
         }
 
         Ok(outcomes)
+    }
+
+    fn resource_incarnations(&self) -> BTreeMap<String, String> {
+        self.config
+            .resources
+            .iter()
+            .filter_map(|resource| {
+                let observed = crate::resource::observe(resource);
+                observed
+                    .container
+                    .map(|container| (resource.name.clone(), container.id))
+            })
+            .collect()
     }
 
     /// Start every service that is not already running, waiting for each readiness probe.
@@ -564,4 +719,24 @@ pub fn parse_duration(text: &str) -> Result<std::time::Duration> {
         .parse()
         .with_context(|| format!("{text:?} is not a duration like \"180s\""))?;
     Ok(std::time::Duration::from_millis(amount * multiplier))
+}
+
+#[cfg(test)]
+mod seed_marker_tests {
+    use super::{SeedDecision, StoredSeedMarker, seed_decision};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn a_resource_started_now_invalidates_a_matching_legacy_marker() {
+        let command = "seed the database";
+        let stored = StoredSeedMarker::Legacy(command.to_string());
+        let started = BTreeSet::from(["mongo".to_string()]);
+
+        let decision = seed_decision(Some(&stored), command, &BTreeMap::new(), &started, false);
+
+        assert!(matches!(
+            decision,
+            SeedDecision::Run { why: Some(why) } if why == "resource mongo was recreated"
+        ));
+    }
 }

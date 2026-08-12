@@ -402,16 +402,21 @@ fn ls_reports_a_stopped_instance_as_stopped() {
     let wt = cli.worktree("feat_search");
     cli.run(&wt, &["up"]).success();
 
-    let running =
+    // The instance's own row, not the whole page: the footer counts what is running on
+    // the machine, and matching that would let this test pass on the wrong evidence.
+    let row = |cli: &Cli| -> String {
         String::from_utf8_lossy(&cli.run(&wt, &["ls"]).success().get_output().stdout.clone())
-            .into_owned();
-    assert!(running.contains("running"), "while up: {running}");
+            .lines()
+            .find(|l| l.contains("feat_search"))
+            .expect("the instance must be listed")
+            .to_string()
+    };
+
+    assert!(row(&cli).contains("running"), "while up: {}", row(&cli));
 
     cli.run(&wt, &["down"]).success();
 
-    let stopped =
-        String::from_utf8_lossy(&cli.run(&wt, &["ls"]).success().get_output().stdout.clone())
-            .into_owned();
+    let stopped = row(&cli);
     assert!(
         !stopped.contains("running"),
         "after down, nothing is listening — ls must not claim otherwise: {stopped}"
@@ -848,6 +853,557 @@ fn logs_can_show_only_this_run_and_only_the_tail() {
     )
     .into_owned();
     assert_eq!(tail.lines().count(), 1, "{tail}");
+
+    cli.run(&wt, &["down"]).success();
+}
+
+fn registry_of(cli: &Cli) -> grove::registry::Registry {
+    grove::registry::Registry::at(cli.state.path().join("registry.json"))
+}
+
+/// Age an instance so a later command's effect on the idle clock is visible without the
+/// test sleeping through it.
+///
+/// Both halves of the signal have to move. `up` writes a service log on the way past, so
+/// an instance that only had its clock rolled back is still "busy" — correctly, and that
+/// is the browser-QA protection working, but it means a test wanting a stale instance has
+/// to backdate the logs too.
+fn backdate(cli: &Cli, worktree: &Path, seconds: u64) {
+    let entry = registry_of(cli).get(worktree).expect("get").expect("entry");
+
+    if let Some(dir) = &entry.instance_dir {
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(seconds);
+        for log in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let _ = std::fs::File::options()
+                .write(true)
+                .open(log.path())
+                .map(|f| f.set_modified(when));
+        }
+    }
+
+    // Edited in the file rather than through `record`, which will not move the clock
+    // backwards — that invariant is what stops a command writing back a stale entry and
+    // undoing its own touch, and a test wanting an aged instance has to go around it.
+    let path = cli.state.path().join("registry.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("registry")).expect("json");
+    state["instances"][worktree.to_str().expect("utf-8 path")]["last_used"] =
+        (grove::registry::now() - seconds).into();
+    std::fs::write(&path, serde_json::to_string_pretty(&state).expect("json")).expect("write");
+}
+
+fn last_used(cli: &Cli, worktree: &Path) -> Option<u64> {
+    registry_of(cli)
+        .get(worktree)
+        .expect("get")
+        .expect("entry")
+        .last_used
+}
+
+/// What `--idle` sweeps is decided by this clock, so which commands advance it *is* the
+/// feature. Working in an instance keeps it; looking at one must not, because agents poll
+/// `status` in a loop and `ls` is what you read while deciding what to stop — either one
+/// refreshing the thing it reports on would make the sweep list permanently empty.
+#[test]
+fn work_advances_the_idle_clock_and_inspection_leaves_it_alone() {
+    let cli = Cli::new();
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+
+    assert!(
+        last_used(&cli, &wt).is_some(),
+        "up must mark the instance used"
+    );
+
+    for inspection in [vec!["status"], vec!["ls"]] {
+        backdate(&cli, &wt, 7200);
+        let before = last_used(&cli, &wt);
+        cli.run(&wt, &inspection).success();
+        assert_eq!(
+            last_used(&cli, &wt),
+            before,
+            "`grove {}` is a read and must not look like work",
+            inspection.join(" ")
+        );
+    }
+
+    for work in [vec!["run", "--", "true"], vec!["seed"], vec!["logs", "web"]] {
+        backdate(&cli, &wt, 7200);
+        cli.run(&wt, &work).success();
+        let idle = grove::registry::now() - last_used(&cli, &wt).expect("used");
+        assert!(
+            idle < 60,
+            "`grove {}` means someone is working here, but it read as {idle}s idle",
+            work.join(" ")
+        );
+    }
+
+    cli.run(&wt, &["down"]).success();
+}
+
+impl Cli {
+    /// Real machine load is not something a test can arrange, so grove lets both halves
+    /// be forced. Set on the child, never on this process — `set_var` is unsafe in this
+    /// edition and would race the other tests sharing this binary.
+    fn run_on_machine(
+        &self,
+        cwd: &Path,
+        args: &[&str],
+        load: &str,
+        cores: &str,
+    ) -> assert_cmd::assert::Assert {
+        Command::cargo_bin("grove")
+            .expect("binary")
+            .current_dir(cwd)
+            .env("GROVE_STATE_DIR", self.state.path())
+            .env("GROVE_LOAD", load)
+            .env("GROVE_CORES", cores)
+            .args(args)
+            .assert()
+    }
+}
+
+/// The failure mode of this whole feature is crying wolf. An agent that learns grove
+/// warns on a quiet machine learns to skip grove's warnings, including the one that
+/// would have saved it an hour — so the quiet case is the case worth guarding.
+#[test]
+fn a_calm_machine_is_never_warned_about() {
+    let cli = Cli::new();
+    let a = cli.worktree("fix_login");
+    let b = cli.worktree("feat_search");
+    cli.run(&a, &["up"]).success();
+
+    let out = cli.run_on_machine(&b, &["up"], "0.4", "16");
+    let stderr = String::from_utf8_lossy(&out.success().get_output().stderr).into_owned();
+
+    assert!(
+        !stderr.contains("warning"),
+        "two instances on an idle machine is not a pile-up: {stderr}"
+    );
+
+    cli.run(&a, &["down"]).success();
+    cli.run(&b, &["down"]).success();
+}
+
+/// The other false positive: one big type-check crosses load 16 on a sixteen-core box
+/// with only a couple of instances up. Nothing there is reclaimable, so the warning would
+/// offer to stop an idle box that is not the problem.
+#[test]
+fn a_loaded_machine_with_few_instances_is_never_warned_about() {
+    let cli = Cli::new();
+    let a = cli.worktree("fix_login");
+    let b = cli.worktree("feat_search");
+    cli.run(&a, &["up"]).success();
+
+    let out = cli.run_on_machine(&b, &["up"], "40", "8");
+    let stderr = String::from_utf8_lossy(&out.success().get_output().stderr).into_owned();
+
+    assert!(
+        !stderr.contains("warning"),
+        "a busy machine with nothing to reclaim is not grove's news to break: {stderr}"
+    );
+
+    cli.run(&a, &["down"]).success();
+    cli.run(&b, &["down"]).success();
+}
+
+/// The pile-up forms one agent at a time, and each one is currently told nothing about
+/// what it is joining. The warning has to name the boxes — "would stop 7" answers how
+/// many when the question is which.
+#[test]
+fn joining_a_crowded_machine_warns_and_names_what_can_be_reclaimed() {
+    let cli = Cli::new();
+    let crowd: Vec<_> = ["one", "two", "three", "four"]
+        .iter()
+        .map(|s| cli.worktree(s))
+        .collect();
+    for wt in &crowd {
+        cli.run(wt, &["up"]).success();
+    }
+    backdate(&cli, &crowd[0], 6 * 3600);
+
+    let joining = cli.worktree("five");
+    let out = cli.run_on_machine(&joining, &["up"], "30", "8");
+    let stderr = String::from_utf8_lossy(&out.success().get_output().stderr).into_owned();
+
+    assert!(stderr.contains("warning"), "{stderr}");
+    assert!(stderr.contains("4 instances"), "{stderr}");
+    assert!(stderr.contains("load 30"), "{stderr}");
+    assert!(
+        stderr.contains("one (6h)"),
+        "the warning must name the stale box and its age: {stderr}"
+    );
+    assert!(
+        stderr.contains("grove down --idle"),
+        "a warning without the command that fixes it is a complaint: {stderr}"
+    );
+
+    for wt in crowd.iter().chain([&joining]) {
+        cli.run(wt, &["down"]).success();
+    }
+}
+
+/// A prescription that would stop nothing teaches the reader that grove's prescriptions
+/// are noise.
+#[test]
+fn a_crowd_with_nothing_stale_is_warned_about_without_a_prescription() {
+    let cli = Cli::new();
+    let crowd: Vec<_> = ["one", "two", "three", "four"]
+        .iter()
+        .map(|s| cli.worktree(s))
+        .collect();
+    for wt in &crowd {
+        cli.run(wt, &["up"]).success();
+    }
+
+    let joining = cli.worktree("five");
+    let out = cli.run_on_machine(&joining, &["up"], "30", "8");
+    let stderr = String::from_utf8_lossy(&out.success().get_output().stderr).into_owned();
+
+    assert!(stderr.contains("warning"), "{stderr}");
+    assert!(
+        !stderr.contains("grove down --idle"),
+        "every box is in use; there is nothing to propose: {stderr}"
+    );
+
+    for wt in crowd.iter().chain([&joining]) {
+        cli.run(wt, &["down"]).success();
+    }
+}
+
+/// The hours this feature exists to save went into diagnosing tests that failed because
+/// the machine was buried, not because the branch was wrong. grove is in the loop for
+/// `grove run`, and it knows the exit code — so failure is the one moment worth speaking
+/// up, and success is the moment worth staying quiet.
+#[test]
+fn a_failing_run_on_a_buried_machine_says_so_and_a_passing_one_does_not() {
+    let cli = Cli::new();
+    let crowd: Vec<_> = ["one", "two", "three", "four"]
+        .iter()
+        .map(|s| cli.worktree(s))
+        .collect();
+    for wt in &crowd {
+        cli.run(wt, &["up"]).success();
+    }
+
+    let failed = cli
+        .run_on_machine(&crowd[0], &["run", "--", "false"], "30", "8")
+        .failure();
+    let stderr = String::from_utf8_lossy(&failed.get_output().stderr).into_owned();
+    assert!(stderr.contains("load 30"), "{stderr}");
+    assert!(
+        stderr.contains("may be the machine"),
+        "the note has to name the alternative explanation, or it is just trivia: {stderr}"
+    );
+    assert_eq!(
+        failed.get_output().status.code(),
+        Some(1),
+        "the note must not disturb the exit code a caller is branching on"
+    );
+
+    let passed = cli
+        .run_on_machine(&crowd[0], &["run", "--", "true"], "30", "8")
+        .success();
+    assert!(
+        String::from_utf8_lossy(&passed.get_output().stderr).is_empty(),
+        "a green run on a busy machine is not news"
+    );
+
+    let quiet = cli
+        .run_on_machine(&crowd[0], &["run", "--", "false"], "0.2", "8")
+        .failure();
+    assert!(
+        String::from_utf8_lossy(&quiet.get_output().stderr).is_empty(),
+        "an ordinary failure on an idle machine is the branch's fault and grove should not muddy it"
+    );
+
+    for wt in &crowd {
+        cli.run(wt, &["down"]).success();
+    }
+}
+
+/// Eighteen rows and the stale ones scattered through them is how a pile-up goes
+/// unnoticed. The instances worth reclaiming belong at the top, and the machine's state
+/// belongs where someone deciding what to stop will actually read it.
+#[test]
+fn ls_puts_the_most_neglected_instance_first_and_reports_the_machine() {
+    let cli = Cli::new();
+    let fresh = cli.worktree("worked_on_lately");
+    let forgotten = cli.worktree("forgotten_since_lunch");
+    cli.run(&fresh, &["up"]).success();
+    cli.run(&forgotten, &["up"]).success();
+    backdate(&cli, &forgotten, 6 * 3600);
+
+    let out = cli
+        .run_on_machine(&fresh, &["ls"], "0.3", "16")
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&out).into_owned();
+
+    let stale = stdout.find("forgotten_since_lunch").expect("listed");
+    let recent = stdout.find("worked_on_lately").expect("listed");
+    assert!(
+        stale < recent,
+        "the reclaim candidate has to surface, not hide in the middle: {stdout}"
+    );
+    assert!(
+        stdout.contains("6h"),
+        "an idle age is what makes a row actionable: {stdout}"
+    );
+    assert!(
+        stdout.contains("load 0.3 on 16 cores"),
+        "ls is where someone deciding what to stop is already looking: {stdout}"
+    );
+    assert!(
+        !stdout.contains("grove down --idle"),
+        "a calm machine needs no prescription: {stdout}"
+    );
+
+    cli.run(&fresh, &["down"]).success();
+    cli.run(&forgotten, &["down"]).success();
+}
+
+/// `pgrep | wc -l` and `uptime` got reached for before `grove ls` did. An agent should be
+/// able to decide from grove directly rather than parsing a table or shelling out.
+#[test]
+fn ls_json_carries_what_an_agent_needs_to_decide() {
+    let cli = Cli::new();
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+    backdate(&cli, &wt, 3 * 3600);
+
+    let out = cli
+        .run_on_machine(&wt, &["ls", "--json"], "26.1", "16")
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out).expect("ls --json must emit valid json");
+
+    assert_eq!(parsed["load"], 26.1);
+    assert_eq!(parsed["cores"], 16);
+    assert_eq!(parsed["running"], 1);
+
+    let instance = &parsed["instances"][0];
+    assert_eq!(instance["slug"], "feat_search");
+    assert_eq!(instance["running"], true);
+    assert!(instance["ports"]["web"].as_u64().is_some(), "{parsed}");
+    let idle = instance["idle_seconds"].as_u64().expect("idle age");
+    assert!((3 * 3600..3 * 3600 + 120).contains(&idle), "{parsed}");
+
+    cli.run(&wt, &["down"]).success();
+}
+
+/// The point of `--idle` over `prune`: a forgotten box is one you want back tomorrow, and
+/// the URL an agent wrote down has to still work when it comes back.
+#[test]
+fn a_swept_instance_keeps_its_ports_and_the_current_one_is_spared() {
+    let cli = Cli::new();
+    let here = cli.worktree("where_i_am_working");
+    let stale = cli.worktree("forgotten");
+    cli.run(&here, &["up"]).success();
+    cli.run(&stale, &["up"]).success();
+
+    let port_of = |wt: &Path| -> u16 {
+        std::fs::read_to_string(wt.join("backend/.env.local"))
+            .expect("env")
+            .lines()
+            .find_map(|l| l.strip_prefix("API_URL=http://localhost:"))
+            .expect("API_URL")
+            .parse()
+            .expect("port")
+    };
+    let (mine, theirs) = (port_of(&here), port_of(&stale));
+
+    backdate(&cli, &stale, 3 * 3600);
+    backdate(&cli, &here, 3 * 3600);
+
+    let out = cli.run(&here, &["down", "--idle", "2h"]).success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+
+    assert!(stdout.contains("forgotten"), "{stdout}");
+    assert!(
+        stdout.contains("3h"),
+        "naming the age is what makes the list checkable before it is acted on: {stdout}"
+    );
+    assert!(
+        !stdout.contains("where_i_am_working"),
+        "sweeping the box you are standing in is the one genuinely surprising outcome: {stdout}"
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    assert!(
+        ureq::get(format!("http://127.0.0.1:{theirs}/"))
+            .call()
+            .is_err(),
+        "the stale instance is still serving on {theirs}"
+    );
+    assert!(
+        ureq::get(format!("http://127.0.0.1:{mine}/"))
+            .call()
+            .is_ok(),
+        "the instance being worked in was stopped"
+    );
+
+    cli.run(&stale, &["up"]).success();
+    assert_eq!(
+        port_of(&stale),
+        theirs,
+        "a swept instance must come back on the ports it had, or every URL written down \
+         while it ran is now wrong"
+    );
+
+    cli.run(&here, &["down"]).success();
+    cli.run(&stale, &["down"]).success();
+}
+
+/// The blast radius spans other people's work, so there has to be a way to read the list
+/// before committing to it.
+#[test]
+fn a_dry_run_names_the_casualties_without_creating_any() {
+    let cli = Cli::new();
+    let here = cli.worktree("where_i_am_working");
+    let stale = cli.worktree("forgotten");
+    cli.run(&here, &["up"]).success();
+    cli.run(&stale, &["up"]).success();
+    backdate(&cli, &stale, 3 * 3600);
+
+    let out = cli
+        .run(&here, &["down", "--idle", "2h", "--dry-run"])
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+
+    assert!(stdout.contains("forgotten"), "{stdout}");
+    assert!(stdout.contains("would stop"), "{stdout}");
+
+    let still_up: serde_json::Value = serde_json::from_slice(
+        &cli.run(&stale, &["status", "--json"])
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("json");
+    assert_eq!(
+        still_up["services"]["web"]["running"], true,
+        "a dry run that stopped something is not a dry run"
+    );
+
+    cli.run(&here, &["down"]).success();
+    cli.run(&stale, &["down"]).success();
+}
+
+/// An agent deep in QA on a sibling worktree is exactly who this command is dangerous to,
+/// so an instance still serving traffic is not a candidate however long ago its last
+/// grove command was.
+#[test]
+fn an_instance_still_serving_traffic_survives_a_sweep() {
+    let cli = Cli::new();
+    let here = cli.worktree("where_i_am_working");
+    let busy = cli.worktree("mid_browser_qa");
+    cli.run(&here, &["up"]).success();
+    cli.run(&busy, &["up"]).success();
+
+    // Its last grove command was hours ago, but the service has been logging since.
+    backdate(&cli, &busy, 3 * 3600);
+    let logs = registry_of(&cli)
+        .get(&busy)
+        .expect("get")
+        .expect("entry")
+        .instance_dir
+        .expect("instance dir");
+    {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(logs.join("web.log"))
+            .expect("log")
+            .write_all(b"GET /api/quotes 200\n")
+            .expect("append");
+    }
+
+    let out = cli
+        .run(&here, &["down", "--idle", "2h", "--dry-run"])
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+
+    assert!(
+        !stdout.contains("mid_browser_qa"),
+        "an instance whose service is still writing is in use, whoever last ran a grove \
+         command there: {stdout}"
+    );
+
+    cli.run(&here, &["down"]).success();
+    cli.run(&busy, &["down"]).success();
+}
+
+/// Dropping every swept instance's database would mean loading each worktree's config to
+/// find its datastore. Refusing is better than a flag that silently does nothing.
+#[test]
+fn purging_a_whole_machine_is_refused_rather_than_half_done() {
+    let cli = Cli::new();
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+
+    let out = cli.run(&wt, &["down", "--purge", "--idle", "2h"]).failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+
+    assert!(
+        stderr.contains("--purge"),
+        "the refusal has to name the flag it is refusing: {stderr}"
+    );
+    assert!(
+        stderr.contains("one instance") || stderr.contains("grove down --purge"),
+        "and point at the form that does work: {stderr}"
+    );
+
+    cli.run(&wt, &["down"]).success();
+}
+
+/// The blunt form, for when you know you are done with everything else on the machine.
+#[test]
+fn all_but_this_stops_the_siblings_and_spares_the_one_you_are_in() {
+    let cli = Cli::new();
+    let here = cli.worktree("where_i_am_working");
+    let other = cli.worktree("someone_elses");
+    cli.run(&here, &["up"]).success();
+    cli.run(&other, &["up"]).success();
+
+    let out = cli.run(&here, &["down", "--all-but-this"]).success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+
+    assert!(stdout.contains("someone_elses"), "{stdout}");
+    assert!(!stdout.contains("where_i_am_working"), "{stdout}");
+
+    let mine: serde_json::Value = serde_json::from_slice(
+        &cli.run(&here, &["status", "--json"])
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("json");
+    assert_eq!(
+        mine["services"]["web"]["running"], true,
+        "--all-but-this must mean all but this"
+    );
+
+    cli.run(&here, &["down"]).success();
+}
+
+/// A sweep that matched nothing must say so rather than printing a blank success, which
+/// reads as "it worked" when in fact the window was wrong.
+#[test]
+fn a_sweep_that_matches_nothing_says_so() {
+    let cli = Cli::new();
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+
+    let out = cli.run(&wt, &["down", "--idle", "9h"]).success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+
+    assert!(stdout.contains("nothing to stop"), "{stdout}");
 
     cli.run(&wt, &["down"]).success();
 }

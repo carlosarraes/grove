@@ -72,6 +72,24 @@ fn llm_reference_explains_the_container_limit_and_existing_container_boundary() 
 }
 
 #[test]
+fn llm_reference_routes_test_switches_and_browser_failures_to_their_owners() {
+    let reference = llm::reference();
+
+    assert!(
+        reference.contains("repository-specific test switch"),
+        "{reference}"
+    );
+    assert!(reference.contains("[secrets.set]"), "{reference}");
+    assert!(reference.contains("grove run"), "{reference}");
+    assert!(reference.contains("grove status"), "{reference}");
+    assert!(reference.contains("CDP"), "{reference}");
+    assert!(
+        reference.contains("agent-browser doctor --fix"),
+        "{reference}"
+    );
+}
+
+#[test]
 fn secrets_carry_the_per_instance_overrides() {
     let c = config::parse(llm::EXAMPLE).expect("parse");
     let backend = c

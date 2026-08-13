@@ -122,6 +122,11 @@ starts; it does not provide an empty settings environment. Tests that assert app
 defaults must disable dotenv loading and clear the relevant process variables in the
 repo's own fixture or settings constructor.
 
+When a repository-specific test switch tells integration tests to use Grove's managed
+dependency instead of starting their own container, declare it in the corresponding
+[secrets.set]. Grove renders it into the dotenv target and `grove run` exports it to the
+command, without needing to know the repository's variable names.
+
   [[resource]]       repeatable; a datastore shared across instances
   name               identifier
   kind               "docker-shared"; grove-started containers use
@@ -164,6 +169,13 @@ needed data, then deliberately remove and recreate that container.
    holds two independent addresses for its backend -- one the browser uses and one the
    dev-server proxy uses -- and each usually has a hardcoded fallback. Missing one is
    invisible until an instance answers with another instance's data.
+
+### Browser failures
+
+Grove owns application readiness; agent-browser owns its browser daemon and CDP channel.
+Run `grove status` first. If the service is healthy but the browser channel is refused,
+closed, or unresponsive, start agent-browser's own recovery with
+`agent-browser doctor --fix`, then reopen the isolated session if needed.
 
 ## Worked example: Vite + FastAPI + MongoDB
 

@@ -25,6 +25,10 @@ pub struct Entry {
     pub services: BTreeMap<String, crate::supervise::Handle>,
     #[serde(default)]
     pub db_name: Option<String>,
+    /// Where `db_name` lives. Recorded while the worktree still exists, because `prune`
+    /// runs after it is gone — and with it the `.grove.toml` that named the datastore.
+    #[serde(default)]
+    pub db_resource: Option<DbResource>,
     /// Unix seconds at the last command that meant someone was working here. Optional
     /// because entries written before this existed have no answer, and guessing one would
     /// make every instance on an upgraded machine look abandoned.
@@ -35,6 +39,14 @@ pub struct Entry {
     /// way to reach, since it reads the registry and never resolves a worktree.
     #[serde(default)]
     pub instance_dir: Option<PathBuf>,
+}
+
+/// Enough to reach a datastore without the config that declared it: the port to speak to,
+/// and the name grove derives its container name from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DbResource {
+    pub name: String,
+    pub port: u16,
 }
 
 impl Entry {
@@ -158,6 +170,7 @@ impl Registry {
                 )?,
                 services: BTreeMap::new(),
                 db_name: None,
+                db_resource: None,
                 last_used: None,
                 instance_dir: None,
             };

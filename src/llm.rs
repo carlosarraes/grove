@@ -113,9 +113,14 @@ Any string value in [secrets.set], [[resource]].db_name, [[service]].command, an
   from               path relative to the MAIN worktree -- where real secrets live
   into               path relative to THIS worktree -- where they are written
   [secrets.set]      keys to override after copying; values are templates.
-                     These are also exported into every service's environment, because
+                     These are also exported into the environment of every command Grove
+                     runs -- services, seeds, setup, prepare, and `grove run` -- because
                      code that reads the environment before its settings library loads
                      the file would otherwise see the pre-instance value.
+                     Overrides, not secrets: .grove.toml is committed, so a real
+                     credential written here is already in git. Real secrets belong in
+                     the gitignored file named by `from`, which Grove copies verbatim
+                     and never puts in the environment.
 
 Grove renders configured dotenv files and overlays per-instance variables on commands it
 starts; it does not provide an empty settings environment. Tests that assert application
@@ -154,10 +159,20 @@ needed data, then deliberately remove and recreate that container.
   [[service]]        repeatable; a long-running process
   name               identifier, also the log file name
   cwd                working directory relative to the worktree root
-  setup              run once per worktree before first start (uv sync, npm install)
+  setup              run ONCE per worktree before first start (uv sync, npm install)
+  prepare            run on EVERY up, before this service starts and after the services
+                     declared above it are answering -- for generated code that must
+                     track what it was generated from, e.g. a typed client built from
+                     this worktree's own backend. It runs even when the service is
+                     already up, which is the case where stale output survives unnoticed.
   command            the process to run; must accept its port, usually via a flag
   ready.http         URL polled until it answers
   ready.timeout      how long to wait, e.g. "180s"
+
+Three fields run commands, and the difference between them is how often:
+`setup` once per worktree, `[[seed]]` once per instance, `prepare` every `up`. Put a
+dependency install in `setup`, fixture data in `[[seed]]`, and code generation in
+`prepare` -- generated output is the one that goes stale when it is only made once.
 
 ### Two rules that prevent silent cross-talk
 
@@ -173,9 +188,13 @@ needed data, then deliberately remove and recreate that container.
 ### Browser failures
 
 Grove owns application readiness; agent-browser owns its browser daemon and CDP channel.
-Run `grove status` first. If the service is healthy but the browser channel is refused,
-closed, or unresponsive, start agent-browser's own recovery with
-`agent-browser doctor --fix`, then reopen the isolated session if needed.
+Run `grove status` first: it probes each service's `ready.http` and separates a live
+process from a served endpoint. A service reported `running` but `NOT ANSWERING` is
+Grove's problem, not the browser's -- read `grove logs <service> --since-restart`, and
+check `grove doctor` for a datastore that has died underneath it. Only when the service
+is answering does a refused, closed, or unresponsive browser channel point at
+agent-browser: start its own recovery with `agent-browser doctor --fix`, then reopen the
+isolated session if needed.
 
 ## Worked example: Vite + FastAPI + MongoDB
 

@@ -75,6 +75,9 @@ names = ["frontend", "backend"]
 from = "backend/.env.local"
 into = "backend/.env.local"
 
+# Overrides, not secrets. `.grove.toml` is committed, so a real credential written
+# here is already in git — put those in the gitignored file named by `from` above.
+# These values are also exported to every command grove runs.
 [secrets.set]
 CORS_ORIGINS = "http://localhost:{{ port.frontend }}"
 DATABASE_NAME = "{{ db.name }}"
@@ -95,9 +98,14 @@ command = "uv run python -m tests.seed"
 [[service]]
 name = "backend"
 cwd = "backend"
-setup = "uv sync"
+setup = "uv sync"                 # once per worktree
 command = "uv run uvicorn src.main:app --reload --port {{ port.backend }}"
 ready = { http = "http://localhost:{{ port.backend }}/health", timeout = "180s" }
+
+[[service]]
+name = "frontend"
+prepare = "npm run contracts:generate"   # every `up`, once the backend answers
+command = "npm run dev -- --strictPort --port {{ port.frontend }}"
 ```
 
 `grove --llm` prints the full schema and a worked example — that's what an agent reads to
@@ -116,7 +124,7 @@ repo's own fixture or settings constructor.
 | `down [--purge]` | stop services; `--purge` also drops the database |
 | `down --idle 2h` \| `--all-but-this` | stop instances across the machine, keeping their ports; `--dry-run` names them first |
 | `restart [service]` | replace one service without touching the others |
-| `status [--json]` | ports, pids, health — and a warning if a service predates your last edit |
+| `status [--json]` | ports, pids, and whether each service's `ready.http` answers — plus a warning if a service predates your last edit |
 | `ls [--json]` | every instance on the machine, most neglected first, with the machine's load |
 | `run -- <cmd>` | run a command with this instance's environment overlaid |
 | `logs [service] [--since-restart] [-n N]` | what a service printed |

@@ -49,7 +49,8 @@ starts; it does not provide an empty settings environment. Tests that assert app
 defaults must disable dotenv loading and clear the relevant process variables in the
 repo's own fixture or settings constructor.
 
-`grove status` shows what is running now, and `--json` makes it parseable.
+`grove status` shows what is running and, for every service with a `ready.http`, whether
+that endpoint actually answers. `--json` makes it parseable.
 
 After editing a service that does not reload itself, replace just that one:
 
@@ -88,6 +89,28 @@ driving a browser through a long QA pass. A box that is quiet for some other rea
 review paused mid-read, a session waiting on a human — looks exactly like an abandoned
 one. `--dry-run` names every casualty, generous windows cost little, and where you cannot
 tell whose instance is whose, `grove down` in each worktree you own is the certain move.
+
+## When a service needs generated code
+
+Some services cannot start correctly from a fresh checkout — a frontend that compiles
+against types generated from its own backend, a client built from a schema. Generated
+output has to track what it was generated from, so a worktree that regenerates only once
+serves stale code the moment the thing it mirrors changes.
+
+That is what a service's `prepare` is for. `up` runs it **every time**, before that
+service starts and after the services declared above it are answering, so a generator can
+read this instance's own backend:
+
+```toml
+[[service]]
+name = "frontend"
+prepare = "npm run contracts:generate"
+```
+
+Three config fields run commands and the difference is only how often: `setup` once per
+worktree (dependency installs), `[[seed]]` once per instance (fixture data), `prepare` on
+every `up` (generation). A failing `prepare` fails `up` and prints what it printed, rather
+than starting a service on top of half a file.
 
 ## Seeding
 
@@ -169,6 +192,26 @@ grove logs <service> --since-restart
 
 The log keeps the whole history including the dependency install, so `--since-restart`
 starts at the current run and `-n` limits it to the last lines.
+
+### When requests fail but the service is up
+
+A process can survive while the thing it serves is dead — most often because the shared
+datastore underneath it went away mid-run. Nothing crashes, nothing appears in the process
+list as wrong, and every request fails.
+
+`grove status` separates the two:
+
+```
+services
+  frontend  running  pid 41201  answering
+  backend   running  pid 41202  NOT ANSWERING http://localhost:24311/health
+            grove logs backend --since-restart
+```
+
+**`NOT ANSWERING` on a running service is grove's problem, not your test's and not the
+browser's.** Read that log, then run `grove doctor`, which checks the datastores the
+service depends on. Reach for browser or client-side recovery only once the service says
+`answering` — otherwise you are fixing the wrong end of the request.
 
 ## Browser testing on an instance's port
 

@@ -116,25 +116,33 @@ pub fn stop(handle: &Handle) -> Result<()> {
     Ok(())
 }
 
-/// Poll until the service answers. Any HTTP response counts, including an error status:
-/// a health endpoint may report degraded by design, and grove is checking that the
-/// process is up, not that it is happy.
-pub fn wait_ready(url: &str, timeout: Duration) -> Result<()> {
-    let deadline = Instant::now() + timeout;
+/// One attempt, no retry: is anything serving this URL right now?
+///
+/// Any HTTP response counts, including an error status — a health endpoint may report
+/// degraded by design, and grove is checking that the port is served, not that the
+/// application is happy. `wait_ready` polls on this, so that rule lives in one place.
+pub fn probe(url: &str, timeout: Duration) -> bool {
     let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(2)))
+        .timeout_global(Some(timeout))
         .build()
         .new_agent();
+    matches!(
+        agent.get(url).call(),
+        Ok(_) | Err(ureq::Error::StatusCode(_))
+    )
+}
 
+/// Poll until the service answers, or the timeout expires.
+pub fn wait_ready(url: &str, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
     loop {
-        match agent.get(url).call() {
-            Ok(_) => return Ok(()),
-            Err(ureq::Error::StatusCode(_)) => return Ok(()),
-            Err(_) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(e) => bail!("{url} never answered within {timeout:?} ({e})"),
+        if probe(url, Duration::from_secs(2)) {
+            return Ok(());
         }
+        if Instant::now() >= deadline {
+            bail!("{url} never answered within {timeout:?}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 

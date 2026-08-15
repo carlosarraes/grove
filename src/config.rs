@@ -94,6 +94,11 @@ pub struct Service {
     pub cwd: Option<String>,
     /// Run once per worktree before the first start, e.g. `uv sync`, `npm install`.
     pub setup: Option<String>,
+    /// Run on **every** `up`, before this service starts and after the services declared
+    /// above it are answering — e.g. generating a client from this worktree's own backend.
+    /// Distinct from `setup` and `[[seed]]`, which run once: generated code has to track
+    /// what it was generated from, so "once" is the wrong contract for it.
+    pub prepare: Option<String>,
     pub command: String,
     pub ready: Option<Ready>,
 }

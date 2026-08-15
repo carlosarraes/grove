@@ -1755,3 +1755,422 @@ fn a_sweep_that_matches_nothing_says_so() {
 
     cli.run(&wt, &["down"]).success();
 }
+
+/// A service whose readiness URL points somewhere nothing serves. The process runs
+/// happily; the endpoint is dead.
+const WEDGED_CONFIG: &str = r#"
+version = 1
+
+[ports]
+names = ["web", "unserved"]
+
+[[secrets]]
+from = "backend/.env.local"
+into = "backend/.env.local"
+
+[secrets.set]
+API_URL = "http://localhost:{{ port.web }}"
+
+[[service]]
+name = "web"
+command = "python3 -u -m http.server {{ port.web }}"
+ready = { http = "http://127.0.0.1:{{ port.web }}/", timeout = "30s" }
+
+# Runs forever and binds nothing. Its readiness URL points at a port no one serves, which
+# is what a backend looks like once the datastore it depends on has died.
+[[service]]
+name = "wedged"
+command = "sleep 600"
+ready = { http = "http://127.0.0.1:{{ port.unserved }}/", timeout = "1s" }
+"#;
+
+/// The misdiagnosis this exists to stop. `src/llm.rs` tells agents "Grove owns application
+/// readiness — run `grove status` first", and on a healthy answer sends them off to
+/// `agent-browser doctor --fix`. A backend whose process is alive but whose HTTP is dead —
+/// what happens when the shared datastore dies mid-suite — must not read as healthy, or
+/// grove has scripted an hour of looking in the wrong place.
+#[test]
+fn status_separates_a_live_process_from_a_dead_endpoint() {
+    let cli = Cli::with_config(WEDGED_CONFIG);
+    let wt = cli.worktree("feat_search");
+
+    // `up` fails: the wedged service never answers. That is correct, and the instance is
+    // left exactly in the state this test is about — process alive, endpoint dead.
+    cli.run(&wt, &["up"]).failure();
+
+    let out = cli
+        .run(&wt, &["status"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&out).into_owned();
+
+    // Scoped to the services block: port names and service names are separate namespaces
+    // and both are called `web` here, which is exactly why the block is headed.
+    let block = stdout
+        .split_once("\nservices\n")
+        .unwrap_or_else(|| panic!("status must head its service rows: {stdout}"))
+        .1;
+    let row = |name: &str| -> &str {
+        block
+            .lines()
+            .find(|l| l.trim_start().starts_with(name))
+            .unwrap_or_else(|| panic!("status must list {name}: {stdout}"))
+    };
+
+    let wedged = row("wedged");
+    assert!(
+        wedged.contains("running"),
+        "the process really is alive; saying otherwise is the opposite error: {wedged}"
+    );
+    assert!(
+        wedged.to_lowercase().contains("not answering"),
+        "an alive process with a dead endpoint must not read as healthy: {wedged}"
+    );
+
+    let healthy = row("web");
+    assert!(healthy.contains("answering"), "{healthy}");
+    assert!(
+        !healthy.to_lowercase().contains("not answering"),
+        "{healthy}"
+    );
+
+    cli.run(&wt, &["down"]).success();
+}
+
+/// An unasked question is not a passed check. A service with no `ready.http` gives grove
+/// nothing to probe, and reporting that as answering would launder ignorance into a
+/// health claim — the exact move this whole change exists to undo.
+#[test]
+fn a_service_with_no_readiness_probe_is_never_called_answering() {
+    let cli = Cli::with_config(
+        r#"
+version = 1
+
+[ports]
+names = ["web"]
+
+[[secrets]]
+from = "backend/.env.local"
+into = "backend/.env.local"
+
+[[service]]
+name = "web"
+command = "python3 -u -m http.server {{ port.web }}"
+"#,
+    );
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+
+    let parsed: serde_json::Value = serde_json::from_slice(
+        &cli.run(&wt, &["status", "--json"])
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("json");
+
+    assert_eq!(parsed["services"]["web"]["running"], true);
+    assert_eq!(parsed["services"]["web"]["ready"], "undeclared");
+    assert_eq!(parsed["services"]["web"]["url"], serde_json::Value::Null);
+
+    cli.run(&wt, &["down"]).success();
+}
+
+/// `status --json` is what agents branch on, so the new keys have to be there and the
+/// old ones have to be untouched.
+#[test]
+fn status_json_reports_readiness_beside_the_pid() {
+    let cli = Cli::new();
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+
+    let parsed: serde_json::Value = serde_json::from_slice(
+        &cli.run(&wt, &["status", "--json"])
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("json");
+
+    let web = &parsed["services"]["web"];
+    assert_eq!(web["running"], true);
+    assert_eq!(web["ready"], "answering");
+    assert!(
+        web["url"].as_str().expect("url").starts_with("http://"),
+        "a reader told 'not answering' needs the URL to try: {parsed}"
+    );
+    assert!(web["pid"].as_u64().is_some(), "{parsed}");
+    assert_eq!(parsed["slug"], "feat_search", "existing keys must not move");
+
+    cli.run(&wt, &["down"]).success();
+}
+
+/// A stopped service serves nothing by definition. Probing it spends the timeout to learn
+/// what the pid already said, and `status` has to stay a command you run without thinking.
+#[test]
+fn a_stopped_service_is_reported_silent_without_being_probed() {
+    let cli = Cli::with_config(WEDGED_CONFIG);
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).failure();
+    cli.run(&wt, &["down"]).success();
+
+    let began = std::time::Instant::now();
+    let parsed: serde_json::Value = serde_json::from_slice(
+        &cli.run(&wt, &["status", "--json"])
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("json");
+    let elapsed = began.elapsed();
+
+    assert_eq!(parsed["services"]["wedged"]["running"], false);
+    assert_eq!(parsed["services"]["wedged"]["ready"], "silent");
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "status on a stopped instance must not wait on probes it can answer from the pid: {elapsed:?}"
+    );
+}
+
+/// The decided semantics, and the one a naive implementation gets wrong. `setup` and
+/// `[[seed]]` already cover "once per worktree"; running every time is the entire reason
+/// `prepare` exists. A generator that skipped a live service would leave the common loop
+/// — edit the backend, `grove up` — serving stale generated code, which is the bug it was
+/// added to prevent.
+#[test]
+fn prepare_runs_on_every_up_including_when_the_service_is_already_alive() {
+    let cli = Cli::with_config(
+        r#"
+version = 1
+
+[ports]
+names = ["web"]
+
+[[secrets]]
+from = "backend/.env.local"
+into = "backend/.env.local"
+
+[[service]]
+name = "web"
+prepare = "printf 'generated\n' >> ../prepared.log"
+command = "python3 -u -m http.server {{ port.web }}"
+ready = { http = "http://127.0.0.1:{{ port.web }}/", timeout = "30s" }
+"#,
+    );
+    let wt = cli.worktree("feat_search");
+    let ran = wt.parent().expect("worktrees dir").join("prepared.log");
+
+    cli.run(&wt, &["up"]).success();
+    assert_eq!(
+        std::fs::read_to_string(&ran)
+            .expect("prepare ran")
+            .lines()
+            .count(),
+        1
+    );
+
+    // The service is still up. `up` starts nothing — and must still prepare.
+    cli.run(&wt, &["up"]).success();
+    assert_eq!(
+        std::fs::read_to_string(&ran)
+            .expect("prepare log")
+            .lines()
+            .count(),
+        2,
+        "prepare skipped a running service, so generated code would now be stale"
+    );
+
+    cli.run(&wt, &["down"]).success();
+}
+
+/// Generated code is worthless if it was generated from nothing. A frontend's generator
+/// reads its own worktree's backend, so `prepare` has to run after the services declared
+/// before it are answering — not merely after they were spawned.
+#[test]
+fn prepare_runs_after_earlier_services_are_answering() {
+    let cli = Cli::with_config(
+        r#"
+version = 1
+
+[ports]
+names = ["backend", "frontend"]
+
+[[secrets]]
+from = "backend/.env.local"
+into = "backend/.env.local"
+
+[[service]]
+name = "backend"
+command = "python3 -u -m http.server {{ port.backend }}"
+ready = { http = "http://127.0.0.1:{{ port.backend }}/", timeout = "30s" }
+
+# Fails outright unless the backend above is already serving.
+[[service]]
+name = "frontend"
+prepare = "python3 -c \"import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:{{ port.backend }}/')\""
+command = "python3 -u -m http.server {{ port.frontend }}"
+ready = { http = "http://127.0.0.1:{{ port.frontend }}/", timeout = "30s" }
+"#,
+    );
+    let wt = cli.worktree("feat_search");
+
+    cli.run(&wt, &["up"]).success();
+
+    cli.run(&wt, &["down"]).success();
+}
+
+/// A generator that failed produced nothing, or worse produced half a file. Starting the
+/// service on top of that hides the cause behind whatever breaks next.
+#[test]
+fn a_failing_prepare_stops_up_and_shows_what_it_printed() {
+    let cli = Cli::with_config(
+        r#"
+version = 1
+
+[ports]
+names = ["web"]
+
+[[secrets]]
+from = "backend/.env.local"
+into = "backend/.env.local"
+
+[[service]]
+name = "web"
+prepare = "echo 'contracts generator exploded' >&2; exit 1"
+command = "python3 -u -m http.server {{ port.web }}"
+ready = { http = "http://127.0.0.1:{{ port.web }}/", timeout = "30s" }
+"#,
+    );
+    let wt = cli.worktree("feat_search");
+
+    let out = cli.run(&wt, &["up"]).failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+
+    assert!(stderr.contains("prepare"), "{stderr}");
+    assert!(
+        stderr.contains("contracts generator exploded"),
+        "the failure has to carry what the generator said, or it costs a round trip: {stderr}"
+    );
+
+    let parsed: serde_json::Value = serde_json::from_slice(
+        &cli.run(&wt, &["status", "--json"])
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("json");
+    assert_eq!(
+        parsed["services"]["web"]["running"], false,
+        "the service must not start on top of a failed generator"
+    );
+}
+
+/// `prune` reaches instances whose worktree — and therefore whose `.grove.toml` — is
+/// gone, so the registry has to have recorded where the database lived while it still
+/// could.
+#[test]
+fn an_instance_records_where_its_database_lives() {
+    // A held listener makes the port answer, so `ensure` reuses it and the test needs no
+    // Docker — the same path a developer running their own datastore takes.
+    let datastore =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("a stand-in for the datastore");
+    let port = datastore.local_addr().expect("addr").port();
+
+    let cli = Cli::with_config(&CONFIG.replace(
+        "[[service]]",
+        &format!(
+            r#"[[resource]]
+name = "store"
+kind = "docker-shared"
+port = {port}
+db_name = "app_{{{{ slug }}}}"
+
+[[service]]"#
+        ),
+    ));
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+
+    let entry = registry_of(&cli)
+        .get(&wt)
+        .expect("get")
+        .expect("reserved on open");
+    assert_eq!(entry.db_name.as_deref(), Some("app_feat_search"));
+    let resource = entry
+        .db_resource
+        .expect("the database's whereabouts must be recorded while the worktree exists");
+    assert_eq!(resource.name, "store");
+    assert_eq!(resource.port, port);
+
+    cli.run(&wt, &["down"]).success();
+}
+
+/// The blast radius is databases, and the worktrees they belonged to are already gone —
+/// so naming them before dropping anything is the whole safety story.
+#[test]
+fn prune_dry_run_names_orphan_databases_and_reclaims_nothing() {
+    let cli = Cli::new();
+    let doomed = cli.worktree("deleted_later");
+    cli.run(&doomed, &["up"]).success();
+    cli.run(&doomed, &["down"]).success();
+
+    // Give it a database the config never declared, so this test does not need a datastore.
+    let registry = registry_of(&cli);
+    let mut entry = registry.get(&doomed).expect("get").expect("entry");
+    entry.db_name = Some("app_deleted_later".to_string());
+    entry.db_resource = Some(grove::registry::DbResource {
+        name: "store".to_string(),
+        port: 1,
+    });
+    registry.record(&entry).expect("record");
+    std::fs::remove_dir_all(&doomed).expect("delete the worktree");
+
+    let out = cli
+        .run(&cli.fx.main, &["prune", "--dry-run"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&out).into_owned();
+
+    assert!(stdout.contains("deleted_later"), "{stdout}");
+    assert!(stdout.contains("app_deleted_later"), "{stdout}");
+    assert!(
+        registry.get(&doomed).expect("get").is_some(),
+        "a dry run that forgot the instance is not a dry run: {stdout}"
+    );
+}
+
+/// Entries written before grove recorded the datastore's whereabouts cannot be reached —
+/// their worktree is gone, so there is nothing left to read the port from. Saying so, and
+/// handing over the command that does work, beats implying it was handled.
+#[test]
+fn prune_admits_which_databases_it_cannot_reach() {
+    let cli = Cli::new();
+    let doomed = cli.worktree("from_an_older_grove");
+    cli.run(&doomed, &["up"]).success();
+    cli.run(&doomed, &["down"]).success();
+
+    let registry = registry_of(&cli);
+    let mut entry = registry.get(&doomed).expect("get").expect("entry");
+    entry.db_name = Some("app_from_an_older_grove".to_string());
+    entry.db_resource = None; // as a v0.1.12 registry has it
+    registry.record(&entry).expect("record");
+    std::fs::remove_dir_all(&doomed).expect("delete the worktree");
+
+    let out = cli
+        .run(&cli.fx.main, &["prune", "--purge"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&out).into_owned();
+
+    assert!(stdout.contains("app_from_an_older_grove"), "{stdout}");
+    assert!(
+        stdout.contains("mongosh"),
+        "an unreachable database should hand over the command that works: {stdout}"
+    );
+}

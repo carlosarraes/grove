@@ -20,10 +20,35 @@ pub struct Instance {
     recently_started_resources: BTreeSet<String>,
 }
 
+/// Whether the service's declared endpoint is actually being served. Distinct from
+/// `running`, which only says a process survives: the two disagree exactly when it matters
+/// most — a backend whose datastore died keeps its process and stops answering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Readiness {
+    Answering,
+    Silent,
+    /// No `ready.http` declared, so grove has nothing to ask. Never report this as
+    /// answering: an unasked question is not a passed check.
+    Undeclared,
+}
+
+impl Readiness {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Readiness::Answering => "answering",
+            Readiness::Silent => "silent",
+            Readiness::Undeclared => "undeclared",
+        }
+    }
+}
+
 pub struct ServiceStatus {
     pub name: String,
     pub running: bool,
     pub pid: Option<u32>,
+    pub ready: Readiness,
+    /// The rendered `ready.http`, so a reader told "not answering" can try it themselves.
+    pub url: Option<String>,
 }
 
 pub enum SeedOutcome {
@@ -32,6 +57,11 @@ pub enum SeedOutcome {
 }
 
 const SEED_MARKER_VERSION: u8 = 1;
+
+/// Long enough for a loaded machine to answer, short enough that `status` stays a command
+/// you run without thinking. Only reached when something accepts the connection and then
+/// says nothing; a closed port refuses instantly.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Deserialize, Serialize)]
 struct SeedMarker {
@@ -50,6 +80,14 @@ enum StoredSeedMarker {
 enum SeedDecision {
     Run { why: Option<String> },
     Skip,
+}
+
+/// How one blocking step of `up` names itself while it runs and when it fails.
+struct Step<'a> {
+    service: &'a str,
+    kind: &'a str,
+    doing: &'a str,
+    done: &'a str,
 }
 
 fn read_seed_marker(path: &Path) -> Result<Option<StoredSeedMarker>> {
@@ -313,12 +351,8 @@ impl Instance {
     /// Resolve `db_name` from the first resource that declares one, then write every env
     /// file this repo needs.
     pub fn render(&mut self) -> Result<Vec<PathBuf>> {
-        if let Some(template) = self
-            .config
-            .resources
-            .iter()
-            .find_map(|r| r.db_name.as_deref())
-        {
+        if let Some(resource) = self.config.resources.iter().find(|r| r.db_name.is_some()) {
+            let template = resource.db_name.as_deref().expect("filtered on Some");
             let bare = RenderContext {
                 slug: self.resolved.slug.clone(),
                 ports: self.entry.ports.clone(),
@@ -328,6 +362,12 @@ impl Instance {
             let name = render::value(template, &bare)
                 .with_context(|| format!("rendering db_name {template:?}"))?;
             self.entry.db_name = Some(name);
+            // Recorded now, while the config that names the datastore is still readable.
+            // `prune` needs it after the worktree has been deleted.
+            self.entry.db_resource = Some(crate::registry::DbResource {
+                name: resource.name.clone(),
+                port: resource.port,
+            });
             self.registry.record(&self.entry)?;
         }
 
@@ -512,6 +552,23 @@ impl Instance {
         let context = self.render_context();
 
         for service in &self.config.services {
+            let cwd = match &service.cwd {
+                Some(dir) => self.resolved.worktree.join(dir),
+                None => self.resolved.worktree.clone(),
+            };
+            let log = self.instance_dir().join(format!("{}.log", service.name));
+
+            // Before the skip below, not after: a running service is precisely the case
+            // where generated code goes stale unnoticed. Services start in declaration
+            // order and each waits for its readiness probe, so by the time this runs the
+            // services declared above are answering — which is what a generator reading
+            // this worktree's own backend needs.
+            if let Some(prepare) = &service.prepare {
+                let command = render::value(prepare, &context)
+                    .with_context(|| format!("rendering prepare for {}", service.name))?;
+                self.run_prepare(&service.name, &command, &cwd, &log)?;
+            }
+
             let already = self.entry.services.get(&service.name).copied();
             if let Some(handle) = already {
                 if fresh {
@@ -520,12 +577,6 @@ impl Instance {
                     continue;
                 }
             }
-
-            let cwd = match &service.cwd {
-                Some(dir) => self.resolved.worktree.join(dir),
-                None => self.resolved.worktree.clone(),
-            };
-            let log = self.instance_dir().join(format!("{}.log", service.name));
 
             let command = render::value(&service.command, &context)
                 .with_context(|| format!("rendering the command for {}", service.name))?;
@@ -556,12 +607,52 @@ impl Instance {
         if marker.exists() {
             return Ok(());
         }
-        std::fs::create_dir_all(self.instance_dir())?;
-        eprintln!("{name}: installing dependencies ({setup})");
+        self.run_step(
+            &Step {
+                service: name,
+                kind: "setup",
+                doing: "installing dependencies",
+                done: "dependencies installed",
+            },
+            setup,
+            cwd,
+            log,
+        )?;
+        std::fs::write(&marker, setup)?;
+        Ok(())
+    }
 
-        // Setup output goes to the service log rather than the terminal. `npm ci` and
-        // `uv sync` between them emit hundreds of lines, and the port summary printed
-        // afterwards is the one thing the caller actually needs to read.
+    /// Code generation runs on **every** `up`, marker-free by design: what it produces has
+    /// to track what it was generated from, and this one runs even when the service it
+    /// belongs to is already up — which is exactly the case a stale client survives.
+    fn run_prepare(&self, name: &str, prepare: &str, cwd: &Path, log: &Path) -> Result<()> {
+        self.run_step(
+            &Step {
+                service: name,
+                kind: "prepare",
+                doing: "preparing",
+                done: "prepared",
+            },
+            prepare,
+            cwd,
+            log,
+        )
+    }
+
+    /// One blocking command with its output on disk and a heartbeat on the terminal.
+    fn run_step(&self, step: &Step<'_>, command: &str, cwd: &Path, log: &Path) -> Result<()> {
+        let Step {
+            service,
+            kind,
+            doing,
+            done,
+        } = *step;
+        std::fs::create_dir_all(self.instance_dir())?;
+        eprintln!("{service}: {doing} ({command})");
+
+        // Output goes to the service log rather than the terminal. `npm ci` and `uv sync`
+        // between them emit hundreds of lines, and the port summary printed afterwards is
+        // the one thing the caller actually needs to read.
         let sink = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -569,16 +660,17 @@ impl Instance {
             .with_context(|| format!("opening {}", log.display()))?;
         let errors = sink.try_clone().context("duplicating the log handle")?;
 
-        // A silent multi-minute install is indistinguishable from a hang, and an agent
+        // A silent multi-minute step is indistinguishable from a hang, and an agent
         // watching it will eventually kill it. Tick while the child runs.
         let mut child = std::process::Command::new("sh")
             .arg("-c")
-            .arg(setup)
+            .arg(command)
             .current_dir(cwd)
+            .envs(self.environment()?)
             .stdout(std::process::Stdio::from(sink))
             .stderr(std::process::Stdio::from(errors))
             .spawn()
-            .with_context(|| format!("running setup for {name}: {setup}"))?;
+            .with_context(|| format!("running {kind} for {service}: {command}"))?;
 
         // First tick at 10s, then every 15s. The opening silence is what reads as a
         // hang, so it is the interval worth shortening.
@@ -591,25 +683,21 @@ impl Instance {
             std::thread::sleep(std::time::Duration::from_millis(200));
             let elapsed = began.elapsed().as_secs();
             if elapsed >= next_tick {
-                eprintln!("{name}: still installing ({elapsed}s)");
+                eprintln!("{service}: still {doing} ({elapsed}s)");
                 next_tick = elapsed + 15;
             }
         };
         if !status.success() {
             bail!(
-                "setup for {name} failed: {setup}\n\
+                "{kind} for {service} failed: {command}\n\
                  full output in {}\n{}",
                 log.display(),
                 tail(log, 30).unwrap_or_default()
             );
         }
-        std::fs::write(&marker, setup)?;
-        // Closure matters as much as the ticks: an install that ends without saying so
-        // leaves the reader wondering whether it finished or was skipped.
-        eprintln!(
-            "{name}: dependencies installed ({}s)",
-            began.elapsed().as_secs()
-        );
+        // Closure matters as much as the ticks: a step that ends without saying so leaves
+        // the reader wondering whether it finished or was skipped.
+        eprintln!("{service}: {done} ({}s)", began.elapsed().as_secs());
         Ok(())
     }
 
@@ -671,18 +759,47 @@ impl Instance {
             .collect()
     }
 
+    /// What each declared service is doing: process state, and whether its endpoint
+    /// answers. Probing costs one HTTP call per live service; a dead port on localhost
+    /// refuses immediately, so the timeout only bites in the wedged case — which is
+    /// precisely the case worth waiting for.
     pub fn status(&self) -> Vec<ServiceStatus> {
+        let context = self.render_context();
         self.config
             .services
             .iter()
-            .map(|s| ServiceStatus {
-                name: s.name.clone(),
-                running: self
+            .map(|s| {
+                let running = self
                     .entry
                     .services
                     .get(&s.name)
-                    .is_some_and(supervise::is_alive),
-                pid: self.entry.services.get(&s.name).map(|h| h.pid),
+                    .is_some_and(supervise::is_alive);
+                let url = s
+                    .ready
+                    .as_ref()
+                    .and_then(|r| render::value(&r.http, &context).ok());
+
+                let ready = match (&url, running) {
+                    (None, _) => Readiness::Undeclared,
+                    // A stopped service serves nothing by definition, and probing it
+                    // spends the timeout to learn what the pid already said.
+                    (Some(_), false) => Readiness::Silent,
+                    (Some(url), true) => {
+                        if supervise::probe(url, PROBE_TIMEOUT) {
+                            Readiness::Answering
+                        } else {
+                            Readiness::Silent
+                        }
+                    }
+                };
+
+                ServiceStatus {
+                    name: s.name.clone(),
+                    running,
+                    pid: self.entry.services.get(&s.name).map(|h| h.pid),
+                    ready,
+                    url,
+                }
             })
             .collect()
     }

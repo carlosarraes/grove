@@ -128,7 +128,7 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Ports, pids, and health for this instance
+    /// Ports, pids, and whether each service's endpoint actually answers
     Status {
         #[arg(long)]
         json: bool,
@@ -159,7 +159,14 @@ enum Command {
     /// Stop a service and start it again; all of them if none is named
     Restart { service: Option<String> },
     /// Stop and forget instances whose worktree no longer exists
-    Prune,
+    Prune {
+        /// Also drop their databases
+        #[arg(long)]
+        purge: bool,
+        /// Name what would be reclaimed, and reclaim nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Populate data; rerun after seed changes or resource recreation
     Seed {
         /// Re-run seeds that already ran for this instance
@@ -262,6 +269,7 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&status_json(&instance))?);
             } else {
                 print_summary(&instance);
+                print_services(&instance);
                 warn_if_stale(&instance);
             }
             Ok(())
@@ -446,29 +454,82 @@ fn main() -> Result<()> {
             print_summary(&instance);
             Ok(())
         }
-        Some(Command::Prune) => {
+        Some(Command::Prune { purge, dry_run }) => {
             let registry = grove::instance::registry()?;
-            // Stop the services before dropping the entry: once it is gone the pids go
-            // with it, and nothing can reach those processes again.
-            let orphans = registry.reap()?;
+
+            // A dry run must not reap: `reap` removes the entries as it returns them, so
+            // rehearsing with it would be the destructive act it exists to avoid.
+            let orphans: Vec<Entry> = if dry_run {
+                registry
+                    .list()?
+                    .into_iter()
+                    .filter(|e| !e.worktree.exists())
+                    .collect()
+            } else {
+                // Stop the services before dropping the entry: once it is gone the pids go
+                // with it, and nothing can reach those processes again.
+                registry.reap()?
+            };
+
             if orphans.is_empty() {
                 println!("nothing to reclaim");
+                return Ok(());
             }
-            for orphan in orphans {
-                for handle in orphan.services.values() {
-                    grove::supervise::stop(handle)?;
+
+            for orphan in &orphans {
+                if !dry_run {
+                    for handle in orphan.services.values() {
+                        grove::supervise::stop(handle)?;
+                    }
                 }
                 let ports: Vec<String> = orphan
                     .ports
                     .iter()
                     .map(|(n, p)| format!("{n}={p}"))
                     .collect();
-                println!("reclaimed {:<28} {}", orphan.slug, ports.join(" "));
-                // The worktree is gone, and with it the config saying how to reach the
-                // datastore — so name the database rather than pretend we can drop it.
-                if let Some(database) = &orphan.db_name {
-                    println!("  database {database} left in place");
+                let verb = if dry_run {
+                    "would reclaim"
+                } else {
+                    "reclaimed"
+                };
+                println!("{verb} {:<28} {}", orphan.slug, ports.join(" "));
+
+                // Always name the database, whatever happens to it. It outlives the
+                // worktree either way, and a number nobody named is a number nobody audits.
+                let Some(database) = &orphan.db_name else {
+                    continue;
+                };
+                match (&orphan.db_resource, purge, dry_run) {
+                    (_, false, _) => {
+                        println!("  database {database} left in place (--purge drops it)")
+                    }
+                    (Some(_), true, true) => println!("  database {database} would be dropped"),
+                    (Some(at), true, false) => {
+                        match grove::resource::drop_database_at(&at.name, at.port, database) {
+                            Ok(()) => println!("  database {database} dropped"),
+                            Err(e) => println!("  database {database} left in place: {e:#}"),
+                        }
+                    }
+                    // Written before grove recorded where the datastore was, and the
+                    // worktree that could have said is already gone. Hand over the command
+                    // rather than imply this was handled.
+                    (None, true, _) => {
+                        println!(
+                            "  database {database} left in place — this instance predates \
+                             grove recording its datastore, so grove cannot reach it"
+                        );
+                        println!(
+                            "    {}",
+                            grove::resource::drop_database_hint(27017, database)
+                        );
+                    }
                 }
+            }
+            if dry_run {
+                println!(
+                    "\n{} orphaned. Nothing reclaimed (--dry-run).",
+                    orphans.len()
+                );
             }
             Ok(())
         }
@@ -618,6 +679,56 @@ fn ls_json(entries: &[Entry], now: u64, machine: &Machine) -> serde_json::Value 
     })
 }
 
+/// What each service is doing, for `status` only.
+///
+/// Deliberately not folded into `print_summary`, which `up` and `restart` also call: `up`
+/// has just waited on the readiness probe, so probing again there would spend the timeout
+/// to re-learn what it already blocked on.
+fn print_services(instance: &Instance) {
+    let services = instance.status();
+    if services.is_empty() {
+        return;
+    }
+    let width = services
+        .iter()
+        .map(|s| s.name.len())
+        .max()
+        .unwrap_or(0)
+        .max(8);
+
+    // Headed and indented, because port names and service names are separate namespaces
+    // that often collide — a bare `web` row under the `web` URL above reads as the same
+    // thing said twice.
+    println!("\nservices");
+    for service in &services {
+        let state = match (service.running, service.pid) {
+            (true, Some(pid)) => format!("running  pid {pid}"),
+            (true, None) => "running".to_string(),
+            (false, _) => "stopped".to_string(),
+        };
+        let name = format!("  {:<width$}", service.name, width = width);
+
+        // The loud case, because it is the whole reason this command probes: the process
+        // survives, so every cheaper signal says fine, and the endpoint is dead.
+        match service.ready {
+            grove::instance::Readiness::Silent if service.running => {
+                println!(
+                    "{name}  {state}  NOT ANSWERING {}",
+                    service.url.as_deref().unwrap_or("")
+                );
+                println!(
+                    "  {:<width$}  grove logs {} --since-restart",
+                    "",
+                    service.name,
+                    width = width
+                );
+            }
+            grove::instance::Readiness::Answering => println!("{name}  {state}  answering"),
+            _ => println!("{name}  {state}"),
+        }
+    }
+}
+
 fn status_json(instance: &Instance) -> serde_json::Value {
     let services: serde_json::Map<String, serde_json::Value> = instance
         .status()
@@ -625,7 +736,12 @@ fn status_json(instance: &Instance) -> serde_json::Value {
         .map(|s| {
             (
                 s.name,
-                serde_json::json!({ "running": s.running, "pid": s.pid }),
+                serde_json::json!({
+                    "running": s.running,
+                    "pid": s.pid,
+                    "ready": s.ready.as_str(),
+                    "url": s.url,
+                }),
             )
         })
         .collect();

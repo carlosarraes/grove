@@ -29,6 +29,10 @@ pub struct Entry {
     /// runs after it is gone — and with it the `.grove.toml` that named the datastore.
     #[serde(default)]
     pub db_resource: Option<DbResource>,
+    /// The network mode most recently rendered for this instance. Missing on registries
+    /// written before exposure existed, which is safely loopback-only.
+    #[serde(default)]
+    pub exposure: crate::exposure::Exposure,
     /// Unix seconds at the last command that meant someone was working here. Optional
     /// because entries written before this existed have no answer, and guessing one would
     /// make every instance on an upgraded machine look abandoned.
@@ -171,6 +175,7 @@ impl Registry {
                 services: BTreeMap::new(),
                 db_name: None,
                 db_resource: None,
+                exposure: crate::exposure::Exposure::default(),
                 last_used: None,
                 instance_dir: None,
             };
@@ -188,6 +193,10 @@ impl Registry {
             // that command just made back to whatever it was minutes earlier.
             if let Some(stored) = state.instances.get(&key(&entry.worktree)) {
                 entry.last_used = entry.last_used.max(stored.last_used);
+                // Exposure has a dedicated setter. A command that opened the instance
+                // before a mode switch may still record pids or database metadata later;
+                // that unrelated stale write must not reopen or close the network boundary.
+                entry.exposure = stored.exposure.clone();
             }
             state.instances.insert(key(&entry.worktree), entry);
             Ok(())
@@ -201,6 +210,17 @@ impl Registry {
             if let Some(entry) = state.instances.get_mut(&key(worktree)) {
                 entry.last_used = Some(now());
             }
+            Ok(())
+        })
+    }
+
+    pub fn set_exposure(&self, worktree: &Path, exposure: crate::exposure::Exposure) -> Result<()> {
+        self.with_lock(|state| {
+            let entry = state
+                .instances
+                .get_mut(&key(worktree))
+                .context("the instance is not registered")?;
+            entry.exposure = exposure;
             Ok(())
         })
     }

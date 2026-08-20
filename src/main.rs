@@ -112,6 +112,12 @@ enum Command {
         /// Permit running in the main worktree, overwriting its real env files
         #[arg(long)]
         allow_main: bool,
+        /// Expose opted-in services to the local network using the default-route IPv4
+        #[arg(long)]
+        expose: bool,
+        /// Expose to the local network using this IPv4 address or hostname
+        #[arg(long, value_name = "HOST")]
+        expose_host: Option<String>,
     },
     /// Stop this instance's services
     Down {
@@ -204,12 +210,30 @@ fn main() -> Result<()> {
             println!();
             Ok(())
         }
-        Some(Command::Up { fresh, allow_main }) => {
+        Some(Command::Up {
+            fresh,
+            allow_main,
+            expose,
+            expose_host,
+        }) => {
+            let exposure = match expose_host {
+                Some(host) => grove::exposure::Exposure::explicit(&host)?,
+                None if expose => grove::exposure::Exposure::detect()?,
+                None => grove::exposure::Exposure::local(),
+            };
             let mut instance = Instance::open(&cwd)?;
             if !allow_main {
                 instance.refuse_in_main()?;
             }
             instance.touch()?;
+
+            if exposure.is_exposed() {
+                eprintln!(
+                    "warning: exposing {} on all interfaces as {}; development services and authentication bypasses may be reachable from other machines",
+                    instance.resolved.slug,
+                    exposure.public_host()
+                );
+            }
 
             // Before starting, not after: the pile-up forms one agent at a time, and this
             // is the only moment the one adding to it is paying attention.
@@ -224,7 +248,7 @@ fn main() -> Result<()> {
             for started in instance.resources()? {
                 eprintln!("started shared {started}");
             }
-            instance.render()?;
+            instance.render_for_up(exposure)?;
             for outcome in instance.up(fresh)? {
                 eprintln!("{outcome}");
             }
@@ -334,12 +358,18 @@ fn main() -> Result<()> {
                     .iter()
                     .map(|(n, p)| format!("{n}={p}"))
                     .collect();
+                let exposure = if entry.exposure.is_exposed() {
+                    format!(" exposed {}", entry.exposure.public_host())
+                } else {
+                    String::new()
+                };
                 println!(
-                    "{:<28} {:<13} {:<10} {}",
+                    "{:<28} {:<13} {:<10} {}{}",
                     entry.slug,
                     state,
                     idle,
-                    ports.join(" ")
+                    ports.join(" "),
+                    exposure
                 );
             }
             if orphans > 0 {
@@ -664,6 +694,8 @@ fn ls_json(entries: &[Entry], now: u64, machine: &Machine) -> serde_json::Value 
                 "running": e.is_running(),
                 "orphaned": !e.worktree.exists(),
                 "idle_seconds": e.idle_seconds(now),
+                "exposed": e.exposure.is_exposed(),
+                "public_host": e.exposure.public_host(),
                 "ports": e.ports,
                 "database": e.db_name,
             })
@@ -748,6 +780,8 @@ fn status_json(instance: &Instance) -> serde_json::Value {
     serde_json::json!({
         "slug": instance.resolved.slug,
         "worktree": instance.resolved.worktree,
+        "exposed": instance.exposure().is_exposed(),
+        "public_host": instance.exposure().public_host(),
         "ports": instance.entry.ports,
         "database": instance.db_name(),
         "services": services,
@@ -758,7 +792,13 @@ fn status_json(instance: &Instance) -> serde_json::Value {
 fn print_summary(instance: &Instance) {
     println!("instance  {}", instance.resolved.slug);
     for (name, port) in &instance.entry.ports {
-        println!("{name:<10}http://localhost:{port}");
+        println!(
+            "{name:<10}http://{}:{port}",
+            instance.exposure().public_host()
+        );
+    }
+    if instance.exposure().is_exposed() {
+        println!("exposure  network ({})", instance.exposure().public_host());
     }
     if let Some(db) = instance.db_name() {
         println!("database  {db}");

@@ -28,6 +28,27 @@ command = "python3 -u -m http.server {{ port.web }}"
 ready = { http = "http://127.0.0.1:{{ port.web }}/", timeout = "30s" }
 "#;
 
+const EXPOSURE_CONFIG: &str = r#"
+version = 1
+
+[ports]
+names = ["web"]
+
+[[secrets]]
+from = "backend/.env.local"
+into = "backend/.env.local"
+
+[secrets.set]
+API_URL = "http://{{ host.public }}:{{ port.web }}"
+CORS_ORIGINS = "http://{{ host.public }}:{{ port.web }}"
+BIND_HOST = "{{ host.bind }}"
+
+[[service]]
+name = "web"
+command = "printf '%s' '{{ host.bind }}' > bind-host.txt; exec python3 -u -m http.server {{ port.web }} --bind {{ host.bind }}"
+ready = { http = "http://127.0.0.1:{{ port.web }}/", timeout = "30s" }
+"#;
+
 struct Cli {
     state: TempDir,
     fx: Fixture,
@@ -154,6 +175,292 @@ impl Cli {
     }
 }
 
+fn service_pid(cli: &Cli, worktree: &Path, service: &str) -> u64 {
+    let output = cli
+        .run(worktree, &["status", "--json"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status: serde_json::Value = serde_json::from_slice(&output).expect("status JSON");
+    status["services"][service]["pid"]
+        .as_u64()
+        .expect("running service pid")
+}
+
+#[test]
+fn exposure_changes_restart_and_rerender_once_and_plain_up_returns_to_local() {
+    let cli = Cli::with_config(EXPOSURE_CONFIG);
+    let wt = cli.worktree("feat_search");
+
+    cli.run(&wt, &["up"]).success();
+    let local_pid = service_pid(&cli, &wt, "web");
+    let local_env = std::fs::read_to_string(wt.join("backend/.env.local")).expect("local env");
+    assert!(
+        local_env.contains("API_URL=http://localhost:"),
+        "{local_env}"
+    );
+    assert!(local_env.contains("BIND_HOST=127.0.0.1"), "{local_env}");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("bind-host.txt")).expect("bind host"),
+        "127.0.0.1"
+    );
+
+    let exposed = cli
+        .run(&wt, &["up", "--expose-host", "dev-mac.local"])
+        .success();
+    let exposed_stdout = String::from_utf8_lossy(&exposed.get_output().stdout);
+    let exposed_stderr = String::from_utf8_lossy(&exposed.get_output().stderr);
+    assert!(
+        exposed_stdout.contains("http://dev-mac.local:"),
+        "{exposed_stdout}"
+    );
+    assert!(exposed_stderr.contains("warning"), "{exposed_stderr}");
+    assert!(exposed_stderr.contains("dev-mac.local"), "{exposed_stderr}");
+
+    let exposed_pid = service_pid(&cli, &wt, "web");
+    assert_ne!(
+        exposed_pid, local_pid,
+        "changing exposure must restart services"
+    );
+    let exposed_env = std::fs::read_to_string(wt.join("backend/.env.local")).expect("exposed env");
+    assert!(
+        exposed_env.contains("API_URL=http://dev-mac.local:"),
+        "{exposed_env}"
+    );
+    assert!(exposed_env.contains("BIND_HOST=0.0.0.0"), "{exposed_env}");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("bind-host.txt")).expect("bind host"),
+        "0.0.0.0"
+    );
+
+    cli.run(&wt, &["up", "--expose-host", "dev-mac.local"])
+        .success();
+    assert_eq!(
+        service_pid(&cli, &wt, "web"),
+        exposed_pid,
+        "repeating the same exposure must remain idempotent"
+    );
+
+    cli.run(&wt, &["up", "--expose-host", "dev-mac-2.local"])
+        .success();
+    let changed_host_pid = service_pid(&cli, &wt, "web");
+    assert_ne!(
+        changed_host_pid, exposed_pid,
+        "changing only the public host must restart services"
+    );
+    let changed_host_env =
+        std::fs::read_to_string(wt.join("backend/.env.local")).expect("changed host env");
+    assert!(
+        changed_host_env.contains("API_URL=http://dev-mac-2.local:"),
+        "{changed_host_env}"
+    );
+
+    cli.run(&wt, &["up"]).success();
+    assert_ne!(
+        service_pid(&cli, &wt, "web"),
+        changed_host_pid,
+        "plain up is the transition back to loopback"
+    );
+    let local_again =
+        std::fs::read_to_string(wt.join("backend/.env.local")).expect("local env again");
+    assert!(
+        local_again.contains("API_URL=http://localhost:"),
+        "{local_again}"
+    );
+    assert!(local_again.contains("BIND_HOST=127.0.0.1"), "{local_again}");
+
+    cli.run(&wt, &["down"]).success();
+}
+
+#[test]
+fn invalid_exposure_host_changes_neither_files_state_nor_processes() {
+    let cli = Cli::with_config(EXPOSURE_CONFIG);
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+    let pid = service_pid(&cli, &wt, "web");
+    let env = std::fs::read_to_string(wt.join("backend/.env.local")).expect("env");
+
+    let failed = cli
+        .run(&wt, &["up", "--expose-host", "http://dev-mac.local"])
+        .failure();
+    let stderr = String::from_utf8_lossy(&failed.get_output().stderr);
+    assert!(stderr.contains("http://dev-mac.local"), "{stderr}");
+
+    assert_eq!(service_pid(&cli, &wt, "web"), pid);
+    assert_eq!(
+        std::fs::read_to_string(wt.join("backend/.env.local")).expect("env after failure"),
+        env
+    );
+    let status = cli.run(&wt, &["status", "--json"]).success();
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&status.get_output().stdout).expect("status JSON");
+    assert_eq!(parsed["exposed"], false, "{parsed}");
+
+    cli.run(&wt, &["down"]).success();
+}
+
+#[test]
+fn a_failed_exposed_start_retains_the_rendered_target_without_old_processes() {
+    let config = EXPOSURE_CONFIG.replace(
+        "command = \"printf",
+        "prepare = \"test '{{ host.bind }}' != '0.0.0.0'\"\ncommand = \"printf",
+    );
+    let cli = Cli::with_config(&config);
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+
+    cli.run(&wt, &["up", "--expose-host", "dev-mac.local"])
+        .failure();
+
+    let env = std::fs::read_to_string(wt.join("backend/.env.local")).expect("target env");
+    assert!(env.contains("API_URL=http://dev-mac.local:"), "{env}");
+    assert!(env.contains("BIND_HOST=0.0.0.0"), "{env}");
+    let status = cli.run(&wt, &["status", "--json"]).success();
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&status.get_output().stdout).expect("status JSON");
+    assert_eq!(parsed["exposed"], true, "{parsed}");
+    assert_eq!(parsed["public_host"], "dev-mac.local", "{parsed}");
+    assert_eq!(
+        parsed["services"]["web"]["running"], false,
+        "the old local process must be stopped before exposed prepare runs: {parsed}"
+    );
+}
+
+#[test]
+fn restart_and_run_reuse_the_persisted_exposure() {
+    let cli = Cli::with_config(EXPOSURE_CONFIG);
+    let wt = cli.worktree("remote_demo");
+    cli.run(&wt, &["up", "--expose-host", "dev-mac.local"])
+        .success();
+    let before = service_pid(&cli, &wt, "web");
+
+    cli.run(
+        &wt,
+        &[
+            "run",
+            "--",
+            "sh",
+            "-c",
+            "printf '%s|%s' \"$API_URL\" \"$BIND_HOST\" > run-exposure.txt",
+        ],
+    )
+    .success();
+    let run_env = std::fs::read_to_string(wt.join("run-exposure.txt")).expect("run env");
+    assert!(run_env.contains("http://dev-mac.local:"), "{run_env}");
+    assert!(run_env.ends_with("|0.0.0.0"), "{run_env}");
+
+    let restarted = cli.run(&wt, &["restart", "web"]).success();
+    let stdout = String::from_utf8_lossy(&restarted.get_output().stdout);
+    assert!(stdout.contains("http://dev-mac.local:"), "{stdout}");
+    assert_ne!(service_pid(&cli, &wt, "web"), before);
+    assert_eq!(
+        std::fs::read_to_string(wt.join("bind-host.txt")).expect("bind host"),
+        "0.0.0.0"
+    );
+
+    cli.run(&wt, &["down"]).success();
+}
+
+#[test]
+fn status_reports_the_persisted_exposure_in_text_and_json() {
+    let cli = Cli::with_config(EXPOSURE_CONFIG);
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up", "--expose-host", "dev-mac.local"])
+        .success();
+
+    let text = cli.run(&wt, &["status"]).success();
+    let stdout = String::from_utf8_lossy(&text.get_output().stdout);
+    assert!(stdout.contains("http://dev-mac.local:"), "{stdout}");
+    assert!(stdout.contains("exposure"), "{stdout}");
+    assert!(stdout.contains("dev-mac.local"), "{stdout}");
+
+    let json = cli.run(&wt, &["status", "--json"]).success();
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&json.get_output().stdout).expect("status JSON");
+    assert_eq!(parsed["exposed"], true, "{parsed}");
+    assert_eq!(parsed["public_host"], "dev-mac.local", "{parsed}");
+
+    cli.run(&wt, &["down"]).success();
+    let stopped = cli.run(&wt, &["status", "--json"]).success();
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&stopped.get_output().stdout).expect("stopped status JSON");
+    assert_eq!(
+        parsed["exposed"], true,
+        "down must preserve the mode: {parsed}"
+    );
+    assert_eq!(parsed["public_host"], "dev-mac.local", "{parsed}");
+}
+
+#[test]
+fn ls_distinguishes_an_exposed_instance_without_touching_its_local_sibling() {
+    let cli = Cli::with_config(EXPOSURE_CONFIG);
+    let local = cli.worktree("local_ticket");
+    let exposed = cli.worktree("remote_demo");
+    cli.run(&local, &["up"]).success();
+    let local_pid = service_pid(&cli, &local, "web");
+    cli.run(&exposed, &["up", "--expose-host", "dev-mac.local"])
+        .success();
+
+    assert_eq!(
+        service_pid(&cli, &local, "web"),
+        local_pid,
+        "exposing one instance must not restart its sibling"
+    );
+
+    let text = cli.run(&local, &["ls"]).success();
+    let stdout = String::from_utf8_lossy(&text.get_output().stdout);
+    let exposed_row = stdout
+        .lines()
+        .find(|line| line.contains("remote_demo"))
+        .expect("exposed row");
+    let local_row = stdout
+        .lines()
+        .find(|line| line.contains("local_ticket"))
+        .expect("local row");
+    assert!(
+        exposed_row.contains("exposed dev-mac.local"),
+        "{exposed_row}"
+    );
+    assert!(!local_row.contains("exposed"), "{local_row}");
+
+    let json = cli.run(&local, &["ls", "--json"]).success();
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&json.get_output().stdout).expect("ls JSON");
+    let instances = parsed["instances"].as_array().expect("instances");
+    let by_slug = |slug: &str| {
+        instances
+            .iter()
+            .find(|instance| instance["slug"] == slug)
+            .unwrap_or_else(|| panic!("missing {slug}: {parsed}"))
+    };
+    assert_eq!(by_slug("remote_demo")["exposed"], true);
+    assert_eq!(by_slug("remote_demo")["public_host"], "dev-mac.local");
+    assert_eq!(by_slug("local_ticket")["exposed"], false);
+    assert_eq!(by_slug("local_ticket")["public_host"], "localhost");
+
+    cli.run(&local, &["down"]).success();
+    cli.run(&exposed, &["down"]).success();
+}
+
+#[test]
+fn doctor_warns_that_an_exposed_instance_crosses_the_loopback_boundary() {
+    let cli = Cli::with_config(EXPOSURE_CONFIG);
+    let wt = cli.worktree("remote_demo");
+    cli.run(&wt, &["up", "--expose-host", "dev-mac.local"])
+        .success();
+
+    let output = cli.run(&wt, &["doctor"]).success();
+    let stdout = String::from_utf8_lossy(&output.get_output().stdout);
+
+    assert!(stdout.contains("warn"), "{stdout}");
+    assert!(stdout.contains("dev-mac.local"), "{stdout}");
+    assert!(stdout.contains("authentication bypass"), "{stdout}");
+    assert!(stdout.contains("other machines"), "{stdout}");
+
+    cli.run(&wt, &["down"]).success();
+}
+
 #[test]
 fn help_names_the_shared_container_open_file_limit() {
     let out = Command::cargo_bin("grove")
@@ -169,6 +476,24 @@ fn help_names_the_shared_container_open_file_limit() {
     assert!(stdout.contains("nofile=64000"), "{stdout}");
     assert!(stdout.contains("environment overlaid"), "{stdout}");
     assert!(stdout.contains("resource recreation"), "{stdout}");
+}
+
+#[test]
+fn up_help_names_network_exposure_and_its_host_override() {
+    let out = Command::cargo_bin("grove")
+        .expect("binary")
+        .args(["up", "--help"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&out);
+
+    assert!(stdout.contains("--expose"), "{stdout}");
+    assert!(stdout.contains("--expose-host <HOST>"), "{stdout}");
+    assert!(stdout.contains("local network"), "{stdout}");
+    assert!(stdout.contains("default-route"), "{stdout}");
 }
 
 /// The headline: a worktree with no env file, no ports, and no setup becomes a running

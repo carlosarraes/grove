@@ -17,16 +17,22 @@ pub struct Context {
     pub ports: BTreeMap<String, u16>,
     pub db_name: Option<String>,
     pub main_worktree: PathBuf,
+    pub exposure: crate::exposure::Exposure,
 }
 
 impl Context {
     fn bindings(&self) -> Value {
         let ports: BTreeMap<&str, u16> = self.ports.iter().map(|(k, v)| (k.as_str(), *v)).collect();
         let db = BTreeMap::from([("name", self.db_name.clone().unwrap_or_default())]);
+        let host = BTreeMap::from([
+            ("bind", self.exposure.bind_host()),
+            ("public", self.exposure.public_host()),
+        ]);
         Value::from_serialize(BTreeMap::from([
             ("slug", Value::from(self.slug.as_str())),
             ("port", Value::from_serialize(&ports)),
             ("db", Value::from_serialize(&db)),
+            ("host", Value::from_serialize(&host)),
             (
                 "main_worktree",
                 Value::from(self.main_worktree.to_string_lossy().into_owned()),

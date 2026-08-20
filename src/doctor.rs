@@ -47,6 +47,13 @@ pub fn check(instance: &Instance) -> Vec<Verdict> {
         )));
     }
 
+    if instance.exposure().is_exposed() {
+        verdicts.push(Verdict::Warn(format!(
+            "instance is exposed on all interfaces as {}; development services and authentication bypasses may be reachable from other machines",
+            instance.exposure().public_host()
+        )));
+    }
+
     for secrets in &instance.config.secrets {
         let source = instance.resolved.main_worktree.join(&secrets.from);
         if source.is_file() {

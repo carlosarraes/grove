@@ -1,5 +1,6 @@
 pub mod config;
 pub mod doctor;
+pub mod exposure;
 pub mod instance;
 pub mod llm;
 pub mod load;

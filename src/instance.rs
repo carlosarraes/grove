@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::config::{self, Config};
+use crate::exposure::Exposure;
 use crate::registry::{Entry, Registry};
 use crate::render::{self, Context as RenderContext};
 use crate::resolve::{self, Resolved};
@@ -18,6 +19,9 @@ pub struct Instance {
     registry: Registry,
     state_dir: PathBuf,
     recently_started_resources: BTreeSet<String>,
+    /// The mode used by rendering and commands in this process. It starts at the
+    /// persisted mode, but `up` can target a new one before committing the transition.
+    target_exposure: Exposure,
 }
 
 /// Whether the service's declared endpoint is actually being served. Distinct from
@@ -226,6 +230,7 @@ impl Instance {
         let registry = registry()?;
         let entry = registry.reserve(&resolved, &config.ports.names)?;
         let state_dir = state_dir()?;
+        let target_exposure = entry.exposure.clone();
         let mut instance = Instance {
             resolved,
             config,
@@ -233,6 +238,7 @@ impl Instance {
             registry,
             state_dir,
             recently_started_resources: BTreeSet::new(),
+            target_exposure,
         };
 
         // Recorded here because `ls` reads the registry without resolving a worktree, and
@@ -281,12 +287,17 @@ impl Instance {
         self.entry.db_name.clone()
     }
 
+    pub fn exposure(&self) -> &Exposure {
+        &self.target_exposure
+    }
+
     fn render_context(&self) -> RenderContext {
         RenderContext {
             slug: self.resolved.slug.clone(),
             ports: self.entry.ports.clone(),
             db_name: self.entry.db_name.clone(),
             main_worktree: self.resolved.main_worktree.clone(),
+            exposure: self.target_exposure.clone(),
         }
     }
 
@@ -358,6 +369,7 @@ impl Instance {
                 ports: self.entry.ports.clone(),
                 db_name: None,
                 main_worktree: self.resolved.main_worktree.clone(),
+                exposure: self.target_exposure.clone(),
             };
             let name = render::value(template, &bare)
                 .with_context(|| format!("rendering db_name {template:?}"))?;
@@ -372,6 +384,24 @@ impl Instance {
         }
 
         render::all(&self.config, &self.resolved, &self.render_context())
+    }
+
+    /// Render one requested network mode and, when it changed, replace the entire running
+    /// stack. The target is committed only after rendering succeeds; after that point a
+    /// startup failure must retain it because the generated files already describe it.
+    pub fn render_for_up(&mut self, target: Exposure) -> Result<()> {
+        let changed = target != self.entry.exposure;
+        self.target_exposure = target;
+        self.render()?;
+        if !changed {
+            return Ok(());
+        }
+
+        self.down()?;
+        self.registry
+            .set_exposure(&self.resolved.worktree, self.target_exposure.clone())?;
+        self.entry.exposure = self.target_exposure.clone();
+        Ok(())
     }
 
     /// Bring up every declared datastore, reusing anything already answering on its port.

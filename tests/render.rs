@@ -1,6 +1,7 @@
 mod common;
 
 use common::Fixture;
+use grove::exposure::Exposure;
 use grove::render::{self, Context};
 use grove::{config, resolve};
 use std::collections::BTreeMap;
@@ -11,6 +12,7 @@ fn context() -> Context {
         ports: BTreeMap::from([("frontend".into(), 24310u16), ("backend".into(), 24311u16)]),
         db_name: Some("app_feat_search".into()),
         main_worktree: "/home/dev/work/checkout".into(),
+        exposure: Exposure::local(),
     }
 }
 
@@ -138,6 +140,8 @@ fn every_template_variable_resolves() {
             ("PORT", "{{ port.frontend }}"),
             ("DB", "{{ db.name }}"),
             ("MAIN", "{{ main_worktree }}"),
+            ("PUBLIC_HOST", "{{ host.public }}"),
+            ("BIND_HOST", "{{ host.bind }}"),
         ]),
         &context(),
     )
@@ -147,6 +151,27 @@ fn every_template_variable_resolves() {
     assert!(out.contains("PORT=24310"), "{out}");
     assert!(out.contains("DB=app_feat_search"), "{out}");
     assert!(out.contains("MAIN=/home/dev/work/checkout"), "{out}");
+    assert!(out.contains("PUBLIC_HOST=localhost"), "{out}");
+    assert!(out.contains("BIND_HOST=127.0.0.1"), "{out}");
+}
+
+#[test]
+fn exposed_templates_use_the_selected_public_host_and_all_interfaces() {
+    let mut context = context();
+    context.exposure = Exposure::explicit("dev-mac.local").expect("host");
+
+    let out = render::env(
+        "",
+        &set(&[
+            ("PUBLIC_HOST", "{{ host.public }}"),
+            ("BIND_HOST", "{{ host.bind }}"),
+        ]),
+        &context,
+    )
+    .expect("render");
+
+    assert!(out.contains("PUBLIC_HOST=dev-mac.local"), "{out}");
+    assert!(out.contains("BIND_HOST=0.0.0.0"), "{out}");
 }
 
 /// A typo in a port name must not render an empty string into a URL, which would produce

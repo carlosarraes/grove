@@ -1,6 +1,7 @@
 mod common;
 
 use common::Fixture;
+use grove::exposure::Exposure;
 use grove::{registry::Registry, resolve};
 use tempfile::TempDir;
 
@@ -229,6 +230,7 @@ fn an_entry_written_before_idle_tracking_still_parses() {
     assert_eq!(entry.slug, "old");
     assert_eq!(entry.last_used, None);
     assert_eq!(entry.instance_dir, None);
+    assert_eq!(entry.exposure, Exposure::local());
     assert_eq!(entry.idle_seconds(now()), None);
 }
 
@@ -351,5 +353,39 @@ fn recording_a_stale_entry_does_not_roll_back_the_idle_clock() {
     assert!(
         entry.last_used.is_some(),
         "recording an entry read before the touch must not undo it"
+    );
+}
+
+#[test]
+fn exposure_is_updated_through_its_own_locked_registry_operation() {
+    let h = Harness::new();
+    let r = h.resolved("feat_search");
+    h.registry.reserve(&r, &names()).expect("reserve");
+    let exposed = Exposure::explicit("dev-mac.local").expect("host");
+
+    h.registry
+        .set_exposure(&r.worktree, exposed.clone())
+        .expect("set exposure");
+
+    let entry = h.registry.get(&r.worktree).expect("get").expect("entry");
+    assert_eq!(entry.exposure, exposed);
+}
+
+#[test]
+fn recording_a_stale_entry_does_not_roll_back_exposure() {
+    let h = Harness::new();
+    let r = h.resolved("feat_search");
+    let read_while_local = h.registry.reserve(&r, &names()).expect("reserve");
+    let exposed = Exposure::explicit("dev-mac.local").expect("host");
+    h.registry
+        .set_exposure(&r.worktree, exposed.clone())
+        .expect("set exposure");
+
+    h.registry.record(&read_while_local).expect("record stale");
+
+    let entry = h.registry.get(&r.worktree).expect("get").expect("entry");
+    assert_eq!(
+        entry.exposure, exposed,
+        "an unrelated stale service/database write must not return the instance to loopback"
     );
 }

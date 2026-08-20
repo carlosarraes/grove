@@ -137,6 +137,10 @@ impl Cli {
         // arrives without it. Committing it here would make every test a no-op.
         std::fs::write(fx.main.join(".gitignore"), ".env.local\n").expect("gitignore");
         common::git(&fx.main, &["add", "."]);
+        // A developer may globally ignore `.grove.toml` while keeping repo configs
+        // explicitly tracked. This fixture requires the latter regardless of ambient
+        // Git configuration.
+        common::git(&fx.main, &["add", "--force", ".grove.toml"]);
         common::git(&fx.main, &["commit", "-m", "add grove config"]);
 
         Cli {

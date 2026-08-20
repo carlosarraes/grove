@@ -21,12 +21,12 @@ into = "backend/.env.local"
 # CORS_ORIGINS is an exact-match list, so it has to name THIS instance's frontend
 # port. Any auth callback URL needs the same treatment, for the same reason.
 [secrets.set]
-CORS_ORIGINS = "http://localhost:{{ port.frontend }}"
+CORS_ORIGINS = "http://{{ host.public }}:{{ port.frontend }}"
 MONGODB_URI = "mongodb://localhost:27017/?directConnection=true&replicaSet=rs0"
 MONGODB_DATABASE = "{{ db.name }}"
 ENVIRONMENT = "development"
 DEBUG = "True"
-AUTH_REDIRECT_URI = "http://localhost:{{ port.frontend }}/auth/callback"
+AUTH_REDIRECT_URI = "http://{{ host.public }}:{{ port.frontend }}/auth/callback"
 
 [[secrets]]
 from = "frontend/.env.local"
@@ -36,7 +36,7 @@ into = "frontend/.env.local"
 # is what the dev server proxies /auth and /api to. Each falls back to a hardcoded
 # localhost:8000, so missing either one silently drives another instance's backend.
 [secrets.set]
-VITE_API_URL = "http://localhost:{{ port.backend }}"
+VITE_API_URL = "http://{{ host.public }}:{{ port.backend }}"
 VITE_PROXY_TARGET = "http://localhost:{{ port.backend }}"
 
 # One container shared by every instance. grove probes the port first and reuses
@@ -57,7 +57,7 @@ db_name = "app_{{ slug }}"
 name = "backend"
 cwd = "backend"
 setup = "uv sync"
-command = "uv run uvicorn src.main:app --reload --port {{ port.backend }}"
+command = "uv run uvicorn src.main:app --reload --host {{ host.bind }} --port {{ port.backend }}"
 ready = { http = "http://localhost:{{ port.backend }}/openapi.json", timeout = "180s" }
 
 # --strictPort matters: without it Vite drifts to the next free port on collision, and
@@ -101,6 +101,8 @@ Any string value in [secrets.set], [[resource]].db_name, [[service]].command, an
   {{{{ port.<name> }}}}    a port from [ports].names, assigned by grove
   {{{{ db.name }}}}        this instance's database, from [[resource]].db_name
   {{{{ main_worktree }}}}  absolute path of the main checkout
+  {{{{ host.public }}}}    localhost normally; the selected LAN host when exposed
+  {{{{ host.bind }}}}      127.0.0.1 normally; 0.0.0.0 when exposed
 
 ### Schema
 
@@ -184,6 +186,29 @@ dependency install in `setup`, fixture data in `[[seed]]`, and code generation i
    holds two independent addresses for its backend -- one the browser uses and one the
    dev-server proxy uses -- and each usually has a hardcoded fallback. Missing one is
    invisible until an instance answers with another instance's data.
+
+### Exposing an instance to the local network
+
+Exposure is opt-in in both the command and the repository config. Use
+`grove up --expose` to select the default-route IPv4 address, or
+`grove up --expose-host <IPv4-or-hostname>` to choose the browser-visible host explicitly
+for a VPN, Tailscale, or multi-interface machine. The explicit host implies exposure.
+A plain `grove up` returns the instance to localhost-only operation.
+
+Grove supplies the values; the config decides where they belong. A remotely usable
+stack normally needs all three:
+
+1. The service command binds with `{{{{ host.bind }}}}` so exposure can switch it from
+   127.0.0.1 to all interfaces.
+2. Values consumed by a browser use `{{{{ host.public }}}}`, not localhost on the
+   viewer's machine.
+3. Server-side CORS and redirect allowlists use the same public frontend origin.
+
+Changing exposure re-renders config and restarts the instance. The selected state is
+shown by `grove status` and `grove ls`; sibling instances remain unchanged. Exposure is
+not a firewall, TLS, authentication, or tunnelling feature. Development services and any
+authentication bypass are reachable from other machines that can contact the host, so
+use it only on a network whose reachability you understand.
 
 ### Browser failures
 

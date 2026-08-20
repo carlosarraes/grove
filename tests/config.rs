@@ -90,6 +90,40 @@ fn llm_reference_routes_test_switches_and_browser_failures_to_their_owners() {
 }
 
 #[test]
+fn llm_reference_explains_opt_in_network_exposure() {
+    let reference = llm::reference();
+
+    for required in [
+        "grove up --expose",
+        "grove up --expose-host",
+        "{{ host.public }}",
+        "{{ host.bind }}",
+        "plain `grove up`",
+        "CORS",
+        "all interfaces",
+        "authentication bypass",
+    ] {
+        assert!(
+            reference.contains(required),
+            "the agent reference must explain {required:?}"
+        );
+    }
+
+    assert!(
+        llm::EXAMPLE.contains("http://{{ host.public }}:{{ port.backend }}"),
+        "the browser-facing API URL must opt in to the public host"
+    );
+    assert!(
+        llm::EXAMPLE.contains("--host {{ host.bind }}"),
+        "the service must opt in to binding all interfaces"
+    );
+    assert!(
+        llm::EXAMPLE.contains("CORS_ORIGINS = \"http://{{ host.public }}:{{ port.frontend }}\""),
+        "the allowlist must opt in to the browser-visible origin"
+    );
+}
+
+#[test]
 fn secrets_carry_the_per_instance_overrides() {
     let c = config::parse(llm::EXAMPLE).expect("parse");
     let backend = c

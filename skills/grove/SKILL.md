@@ -1,6 +1,6 @@
 ---
 name: grove
-description: Run this repo's dev servers inside a git worktree - each worktree gets its own ports, env files, and database. Use when starting or restarting a dev server, when a port is already in use, when a service fails to start on a missing .env or config error, when a test needs a live server, when tests fail or time out in ways your change does not explain, or when work in a worktree is finished.
+description: Use when starting or restarting this repo's dev servers in a git worktree, a port or env file is missing, tests need a live server or fail for unexplained reasons, an instance must be reached from another machine, or work in a worktree is finished.
 ---
 
 # grove
@@ -24,6 +24,30 @@ not to this instance.
 Re-running `up` is safe, and is the cheapest way to recover from a service that died. The
 first `up` in a worktree also installs the repo's dependencies, so it can take minutes
 where later ones take seconds.
+
+## Viewing from another machine
+
+If the repo's `.grove.toml` opts in to network-aware templates, expose only this
+instance with:
+
+```
+grove up --expose                       # default-route IPv4
+grove up --expose-host dev-mac.local   # explicit VPN, Tailscale, or LAN host
+```
+
+The config must use `{{ host.bind }}` in each service's bind flag,
+`{{ host.public }}` in browser-facing URLs, and the same public origin in CORS and
+redirect allowlists. This coordination prevents a laptop's browser from calling its own
+localhost. Grove supplies the values but cannot infer each framework's bind or CORS
+settings; run `grove --llm` for a complete example.
+
+Exposure is persisted for this instance, re-renders its config, and restarts its
+services. `grove status` and `grove ls` show the public host; sibling instances keep
+their own mode. Plain `grove up` switches this instance back to localhost-only.
+
+Exposed services bind all interfaces. Grove does not add a firewall, TLS,
+authentication, or a tunnel, so development services and authentication bypasses may be
+reachable by other machines on the network.
 
 ## Working
 

@@ -79,7 +79,7 @@ into = "backend/.env.local"
 # here is already in git — put those in the gitignored file named by `from` above.
 # These values are also exported to every command grove runs.
 [secrets.set]
-CORS_ORIGINS = "http://localhost:{{ port.frontend }}"
+CORS_ORIGINS = "http://{{ host.public }}:{{ port.frontend }}"
 DATABASE_NAME = "{{ db.name }}"
 
 # Containers grove starts receive nofile=64000:64000.
@@ -99,7 +99,7 @@ command = "uv run python -m tests.seed"
 name = "backend"
 cwd = "backend"
 setup = "uv sync"                 # once per worktree
-command = "uv run uvicorn src.main:app --reload --port {{ port.backend }}"
+command = "uv run uvicorn src.main:app --reload --host {{ host.bind }} --port {{ port.backend }}"
 ready = { http = "http://localhost:{{ port.backend }}/health", timeout = "180s" }
 
 [[service]]
@@ -111,6 +111,23 @@ command = "npm run dev -- --strictPort --port {{ port.frontend }}"
 `grove --llm` prints the full schema and a worked example — that's what an agent reads to
 write one of these.
 
+### View an instance from another machine
+
+Repositories opt in by using `{{ host.bind }}` where a service chooses its bind address
+and `{{ host.public }}` in values consumed by the browser, including CORS and redirect
+allowlists. Then expose only the current instance:
+
+```sh
+grove up --expose                       # use the default-route IPv4
+grove up --expose-host dev-mac.local   # explicit host for VPN or multi-NIC setups
+grove up                                # return this instance to localhost-only
+```
+
+Changing exposure re-renders and restarts the instance; `status` and `ls` show the
+selected host. Sibling instances are unaffected. Exposure binds opted-in services to all
+interfaces—it does not add a firewall, TLS, authentication, or a tunnel. Development
+auth bypasses may therefore be reachable by other machines on the network.
+
 Grove renders configured dotenv files and overlays per-instance variables on commands it
 starts; it does not provide an empty settings environment. Tests that assert application
 defaults must disable dotenv loading and clear the relevant process variables in the
@@ -120,7 +137,7 @@ repo's own fixture or settings constructor.
 
 | | |
 |---|---|
-| `up` | render config, start missing shared containers with `nofile=64000`, start services |
+| `up [--expose] [--expose-host HOST]` | render config, optionally expose opted-in services to the local network, start shared resources and services |
 | `down [--purge]` | stop services; `--purge` also drops the database |
 | `down --idle 2h` \| `--all-but-this` | stop instances across the machine, keeping their ports; `--dry-run` names them first |
 | `restart [service]` | replace one service without touching the others |

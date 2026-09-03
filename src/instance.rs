@@ -618,6 +618,24 @@ impl Instance {
                 }
             }
 
+            // Before starting, not after: the readiness probe cannot tell this service's
+            // answer from another process's on the same port. A reservation is stable
+            // across restarts and nothing re-checks it, so a port that already answers is
+            // held by something else — and a service started on it would die on bind
+            // while grove reported the other process's answers as readiness.
+            if let Some(ready) = &service.ready {
+                let url = render::value(&ready.http, &context)?;
+                if supervise::probe(&url, std::time::Duration::from_secs(1)) {
+                    bail!(
+                        "{} not started: {url} already answers, so its port is held by \
+                         another process\n\
+                         `grove ls` names the instances holding ports; anything else \
+                         on that port is not grove's to stop",
+                        service.name
+                    );
+                }
+            }
+
             let command = render::value(&service.command, &context)
                 .with_context(|| format!("rendering the command for {}", service.name))?;
             let environment = self.environment()?;
@@ -628,12 +646,22 @@ impl Instance {
             if let Some(ready) = &service.ready {
                 let url = render::value(&ready.http, &context)?;
                 let timeout = parse_duration(&ready.timeout)?;
-                supervise::wait_ready(&url, timeout).with_context(|| {
-                    format!(
-                        "{} never became ready\n{}",
-                        service.name,
-                        tail(&log, 30).unwrap_or_default()
-                    )
+                supervise::wait_ready(&handle, &url, timeout).map_err(|why| {
+                    let tail = tail(&log, 30).unwrap_or_default();
+                    match why {
+                        // Spelled out rather than wrapped: "never became ready" reads as
+                        // slow, and a reader waits. This one died, and the tail says why.
+                        supervise::NotReady::Exited { url } => anyhow::anyhow!(
+                            "{} exited before answering on {url}\n\
+                             full output in {}\n{tail}",
+                            service.name,
+                            log.display()
+                        ),
+                        timed_out => anyhow::anyhow!(
+                            "{} never became ready: {timed_out}\n{tail}",
+                            service.name
+                        ),
+                    }
                 })?;
             }
         }

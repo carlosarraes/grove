@@ -2807,3 +2807,61 @@ fn a_worktree_without_a_config_uses_the_main_checkouts() {
 
     cli.run(&wt, &["down"]).success();
 }
+
+/// Kills a stand-in server when the test ends, however it ends.
+struct Squatter(std::process::Child);
+
+impl Drop for Squatter {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Something else is already serving this port when the service starts — a reservation
+/// is stable across restarts, and nothing re-checks it. The service would die on bind,
+/// the readiness probe would be answered by the squatter, and `up` would report success,
+/// after which every request goes to whatever took the port, silently. That is the worst
+/// outcome grove has, and it has to be refused before anything starts.
+#[test]
+fn up_refuses_when_something_else_already_answers_on_the_port() {
+    let cli = Cli::new();
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+    let port: u16 = std::fs::read_to_string(wt.join("backend/.env.local"))
+        .expect("env")
+        .lines()
+        .find_map(|l| l.strip_prefix("API_URL=http://localhost:"))
+        .expect("API_URL")
+        .parse()
+        .expect("port");
+    cli.run(&wt, &["down"]).success();
+
+    let _squatter = Squatter(
+        std::process::Command::new("python3")
+            .args(["-u", "-m", "http.server", &port.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("squat the port"),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while ureq::get(format!("http://127.0.0.1:{port}/"))
+        .call()
+        .is_err()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the squatter never answered"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let out = cli.run(&wt, &["up"]).failure().get_output().stderr.clone();
+    let stderr = String::from_utf8_lossy(&out).into_owned();
+    assert!(stderr.contains("already answers"), "{stderr}");
+    assert!(
+        stderr.contains(&port.to_string()),
+        "must name the port: {stderr}"
+    );
+}

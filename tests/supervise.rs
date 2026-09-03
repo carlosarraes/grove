@@ -137,15 +137,57 @@ fn serving(status: &str) -> u16 {
     port
 }
 
+/// A process that stays up for the duration of a test, standing in for the service
+/// whose port the in-test server is answering on.
+fn long_lived(dir: &TempDir) -> supervise::Handle {
+    supervise::spawn(
+        "sleep 60",
+        dir.path(),
+        &no_env(),
+        &dir.path().join("svc.log"),
+    )
+    .expect("spawn")
+}
+
 #[test]
 fn waiting_for_ready_returns_once_the_service_answers() {
+    let dir = TempDir::new().expect("tempdir");
+    let handle = long_lived(&dir);
     let port = serving("200 OK");
 
     supervise::wait_ready(
+        &handle,
         &format!("http://127.0.0.1:{port}/openapi.json"),
         Duration::from_secs(5),
     )
     .expect("should become ready");
+    let _ = supervise::stop(&handle);
+}
+
+/// The readiness probe cannot tell this service's answer from a neighbour's on the same
+/// port. The process can: a service that has exited was never the one answering, and
+/// waiting out the timeout would end in a success that belongs to someone else.
+#[test]
+fn a_service_that_exits_fails_the_wait_at_once() {
+    let dir = TempDir::new().expect("tempdir");
+    let handle = supervise::spawn("true", dir.path(), &no_env(), &dir.path().join("svc.log"))
+        .expect("spawn");
+    settle();
+
+    let began = std::time::Instant::now();
+    let err = supervise::wait_ready(&handle, "http://127.0.0.1:1/", Duration::from_secs(10))
+        .expect_err("a dead process is not ready");
+
+    assert!(
+        began.elapsed() < Duration::from_secs(2),
+        "waited out the timeout instead"
+    );
+    let msg = format!("{err:#}");
+    assert!(msg.contains("exited"), "{msg}");
+    assert!(
+        msg.contains("127.0.0.1:1"),
+        "should still name the url: {msg}"
+    );
 }
 
 /// A health endpoint may report degraded by design when an optional dependency is
@@ -153,19 +195,26 @@ fn waiting_for_ready_returns_once_the_service_answers() {
 /// is the question; its opinion of itself is not ours to judge.
 #[test]
 fn an_error_status_still_counts_as_answering() {
+    let dir = TempDir::new().expect("tempdir");
+    let handle = long_lived(&dir);
     let port = serving("503 Service Unavailable");
 
     supervise::wait_ready(
+        &handle,
         &format!("http://127.0.0.1:{port}/health"),
         Duration::from_secs(5),
     )
     .expect("503 is still an answer");
+    let _ = supervise::stop(&handle);
 }
 
 #[test]
 fn waiting_for_ready_gives_up_and_names_the_url() {
+    let dir = TempDir::new().expect("tempdir");
+    let handle = long_lived(&dir);
     // Port 1 is reserved and nothing will ever answer there.
     let err = supervise::wait_ready(
+        &handle,
         "http://127.0.0.1:1/openapi.json",
         Duration::from_millis(400),
     )
@@ -173,4 +222,5 @@ fn waiting_for_ready_gives_up_and_names_the_url() {
 
     let msg = format!("{err:#}");
     assert!(msg.contains("127.0.0.1:1"), "should name the url: {msg}");
+    let _ = supervise::stop(&handle);
 }

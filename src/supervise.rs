@@ -3,7 +3,7 @@
 //! No daemon. Each service runs in its own process group with its output on disk, so
 //! grove can exit immediately after `up` and still stop the whole tree later.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -132,15 +132,50 @@ pub fn probe(url: &str, timeout: Duration) -> bool {
     )
 }
 
-/// Poll until the service answers, or the timeout expires.
-pub fn wait_ready(url: &str, timeout: Duration) -> Result<()> {
+/// Why a service did not become ready. Two variants because they call for different
+/// reactions: a timeout means wait longer or read the log, an exit means the port was
+/// never this service's to answer on.
+#[derive(Debug)]
+pub enum NotReady {
+    Exited { url: String },
+    TimedOut { url: String, after: Duration },
+}
+
+impl std::fmt::Display for NotReady {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NotReady::Exited { url } => write!(f, "the process exited before {url} answered"),
+            NotReady::TimedOut { url, after } => {
+                write!(f, "{url} never answered within {after:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NotReady {}
+
+/// Poll until the service answers, its process exits, or the timeout expires.
+///
+/// The probe cannot tell this service's answer from a neighbour's on the same port,
+/// which is exactly what a second instance is when two `up`s race for a block. The
+/// process can: once it has exited, an answer on the port belongs to someone else, and
+/// reporting it as readiness would hand every later request to that someone.
+pub fn wait_ready(handle: &Handle, url: &str, timeout: Duration) -> Result<(), NotReady> {
     let deadline = Instant::now() + timeout;
     loop {
         if probe(url, Duration::from_secs(2)) {
             return Ok(());
         }
+        if !is_alive(handle) {
+            return Err(NotReady::Exited {
+                url: url.to_string(),
+            });
+        }
         if Instant::now() >= deadline {
-            bail!("{url} never answered within {timeout:?}");
+            return Err(NotReady::TimedOut {
+                url: url.to_string(),
+                after: timeout,
+            });
         }
         std::thread::sleep(Duration::from_millis(100));
     }

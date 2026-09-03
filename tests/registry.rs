@@ -230,6 +230,7 @@ fn an_entry_written_before_idle_tracking_still_parses() {
     assert_eq!(entry.slug, "old");
     assert_eq!(entry.last_used, None);
     assert_eq!(entry.instance_dir, None);
+    assert_eq!(entry.disk_bytes, None);
     assert_eq!(entry.exposure, Exposure::local());
     assert_eq!(entry.idle_seconds(now()), None);
 }

@@ -1,6 +1,7 @@
 pub mod config;
 pub mod doctor;
 pub mod exposure;
+pub mod footprint;
 pub mod instance;
 pub mod llm;
 pub mod load;

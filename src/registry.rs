@@ -43,6 +43,11 @@ pub struct Entry {
     /// way to reach, since it reads the registry and never resolves a worktree.
     #[serde(default)]
     pub instance_dir: Option<PathBuf>,
+    /// Git-ignored bytes under the worktree, measured after `setup` ran — the moment the
+    /// number changes, and the only walk of node_modules worth paying for. None on entries
+    /// written before this existed and on worktrees where no setup has run.
+    #[serde(default)]
+    pub disk_bytes: Option<u64>,
 }
 
 /// Enough to reach a datastore without the config that declared it: the port to speak to,
@@ -178,6 +183,7 @@ impl Registry {
                 exposure: crate::exposure::Exposure::default(),
                 last_used: None,
                 instance_dir: None,
+                disk_bytes: None,
             };
             state.instances.insert(key, entry.clone());
             Ok(entry)

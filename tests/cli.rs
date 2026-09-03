@@ -28,6 +28,28 @@ command = "python3 -u -m http.server {{ port.web }}"
 ready = { http = "http://127.0.0.1:{{ port.web }}/", timeout = "30s" }
 "#;
 
+/// A `setup` that leaves a measurable, gitignored tree behind, the way `npm ci` does.
+/// Appends rather than truncates so a rerun visibly grows it.
+const SETUP_CONFIG: &str = r#"
+version = 1
+
+[ports]
+names = ["web"]
+
+[[secrets]]
+from = "backend/.env.local"
+into = "backend/.env.local"
+
+[secrets.set]
+API_URL = "http://localhost:{{ port.web }}"
+
+[[service]]
+name = "web"
+setup = "mkdir -p node_modules && head -c 2097152 /dev/zero >> node_modules/blob"
+command = "python3 -u -m http.server {{ port.web }}"
+ready = { http = "http://127.0.0.1:{{ port.web }}/", timeout = "30s" }
+"#;
+
 const EXPOSURE_CONFIG: &str = r#"
 version = 1
 
@@ -135,7 +157,8 @@ impl Cli {
         std::fs::write(fx.main.join(".grove.toml"), config).expect("config");
         // Gitignored, exactly as in a real repo — which is the whole reason a worktree
         // arrives without it. Committing it here would make every test a no-op.
-        std::fs::write(fx.main.join(".gitignore"), ".env.local\n").expect("gitignore");
+        std::fs::write(fx.main.join(".gitignore"), ".env.local\nnode_modules/\n")
+            .expect("gitignore");
         common::git(&fx.main, &["add", "."]);
         // A developer may globally ignore `.grove.toml` while keeping repo configs
         // explicitly tracked. This fixture requires the latter regardless of ambient
@@ -2506,4 +2529,102 @@ fn prune_admits_which_databases_it_cannot_reach() {
         stdout.contains("mongosh"),
         "an unreachable database should hand over the command that works: {stdout}"
     );
+}
+
+fn disk_bytes_of(cli: &Cli, worktree: &Path) -> Option<u64> {
+    registry_of(cli)
+        .get(worktree)
+        .expect("get")
+        .expect("entry")
+        .disk_bytes
+}
+
+/// The dependency tree is the cost `down` never returns, and load says nothing about it.
+/// `ls` is where someone deciding what to reclaim is already looking.
+#[test]
+fn up_records_what_setup_put_on_disk_and_ls_shows_it() {
+    let cli = Cli::with_config(SETUP_CONFIG);
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+
+    let bytes = disk_bytes_of(&cli, &wt).expect("measured once setup has run");
+    assert!(bytes >= 2 << 20, "setup wrote 2MiB, recorded {bytes}");
+
+    let out = cli.run(&wt, &["ls"]).success().get_output().stdout.clone();
+    let listed = String::from_utf8_lossy(&out).into_owned();
+    assert!(listed.contains("2.0M"), "{listed}");
+    assert!(listed.contains("on disk"), "{listed}");
+
+    let out = cli
+        .run(&wt, &["ls", "--json"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
+    assert_eq!(json["instances"][0]["disk_bytes"].as_u64(), Some(bytes));
+    assert_eq!(json["disk_bytes"].as_u64(), Some(bytes));
+
+    cli.run(&wt, &["down"]).success();
+}
+
+/// Walking node_modules costs seconds per worktree; on a fleet it is only affordable at
+/// the one moment the number changes, which is when setup runs.
+#[test]
+fn an_ordinary_up_does_not_walk_node_modules_again() {
+    let cli = Cli::with_config(SETUP_CONFIG);
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+    let first = disk_bytes_of(&cli, &wt).expect("measured");
+
+    let mut blob = std::fs::OpenOptions::new()
+        .append(true)
+        .open(wt.join("node_modules/blob"))
+        .expect("blob");
+    std::io::Write::write_all(&mut blob, &vec![0u8; 2 << 20]).expect("grow");
+    drop(blob);
+    cli.run(&wt, &["up"]).success();
+    assert_eq!(
+        disk_bytes_of(&cli, &wt),
+        Some(first),
+        "an ordinary up re-measured"
+    );
+
+    let dir = registry_of(&cli)
+        .get(&wt)
+        .expect("get")
+        .expect("entry")
+        .instance_dir
+        .expect("instance dir");
+    std::fs::remove_file(dir.join(".setup-web")).expect("forget that setup ran");
+    cli.run(&wt, &["up"]).success();
+    let again = disk_bytes_of(&cli, &wt).expect("measured");
+    assert!(
+        again > first,
+        "setup reran but the figure stayed at {first}"
+    );
+
+    cli.run(&wt, &["down"]).success();
+}
+
+/// An orphan's directory is already gone, so its stored figure describes freed blocks.
+/// Showing it would report disk the machine has already got back.
+#[test]
+fn ls_shows_no_size_for_an_orphan() {
+    let cli = Cli::with_config(SETUP_CONFIG);
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+    cli.run(&wt, &["down"]).success();
+    std::fs::remove_dir_all(&wt).expect("delete the worktree");
+
+    let out = cli
+        .run(&cli.fx.main, &["ls"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let listed = String::from_utf8_lossy(&out).into_owned();
+    assert!(listed.contains("orphaned"), "{listed}");
+    assert!(!listed.contains("2.0M"), "{listed}");
+    assert!(!listed.contains("on disk"), "{listed}");
 }

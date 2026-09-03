@@ -567,6 +567,7 @@ impl Instance {
     /// Dependencies first, then seeds, then the services — a seed that writes straight to
     /// the datastore needs the dependencies but not a listening server.
     pub fn up(&mut self, fresh: bool) -> Result<Vec<SeedOutcome>> {
+        let mut installed = false;
         for service in &self.config.services {
             if let Some(setup) = &service.setup {
                 let cwd = match &service.cwd {
@@ -574,8 +575,17 @@ impl Instance {
                     None => self.resolved.worktree.clone(),
                 };
                 let log = self.instance_dir().join(format!("{}.log", service.name));
-                self.run_setup(&service.name, setup, &cwd, &log)?;
+                installed |= self.run_setup(&service.name, setup, &cwd, &log)?;
             }
+        }
+        // Measured here, before anything below can fail: a service that will not start
+        // has still put its dependencies on disk. The second arm is a one-time catch-up
+        // for worktrees whose setup ran under a grove that did not measure — an ordinary
+        // `up` never reruns setup, so without it those would never get a figure.
+        let declares_setup = self.config.services.iter().any(|s| s.setup.is_some());
+        if installed || (declares_setup && self.entry.disk_bytes.is_none()) {
+            self.entry.disk_bytes = crate::footprint::measure(&self.resolved.worktree);
+            self.registry.record(&self.entry)?;
         }
         let seeded = self.seed(false)?;
 
@@ -632,10 +642,11 @@ impl Instance {
     }
 
     /// Dependency installs run once per worktree, tracked by a marker beside the logs.
-    fn run_setup(&self, name: &str, setup: &str, cwd: &Path, log: &Path) -> Result<()> {
+    /// Returns whether it ran, so the caller knows the tree it left behind is new.
+    fn run_setup(&self, name: &str, setup: &str, cwd: &Path, log: &Path) -> Result<bool> {
         let marker = self.instance_dir().join(format!(".setup-{name}"));
         if marker.exists() {
-            return Ok(());
+            return Ok(false);
         }
         self.run_step(
             &Step {
@@ -649,7 +660,7 @@ impl Instance {
             log,
         )?;
         std::fs::write(&marker, setup)?;
-        Ok(())
+        Ok(true)
     }
 
     /// Code generation runs on **every** `up`, marker-free by design: what it produces has

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use grove::footprint::human_size;
 use grove::registry::{Entry, human_age};
 use grove::{instance::Instance, llm, load};
 use std::path::Path;
@@ -363,11 +364,13 @@ fn main() -> Result<()> {
                 } else {
                     String::new()
                 };
+                let size = disk_of(entry).map(human_size).unwrap_or_default();
                 println!(
-                    "{:<28} {:<13} {:<10} {}{}",
+                    "{:<28} {:<13} {:<10} {:>5}  {}{}",
                     entry.slug,
                     state,
                     idle,
+                    size,
                     ports.join(" "),
                     exposure
                 );
@@ -388,6 +391,11 @@ fn main() -> Result<()> {
                     for line in machine.prescription().unwrap_or_default() {
                         println!("{line}");
                     }
+                }
+                // Under the load line, because disk is the other resource a pile-up
+                // exhausts, and it does so on a machine whose load looks fine.
+                if let Some(line) = disk_footer(&entries) {
+                    println!("{line}");
                 }
             }
             Ok(())
@@ -682,6 +690,34 @@ fn sweep(here: &Path, idle: Option<&str>, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+/// The stored figure, but only while the directory it describes exists. An orphan's
+/// blocks went with its worktree, and reporting them would count disk already returned.
+fn disk_of(entry: &Entry) -> Option<u64> {
+    entry.disk_bytes.filter(|_| entry.worktree.exists())
+}
+
+/// Everything setup has put on disk across the machine, and how many instances grove
+/// has not measured, so a total nobody can trust is not presented as one.
+fn disk_footer(entries: &[Entry]) -> Option<String> {
+    let measured: Vec<u64> = entries.iter().filter_map(disk_of).collect();
+    if measured.is_empty() {
+        return None;
+    }
+    let unmeasured = entries
+        .iter()
+        .filter(|e| e.worktree.exists() && e.disk_bytes.is_none())
+        .count();
+    let mut line = format!(
+        "{} on disk in dependencies across {} instances",
+        human_size(measured.iter().sum()),
+        measured.len()
+    );
+    if unmeasured > 0 {
+        line.push_str(&format!(", {unmeasured} unmeasured"));
+    }
+    Some(line)
+}
+
 /// The machine-wide counterpart to `status --json`: everything an agent needs to decide
 /// whether the box is the problem, without parsing a table or shelling out to `uptime`.
 fn ls_json(entries: &[Entry], now: u64, machine: &Machine) -> serde_json::Value {
@@ -698,15 +734,18 @@ fn ls_json(entries: &[Entry], now: u64, machine: &Machine) -> serde_json::Value 
                 "public_host": e.exposure.public_host(),
                 "ports": e.ports,
                 "database": e.db_name,
+                "disk_bytes": disk_of(e),
             })
         })
         .collect();
+    let disk: Vec<u64> = entries.iter().filter_map(disk_of).collect();
 
     serde_json::json!({
         "load": machine.load.as_ref().map(|l| l.one),
         "cores": machine.load.as_ref().map(|l| l.cores),
         "running": machine.running,
         "crowded": machine.crowded(),
+        "disk_bytes": (!disk.is_empty()).then(|| disk.iter().sum::<u64>()),
         "instances": instances,
     })
 }

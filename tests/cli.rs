@@ -2716,3 +2716,70 @@ fn a_sweep_says_how_much_disk_it_left_behind() {
 
     cli.run(&here, &["down"]).success();
 }
+
+/// Eighteen orphans meant eighteen "left in place" lines and nothing that said
+/// eighteen. The count goes in one place; the names stay, because a number nobody
+/// named is a number nobody audits.
+#[test]
+fn prune_counts_the_databases_it_left_and_names_each_one() {
+    let cli = Cli::new();
+    let registry = registry_of(&cli);
+    for slug in ["fix_login", "feat_search"] {
+        let wt = cli.worktree(slug);
+        cli.run(&wt, &["up"]).success();
+        cli.run(&wt, &["down"]).success();
+        let mut entry = registry.get(&wt).expect("get").expect("entry");
+        entry.db_name = Some(format!("app_{slug}"));
+        entry.db_resource = Some(grove::registry::DbResource {
+            name: "mongo".into(),
+            port: 27017,
+        });
+        registry.record(&entry).expect("record");
+        std::fs::remove_dir_all(&wt).expect("delete the worktree");
+    }
+
+    let out = cli
+        .run(&cli.fx.main, &["prune"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&out).into_owned();
+    assert!(stdout.contains("app_fix_login"), "{stdout}");
+    assert!(stdout.contains("app_feat_search"), "{stdout}");
+    assert!(
+        stdout.contains("2 databases left in place (--purge drops them)"),
+        "{stdout}"
+    );
+    assert_eq!(stdout.matches("left in place").count(), 1, "{stdout}");
+}
+
+#[test]
+fn prune_says_it_for_one_database() {
+    let cli = Cli::new();
+    let wt = cli.worktree("fix_login");
+    cli.run(&wt, &["up"]).success();
+    cli.run(&wt, &["down"]).success();
+    let registry = registry_of(&cli);
+    let mut entry = registry.get(&wt).expect("get").expect("entry");
+    entry.db_name = Some("app_fix_login".into());
+    entry.db_resource = Some(grove::registry::DbResource {
+        name: "mongo".into(),
+        port: 27017,
+    });
+    registry.record(&entry).expect("record");
+    std::fs::remove_dir_all(&wt).expect("delete the worktree");
+
+    let out = cli
+        .run(&cli.fx.main, &["prune"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&out).into_owned();
+    assert!(stdout.contains("app_fix_login"), "{stdout}");
+    assert!(
+        stdout.contains("1 database left in place (--purge drops it)"),
+        "{stdout}"
+    );
+}

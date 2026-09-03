@@ -517,6 +517,7 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
+            let mut left = 0;
             for orphan in &orphans {
                 if !dry_run {
                     for handle in orphan.services.values() {
@@ -533,17 +534,21 @@ fn main() -> Result<()> {
                 } else {
                     "reclaimed"
                 };
-                println!("{verb} {:<28} {}", orphan.slug, ports.join(" "));
+                // The database rides on the row, whatever happens to it. It outlives the
+                // worktree either way, and the count printed at the end is not an audit:
+                // a number nobody named is a number nobody audits.
+                let database = orphan
+                    .db_name
+                    .as_deref()
+                    .map(|db| format!("  database {db}"))
+                    .unwrap_or_default();
+                println!("{verb} {:<28} {}{database}", orphan.slug, ports.join(" "));
 
-                // Always name the database, whatever happens to it. It outlives the
-                // worktree either way, and a number nobody named is a number nobody audits.
                 let Some(database) = &orphan.db_name else {
                     continue;
                 };
                 match (&orphan.db_resource, purge, dry_run) {
-                    (_, false, _) => {
-                        println!("  database {database} left in place (--purge drops it)")
-                    }
+                    (_, false, _) => left += 1,
                     (Some(_), true, true) => println!("  database {database} would be dropped"),
                     (Some(at), true, false) => {
                         match grove::resource::drop_database_at(&at.name, at.port, database) {
@@ -566,11 +571,18 @@ fn main() -> Result<()> {
                     }
                 }
             }
+            // Once, not once per orphan: eighteen "left in place" lines said eighteen
+            // times what one line with the number in it says better.
+            if left > 0 || dry_run {
+                println!();
+            }
+            match left {
+                0 => {}
+                1 => println!("1 database left in place (--purge drops it)"),
+                n => println!("{n} databases left in place (--purge drops them)"),
+            }
             if dry_run {
-                println!(
-                    "\n{} orphaned. Nothing reclaimed (--dry-run).",
-                    orphans.len()
-                );
+                println!("{} orphaned. Nothing reclaimed (--dry-run).", orphans.len());
             }
             Ok(())
         }

@@ -90,7 +90,8 @@ configuration by hand.
 ## Authoring .grove.toml
 
 Write it at the worktree root and commit it. It is checked in, so every later agent in
-every worktree just runs `grove up`.
+every worktree just runs `grove up`. A worktree without a copy falls back to the main
+checkout's, so a repo that keeps the file untracked needs only the one in the main checkout.
 
 ### Template variables
 

@@ -130,6 +130,25 @@ pub fn load(worktree: &Path) -> Result<Config> {
     parse(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
+/// The config for a worktree, falling back to the main checkout's copy when this worktree
+/// has none and that one does. A repo keeping `.grove.toml` out of git leaves every new
+/// worktree without it, since `git worktree add` carries only tracked files — and copying
+/// it by hand into each is exactly the setup step grove exists to remove. Says so on
+/// stderr: a config read from somewhere other than where the docs say is a surprise.
+pub fn load_for(worktree: &Path, main_worktree: &Path) -> Result<Config> {
+    let borrowed = worktree != main_worktree
+        && !worktree.join(FILENAME).exists()
+        && main_worktree.join(FILENAME).exists();
+    if !borrowed {
+        return load(worktree);
+    }
+    eprintln!(
+        "note: no {FILENAME} in this worktree; using the main checkout's at {}",
+        main_worktree.join(FILENAME).display()
+    );
+    load(main_worktree)
+}
+
 pub fn parse(text: &str) -> Result<Config> {
     let config: Config = toml::from_str(text)?;
     config.validate()?;

@@ -276,4 +276,6 @@ grove --llm
 
 That prints the schema and a worked example. Write `.grove.toml` at the worktree root
 and commit it — it is checked in, so every later agent in every worktree only runs
-`grove up`.
+`grove up`. A repo that keeps the file out of git still works: a worktree without a copy
+uses the main checkout's and says so on stderr, so nothing needs copying into new
+worktrees.

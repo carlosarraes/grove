@@ -685,12 +685,19 @@ fn up_refuses_to_run_in_the_main_worktree() {
 fn an_unconfigured_repo_points_the_agent_at_the_schema() {
     let cli = Cli::new();
     let wt = cli.worktree("feat_search");
+    // Unconfigured means nowhere: a main checkout that still has one is the case the
+    // fallback covers, not this one.
     std::fs::remove_file(wt.join(".grove.toml")).expect("remove config");
+    std::fs::remove_file(cli.fx.main.join(".grove.toml")).expect("remove config");
 
     let assert = cli.run(&wt, &["up"]).failure();
 
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
     assert!(stderr.contains("grove --llm"), "{stderr}");
+    assert!(
+        stderr.contains(&format!("no .grove.toml in {}", wt.display())),
+        "must name the worktree the agent is standing in: {stderr}"
+    );
 }
 
 #[test]
@@ -732,6 +739,7 @@ fn doctor_in_an_unconfigured_repo_points_at_the_schema() {
     let cli = Cli::new();
     let wt = cli.worktree("feat_search");
     std::fs::remove_file(wt.join(".grove.toml")).expect("remove config");
+    std::fs::remove_file(cli.fx.main.join(".grove.toml")).expect("remove config");
 
     let assert = cli.run(&wt, &["doctor"]).failure();
 
@@ -2782,4 +2790,20 @@ fn prune_says_it_for_one_database() {
         stdout.contains("1 database left in place (--purge drops it)"),
         "{stdout}"
     );
+}
+
+/// A repo that keeps `.grove.toml` out of git leaves every new worktree without one, and
+/// copying seventy-five lines by hand into each is the setup step grove exists to remove.
+#[test]
+fn a_worktree_without_a_config_uses_the_main_checkouts() {
+    let cli = Cli::new();
+    let wt = cli.worktree("feat_search");
+    std::fs::remove_file(wt.join(".grove.toml")).expect("leave the worktree without a config");
+
+    let out = cli.run(&wt, &["up"]).success().get_output().stderr.clone();
+    let stderr = String::from_utf8_lossy(&out).into_owned();
+    assert!(stderr.contains("main checkout"), "{stderr}");
+    assert!(stderr.contains(cli.fx.main.to_str().unwrap()), "{stderr}");
+
+    cli.run(&wt, &["down"]).success();
 }

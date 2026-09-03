@@ -226,7 +226,7 @@ impl Instance {
     /// Resolve the worktree, load its config, and reserve its ports.
     pub fn open(cwd: &Path) -> Result<Self> {
         let resolved = resolve::resolve(cwd)?;
-        let config = config::load(&resolved.worktree)?;
+        let config = config::load_for(&resolved.worktree, &resolved.main_worktree)?;
         let registry = registry()?;
         let entry = registry.reserve(&resolved, &config.ports.names)?;
         let state_dir = state_dir()?;

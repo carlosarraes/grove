@@ -2876,7 +2876,7 @@ fn up_refuses_when_something_else_already_answers_on_the_port() {
 
     let out = cli.run(&wt, &["up"]).failure().get_output().stderr.clone();
     let stderr = String::from_utf8_lossy(&out).into_owned();
-    assert!(stderr.contains("already answers"), "{stderr}");
+    assert!(stderr.contains("already in use"), "{stderr}");
     assert!(
         stderr.contains(&port.to_string()),
         "must name the port: {stderr}"
@@ -2901,4 +2901,123 @@ fn up_allocates_inside_the_configured_port_range() {
         cli.ports
     );
     cli.run(&wt, &["down"]).success();
+}
+
+/// Without a readiness URL there is no answer to probe, so the port check has to come
+/// from the reservation itself: when none of this instance's services is running,
+/// nothing should be listening on any of its ports.
+#[test]
+fn up_refuses_when_a_reserved_port_is_taken_and_nothing_of_its_own_is_running() {
+    let config = CONFIG.replace(
+        "ready = { http = \"http://127.0.0.1:{{ port.web }}/\", timeout = \"30s\" }\n",
+        "",
+    );
+    assert!(
+        !config.contains("ready"),
+        "the service must declare no readiness check"
+    );
+    let cli = Cli::with_config(&config);
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+    let port: u16 = std::fs::read_to_string(wt.join("backend/.env.local"))
+        .expect("env")
+        .lines()
+        .find_map(|l| l.strip_prefix("API_URL=http://localhost:"))
+        .expect("API_URL")
+        .parse()
+        .expect("port");
+    cli.run(&wt, &["down"]).success();
+
+    // Any listener, not only an HTTP one: a bind test is what tells.
+    let _squatter = TcpListener::bind(("0.0.0.0", port)).expect("squat the port");
+
+    let out = cli.run(&wt, &["up"]).failure().get_output().stderr.clone();
+    let stderr = String::from_utf8_lossy(&out).into_owned();
+    assert!(stderr.contains("already in use"), "{stderr}");
+    assert!(
+        stderr.contains(&port.to_string()),
+        "must name the port: {stderr}"
+    );
+}
+
+/// With one of its own services still running, the instance's ports cannot be told
+/// apart by a bind test, so the readiness URL is what catches a squatter on the other.
+#[test]
+fn up_refuses_a_squatted_port_while_a_sibling_service_is_still_running() {
+    let config = r#"
+version = 1
+
+[ports]
+names = ["web", "api"]
+
+[[secrets]]
+from = "backend/.env.local"
+into = "backend/.env.local"
+
+[secrets.set]
+API_URL = "http://localhost:{{ port.api }}"
+
+[[service]]
+name = "web"
+command = "python3 -u -m http.server {{ port.web }}"
+ready = { http = "http://127.0.0.1:{{ port.web }}/", timeout = "30s" }
+
+[[service]]
+name = "api"
+command = "python3 -u -m http.server {{ port.api }}"
+ready = { http = "http://127.0.0.1:{{ port.api }}/", timeout = "30s" }
+"#;
+    let cli = Cli::with_config(config);
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+    let port: u16 = std::fs::read_to_string(wt.join("backend/.env.local"))
+        .expect("env")
+        .lines()
+        .find_map(|l| l.strip_prefix("API_URL=http://localhost:"))
+        .expect("API_URL")
+        .parse()
+        .expect("port");
+
+    // Kill only `api`, the way a crash would, so `web` keeps the instance "running".
+    let pid = service_pid(&cli, &wt, "api");
+    std::process::Command::new("kill")
+        .args(["-9", &format!("-{pid}")])
+        .status()
+        .expect("kill");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while ureq::get(format!("http://127.0.0.1:{port}/"))
+        .call()
+        .is_ok()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "api never let go of {port}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let _squatter = Squatter(
+        std::process::Command::new("python3")
+            .args(["-u", "-m", "http.server", &port.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("squat the port"),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while ureq::get(format!("http://127.0.0.1:{port}/"))
+        .call()
+        .is_err()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the squatter never answered"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let out = cli.run(&wt, &["up"]).failure().get_output().stderr.clone();
+    let stderr = String::from_utf8_lossy(&out).into_owned();
+    assert!(stderr.contains("api not started"), "{stderr}");
+    assert!(stderr.contains("already answers"), "{stderr}");
 }

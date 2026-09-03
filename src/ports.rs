@@ -90,7 +90,7 @@ pub fn allocate_within(
 
 /// Bound on all interfaces rather than loopback alone: a dev server listening on 0.0.0.0
 /// would otherwise look free here and then fail to bind.
-fn is_free(port: u16) -> bool {
+pub fn is_free(port: u16) -> bool {
     TcpListener::bind(("0.0.0.0", port)).is_ok() && TcpListener::bind(("127.0.0.1", port)).is_ok()
 }
 

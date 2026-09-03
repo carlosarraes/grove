@@ -567,6 +567,7 @@ impl Instance {
     /// Dependencies first, then seeds, then the services — a seed that writes straight to
     /// the datastore needs the dependencies but not a listening server.
     pub fn up(&mut self, fresh: bool) -> Result<Vec<SeedOutcome>> {
+        self.refuse_taken_ports()?;
         let mut installed = false;
         for service in &self.config.services {
             if let Some(setup) = &service.setup {
@@ -627,8 +628,8 @@ impl Instance {
                 let url = render::value(&ready.http, &context)?;
                 if supervise::probe(&url, std::time::Duration::from_secs(1)) {
                     bail!(
-                        "{} not started: {url} already answers, so its port is held by \
-                         another process\n\
+                        "{} not started: {url} already answers, so its port is already \
+                         in use by another process\n\
                          `grove ls` names the instances holding ports; anything else \
                          on that port is not grove's to stop",
                         service.name
@@ -667,6 +668,30 @@ impl Instance {
         }
 
         Ok(seeded)
+    }
+
+    /// When none of this instance's services is running, nothing should be listening on
+    /// any of its ports. A reservation is stable across restarts and nothing else
+    /// re-checks it, so a port taken in the meantime would leave a service dying on bind
+    /// while another process answered in its place. Checked first, before a setup that
+    /// can run for minutes, and by bind rather than probe so a listener that speaks no
+    /// HTTP is caught too. With something of its own running the ports cannot be told
+    /// apart here; the per-service readiness check covers that case.
+    fn refuse_taken_ports(&self) -> Result<()> {
+        if self.entry.services.values().any(supervise::is_alive) {
+            return Ok(());
+        }
+        for (name, port) in &self.entry.ports {
+            if !crate::ports::is_free(*port) {
+                bail!(
+                    "port {port} ({name}) is already in use by another process, and none \
+                     of this instance's services is running to explain it\n\
+                     `grove ls` names the instances holding ports; anything else on \
+                     {port} is not grove's to stop"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Dependency installs run once per worktree, tracked by a marker beside the logs.

@@ -1,6 +1,6 @@
 ---
 name: grove
-description: Use when starting or restarting this repo's dev servers in a git worktree, a port or env file is missing, tests need a live server or fail for unexplained reasons, an instance must be reached from another machine, or work in a worktree is finished.
+description: Use when starting or restarting this repo's dev servers in a git worktree, a port or env file is missing, tests need a live server or fail for unexplained reasons, an instance must be reached from another machine, a machine is short of disk, or work in a worktree is finished.
 ---
 
 # grove
@@ -95,6 +95,21 @@ Starting an instance is cheap and leaving one running is invisible, so a machine
 accumulates them until they start costing someone else — see *When tests fail* below.
 Stopping one when the ticket is done is what keeps that from happening.
 
+`down` stops the services, which returns the CPU and memory a crowded machine is short
+of. It keeps three things on purpose: the port reservation, so a URL written down while
+the instance ran still works when it comes back; the dependency trees `setup` installed,
+often a gigabyte per worktree, which nothing removes until you ask; and the database.
+
+When the branch is done and the machine is short of disk, the checkout is what holds it.
+grove never deletes a worktree, so that step is yours:
+
+```
+git worktree remove <path>       # frees the checkout and everything setup put in it
+grove prune                      # then forgets the instance and frees its ports
+```
+
+The database stays until `grove prune --purge`, and `prune` names every one it leaves.
+
 When several have already piled up, stop the ones nobody is working in:
 
 ```
@@ -182,7 +197,9 @@ grove ls
 
 The footer reports load against core count and how many instances are up. Load at or past
 the core count, with a crowd of instances behind it, means the machine is the suspect and
-the branch is probably innocent. `grove ls --json` carries the same numbers plus each
+the branch is probably innocent. A full disk is the other way a crowd costs someone, and
+the load line says nothing about it: a machine can idle at two on ten cores with no room
+left to write a log. `grove ls --json` carries the same numbers plus each
 instance's idle age, for a decision made in code rather than by reading.
 
 The fix is *Finishing* above: stop what nobody is using, then re-run the failing tests

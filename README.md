@@ -26,7 +26,9 @@ Two things break the moment you run more than one worktree at a time:
 - **Nothing tells you when there are too many.** Starting an instance is cheap and leaving
   one running is invisible, so they accumulate — and the bill arrives disguised as flaky
   tests on somebody's unrelated branch. `grove ls` reports the machine's load alongside
-  the instances, and `grove down --idle 2h` reclaims the forgotten ones.
+  the instances, and `grove down --idle 2h` reclaims the forgotten ones. What `down` gives
+  back is CPU; the checkout and the dependencies `setup` installed stay until
+  `git worktree remove`, which grove never runs for you.
 
 grove reads secrets from your main checkout, rewrites the handful of values that must
 differ, assigns each worktree a port block it keeps across restarts, and gives each its

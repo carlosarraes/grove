@@ -902,6 +902,10 @@ fn skill_install_writes_a_skill_agents_can_load() {
     assert!(body.contains("disable dotenv loading"), "{body}");
     assert!(body.contains("process variables"), "{body}");
     assert!(body.contains("container incarnation"), "{body}");
+    // `down` reads as cleanup and reclaims no disk; the skill has to say what it keeps
+    // and what frees it, or an agent following it believes the machine is clean.
+    assert!(body.contains("keeps"), "{body}");
+    assert!(body.contains("git worktree remove"), "{body}");
     assert!(
         !body.contains("[[secrets]]"),
         "the skill must point at the schema rather than restate it"

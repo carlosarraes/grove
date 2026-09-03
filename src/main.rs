@@ -286,6 +286,9 @@ fn main() -> Result<()> {
                 instance.release()?;
             }
             println!("stopped {}", instance.resolved.slug);
+            if let Some(line) = kept_line(&instance) {
+                println!("{line}");
+            }
             Ok(())
         }
         Some(Command::Status { json }) => {
@@ -682,12 +685,38 @@ fn sweep(here: &Path, idle: Option<&str>, dry_run: bool) -> Result<()> {
         entry.services.clear();
         registry.record(&entry)?;
     }
+    // Whoever sweeps is deciding whether the machine has room, and "ports kept" alone
+    // reads as if the sweep made some.
+    let held: u64 = doomed.iter().filter_map(|(e, _)| disk_of(e)).sum();
+    let disk = match held {
+        0 => String::new(),
+        bytes => format!(", {} still on disk", human_size(bytes)),
+    };
     println!(
-        "\n{} stopped, ports kept. {} still running.",
+        "\n{} stopped, ports kept{disk}. {} still running.",
         doomed.len(),
         running.len() - doomed.len()
     );
     Ok(())
+}
+
+/// `down` reclaims CPU and, left to itself, says nothing about the gigabyte it leaves —
+/// so a reader who never learns disk is separate never learns what frees it. The path is
+/// repeated inside the hint on purpose: agents copy the command, not the line above it.
+/// Silent when no service declares a setup, because then grove put nothing there.
+fn kept_line(instance: &Instance) -> Option<String> {
+    if !instance.config.services.iter().any(|s| s.setup.is_some()) {
+        return None;
+    }
+    let worktree = instance.resolved.worktree.display();
+    let held = match disk_of(&instance.entry) {
+        Some(bytes) => format!(
+            "{} on disk; git worktree remove {worktree} frees it",
+            human_size(bytes)
+        ),
+        None => format!("dependencies on disk; git worktree remove {worktree} frees them"),
+    };
+    Some(format!("kept  {worktree}  ({held})"))
 }
 
 /// The stored figure, but only while the directory it describes exists. An orphan's

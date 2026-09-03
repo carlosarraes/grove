@@ -144,7 +144,7 @@ repo's own fixture or settings constructor.
 | `down --idle 2h` \| `--all-but-this` | stop instances across the machine, keeping their ports; `--dry-run` names them first |
 | `restart [service]` | replace one service without touching the others |
 | `status [--json]` | ports, pids, and whether each service's `ready.http` answers — plus a warning if a service predates your last edit |
-| `ls [--json]` | every instance on the machine, most neglected first, with the machine's load |
+| `ls [--json]` | every instance on the machine, most neglected first, with the machine's load and what each holds on disk |
 | `run -- <cmd>` | run a command with this instance's environment overlaid |
 | `logs [service] [--since-restart] [-n N]` | what a service printed |
 | `seed [--force]` | populate the datastore; markers follow the managed container incarnation, while `--force` rebuilds dirtied data |

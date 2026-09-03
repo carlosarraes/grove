@@ -2628,3 +2628,91 @@ fn ls_shows_no_size_for_an_orphan() {
     assert!(!listed.contains("2.0M"), "{listed}");
     assert!(!listed.contains("on disk"), "{listed}");
 }
+
+/// `down` reclaims CPU and, without this line, says nothing about the gigabyte it left
+/// behind — so a reader who never learns disk is separate never learns what frees it.
+#[test]
+fn down_says_what_it_kept_and_how_to_free_it() {
+    let cli = Cli::with_config(SETUP_CONFIG);
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+
+    let out = cli
+        .run(&wt, &["down"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&out).into_owned();
+    assert!(stdout.contains("stopped feat_search"), "{stdout}");
+    assert!(stdout.contains("kept"), "{stdout}");
+    assert!(stdout.contains("2.0M on disk"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("git worktree remove {}", wt.display())),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn down_without_a_measured_size_still_names_the_disk() {
+    let cli = Cli::with_config(SETUP_CONFIG);
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+    // As an instance whose setup ran under a grove that did not measure has it.
+    let registry = registry_of(&cli);
+    let mut entry = registry.get(&wt).expect("get").expect("entry");
+    entry.disk_bytes = None;
+    registry.record(&entry).expect("record");
+
+    let out = cli
+        .run(&wt, &["down"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&out).into_owned();
+    assert!(stdout.contains("dependencies on disk"), "{stdout}");
+    assert!(stdout.contains("git worktree remove"), "{stdout}");
+}
+
+/// Nothing grove put there, nothing grove should claim to have kept.
+#[test]
+fn down_says_nothing_about_disk_when_no_setup_ran() {
+    let cli = Cli::new();
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+
+    let out = cli
+        .run(&wt, &["down"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&out).into_owned();
+    assert!(!stdout.contains("kept"), "{stdout}");
+    assert!(!stdout.contains("on disk"), "{stdout}");
+}
+
+/// A sweep is the fleet case: whoever runs it is the one deciding whether the machine
+/// has room, and "stopped, ports kept" alone reads as if it made some.
+#[test]
+fn a_sweep_says_how_much_disk_it_left_behind() {
+    let cli = Cli::with_config(SETUP_CONFIG);
+    let here = cli.worktree("feat_search");
+    let stale = cli.worktree("fix_login");
+    cli.run(&here, &["up"]).success();
+    cli.run(&stale, &["up"]).success();
+    backdate(&cli, &stale, 3 * 3600);
+
+    let out = cli
+        .run(&here, &["down", "--idle", "2h"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&out).into_owned();
+    assert!(stdout.contains("stopped fix_login"), "{stdout}");
+    assert!(stdout.contains("2.0M still on disk"), "{stdout}");
+
+    cli.run(&here, &["down"]).success();
+}

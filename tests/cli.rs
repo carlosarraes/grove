@@ -71,8 +71,16 @@ command = "printf '%s' '{{ host.bind }}' > bind-host.txt; exec python3 -u -m htt
 ready = { http = "http://127.0.0.1:{{ port.web }}/", timeout = "30s" }
 "#;
 
+/// Every test gets its own slice of the port space. The allocator's bind check only sees
+/// what is already listening, and two tests in the same hundred milliseconds can both
+/// pick a free block before either service has bound it — the loser then dies on bind
+/// while the winner answers its readiness probe. One registry per machine prevents that
+/// in production; one range per test is the equivalent here.
+static NEXT_SLICE: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
 struct Cli {
     state: TempDir,
+    ports: std::ops::Range<u16>,
     fx: Fixture,
     started: std::cell::RefCell<Vec<std::path::PathBuf>>,
     docker: Option<FakeDocker>,
@@ -166,8 +174,11 @@ impl Cli {
         common::git(&fx.main, &["add", "--force", ".grove.toml"]);
         common::git(&fx.main, &["commit", "-m", "add grove config"]);
 
+        let slice = NEXT_SLICE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let low = 20000 + slice * 100;
         Cli {
             state: TempDir::new().expect("tempdir"),
+            ports: low..low + 100,
             fx,
             started: std::cell::RefCell::new(Vec::new()),
             docker: None,
@@ -187,11 +198,16 @@ impl Cli {
         path
     }
 
+    fn port_range(&self) -> String {
+        format!("{}-{}", self.ports.start, self.ports.end)
+    }
+
     fn run(&self, cwd: &Path, args: &[&str]) -> assert_cmd::assert::Assert {
         let mut command = Command::cargo_bin("grove").expect("binary");
         command
             .current_dir(cwd)
-            .env("GROVE_STATE_DIR", self.state.path());
+            .env("GROVE_STATE_DIR", self.state.path())
+            .env("GROVE_PORT_RANGE", self.port_range());
         if let Some(docker) = &self.docker {
             command
                 .env("GROVE_DOCKER", &docker.program)
@@ -1668,6 +1684,7 @@ impl Cli {
             .expect("binary")
             .current_dir(cwd)
             .env("GROVE_STATE_DIR", self.state.path())
+            .env("GROVE_PORT_RANGE", self.port_range())
             .env("GROVE_LOAD", load)
             .env("GROVE_CORES", cores)
             .args(args)
@@ -2864,4 +2881,24 @@ fn up_refuses_when_something_else_already_answers_on_the_port() {
         stderr.contains(&port.to_string()),
         "must name the port: {stderr}"
     );
+}
+
+#[test]
+fn up_allocates_inside_the_configured_port_range() {
+    let cli = Cli::new();
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+    let port: u16 = std::fs::read_to_string(wt.join("backend/.env.local"))
+        .expect("env")
+        .lines()
+        .find_map(|l| l.strip_prefix("API_URL=http://localhost:"))
+        .expect("API_URL")
+        .parse()
+        .expect("port");
+    assert!(
+        cli.ports.contains(&port),
+        "{port} is outside {:?}",
+        cli.ports
+    );
+    cli.run(&wt, &["down"]).success();
 }

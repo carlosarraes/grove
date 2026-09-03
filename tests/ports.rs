@@ -72,3 +72,36 @@ fn a_repo_needing_more_ports_than_a_block_holds_says_so() {
 
     assert!(format!("{err:#}").contains("block"), "{err:#}");
 }
+
+/// One machine, many registries — a test suite, or two state dirs — share one port space,
+/// and the allocator's bind check only sees what is already listening. A range each
+/// keeps them apart.
+#[test]
+fn allocation_stays_inside_the_range_it_is_given() {
+    let names = vec!["web".to_string(), "api".to_string()];
+    let got = ports::allocate_within(
+        20500..20600,
+        "repo-sliced",
+        "feat_search",
+        &names,
+        &std::collections::HashSet::new(),
+    )
+    .expect("allocate");
+    for port in got.values() {
+        assert!(
+            (20500..20600).contains(port),
+            "{port} is outside 20500..20600"
+        );
+    }
+}
+
+#[test]
+fn a_range_is_written_as_low_dash_high() {
+    assert_eq!(ports::parse_range("20500-20600"), Some(20500..20600));
+    assert_eq!(
+        ports::parse_range("20600-20500"),
+        None,
+        "empty ranges are refused"
+    );
+    assert_eq!(ports::parse_range("all of them"), None);
+}

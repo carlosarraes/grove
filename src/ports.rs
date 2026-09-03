@@ -13,6 +13,23 @@ pub const RANGE: Range<u16> = 20000..30000;
 /// Ports per instance are contiguous, so a block is easy to read and easy to reserve.
 const STRIDE: u16 = 10;
 
+/// The range in force: `GROVE_PORT_RANGE=low-high` when set, `RANGE` otherwise. One
+/// machine running several registries — a test suite, or two state dirs — shares one port
+/// space, and the bind test below only sees what is already listening; a range each is
+/// what keeps their instances from landing on the same block in the same moment.
+pub fn range() -> Range<u16> {
+    std::env::var("GROVE_PORT_RANGE")
+        .ok()
+        .and_then(|s| parse_range(&s))
+        .unwrap_or(RANGE)
+}
+
+pub fn parse_range(text: &str) -> Option<Range<u16>> {
+    let (low, high) = text.split_once('-')?;
+    let (low, high): (u16, u16) = (low.trim().parse().ok()?, high.trim().parse().ok()?);
+    (low < high).then_some(low..high)
+}
+
 pub fn allocate(repo_key: &str, slug: &str, names: &[String]) -> Result<BTreeMap<String, u16>> {
     allocate_avoiding(repo_key, slug, names, &HashSet::new())
 }
@@ -20,6 +37,16 @@ pub fn allocate(repo_key: &str, slug: &str, names: &[String]) -> Result<BTreeMap
 /// `taken` carries ports the registry has promised to other instances. They may not be
 /// listening yet, so a bind test alone would call them free and hand out a duplicate.
 pub fn allocate_avoiding(
+    repo_key: &str,
+    slug: &str,
+    names: &[String],
+    taken: &HashSet<u16>,
+) -> Result<BTreeMap<String, u16>> {
+    allocate_within(range(), repo_key, slug, names, taken)
+}
+
+pub fn allocate_within(
+    range: Range<u16>,
     repo_key: &str,
     slug: &str,
     names: &[String],
@@ -36,14 +63,14 @@ pub fn allocate_avoiding(
         );
     }
 
-    let blocks = (RANGE.end - RANGE.start) / STRIDE;
+    let blocks = ((range.end - range.start) / STRIDE).max(1);
     let first = fnv1a(&format!("{repo_key}/{slug}")) % u32::from(blocks);
 
     // Start at the block this instance hashes to, then walk. Hashing gives stability
     // across restarts; walking gives correctness when the machine is busy.
     for step in 0..blocks {
         let block = (first + u32::from(step)) % u32::from(blocks);
-        let base = RANGE.start + (block as u16) * STRIDE;
+        let base = range.start + (block as u16) * STRIDE;
         let candidate: BTreeMap<String, u16> = names
             .iter()
             .enumerate()
@@ -58,7 +85,7 @@ pub fn allocate_avoiding(
         }
     }
 
-    bail!("no free port block in {RANGE:?}; run `grove ls` and stop instances you are done with")
+    bail!("no free port block in {range:?}; run `grove ls` and stop instances you are done with")
 }
 
 /// Bound on all interfaces rather than loopback alone: a dev server listening on 0.0.0.0

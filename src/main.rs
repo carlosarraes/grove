@@ -5,10 +5,8 @@ use grove::registry::{Entry, human_age};
 use grove::{instance::Instance, llm, load};
 use std::path::Path;
 
-/// The window the printed prescription proposes. Generous on purpose: an instance someone
-/// stepped away from for lunch has to survive it, because whoever runs the command cannot
-/// tell a forgotten box from a colleague's.
-const IDLE_WINDOW: &str = "2h";
+/// The window the printed prescription proposes; `health` reads the same one.
+const IDLE_WINDOW: &str = grove::health::IDLE_WINDOW;
 
 /// What this machine looks like right now — how loaded, how crowded, and which instances
 /// nobody has touched lately.
@@ -185,6 +183,11 @@ enum Command {
     },
     /// Check that this worktree can start: env, resources, ports, config
     Doctor,
+    /// Everything on this machine that is costing someone, and what ends it
+    Health {
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage the agent-facing skill
     Skill {
         #[command(subcommand)]
@@ -622,6 +625,25 @@ fn main() -> Result<()> {
                 println!("{outcome}");
             }
             Ok(())
+        }
+        Some(Command::Health { json }) => {
+            let verdicts = grove::health::check(&cwd)?;
+            let healthy = if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&grove::health::json(&verdicts))?
+                );
+                !verdicts
+                    .iter()
+                    .any(|v| matches!(v, grove::doctor::Verdict::Fail { .. }))
+            } else {
+                grove::doctor::report(&verdicts)?
+            };
+            if healthy {
+                Ok(())
+            } else {
+                std::process::exit(1);
+            }
         }
         Some(Command::Doctor) => {
             let instance = Instance::open(&cwd)?;

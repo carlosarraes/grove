@@ -150,6 +150,7 @@ repo's own fixture or settings constructor.
 | `restart [service]` | replace one service without touching the others |
 | `status [--json]` | ports, pids, and whether each service's `ready.http` answers — plus a warning if a service predates your last edit |
 | `ls [--json]` | every instance on the machine, most neglected first, with the machine's load and what each holds on disk |
+| `health [--json]` | everything on the machine that is costing someone — stray listeners, orphans, idle instances, disk — each with the command that ends it |
 | `run -- <cmd>` | run a command with this instance's environment overlaid |
 | `logs [service] [--since-restart] [-n N]` | what a service printed |
 | `seed [--force]` | populate the datastore; markers follow the managed container incarnation, while `--force` rebuilds dirtied data |

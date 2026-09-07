@@ -3203,3 +3203,124 @@ fn prune_removes_store_entries_no_worktree_references() {
         .collect();
     assert_eq!(left, vec![kept_hash], "{stdout}");
 }
+
+/// A clean machine gets a report that says so, and an exit code scripts can gate on.
+#[test]
+fn health_is_quiet_on_a_clean_machine() {
+    let cli = Cli::new();
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+
+    let out = cli
+        .run(&wt, &["health"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&out).into_owned();
+    assert!(!stdout.contains("FAIL"), "{stdout}");
+    assert!(stdout.contains("ok"), "{stdout}");
+    assert!(stdout.contains("instances running"), "{stdout}");
+
+    cli.run(&wt, &["down"]).success();
+}
+
+/// The case the command exists for: something is listening on a grove port and no
+/// instance is running there — a `down` that missed a child, a server from an older
+/// grove, a squatter. Health names it and hands over the command that ends it.
+#[test]
+fn health_names_a_listener_no_instance_owns() {
+    let cli = Cli::new();
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+    let port: u16 = std::fs::read_to_string(wt.join("backend/.env.local"))
+        .expect("env")
+        .lines()
+        .find_map(|l| l.strip_prefix("API_URL=http://localhost:"))
+        .expect("API_URL")
+        .parse()
+        .expect("port");
+    cli.run(&wt, &["down"]).success();
+
+    let _squatter = Squatter(
+        std::process::Command::new("python3")
+            .args(["-u", "-m", "http.server", &port.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("squat the port"),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while ureq::get(format!("http://127.0.0.1:{port}/"))
+        .call()
+        .is_err()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the squatter never answered"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let out = cli
+        .run(&wt, &["health"])
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&out).into_owned();
+    assert!(stdout.contains("FAIL"), "{stdout}");
+    assert!(stdout.contains(&format!("port {port}")), "{stdout}");
+    assert!(
+        stdout.contains("feat_search"),
+        "must say who reserved it: {stdout}"
+    );
+    assert!(stdout.contains("kill"), "must hand over the fix: {stdout}");
+}
+
+#[test]
+fn health_flags_orphans_and_points_at_prune() {
+    let cli = Cli::new();
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+    cli.run(&wt, &["down"]).success();
+    std::fs::remove_dir_all(&wt).expect("delete the worktree");
+
+    let out = cli
+        .run(&cli.fx.main, &["health"])
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&out).into_owned();
+    assert!(stdout.contains("FAIL"), "{stdout}");
+    assert!(stdout.contains("orphan"), "{stdout}");
+    assert!(stdout.contains("grove prune"), "{stdout}");
+}
+
+#[test]
+fn health_json_lists_every_finding_with_its_fix() {
+    let cli = Cli::new();
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+    cli.run(&wt, &["down"]).success();
+    std::fs::remove_dir_all(&wt).expect("delete the worktree");
+
+    let out = cli
+        .run(&cli.fx.main, &["health", "--json"])
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
+    let findings = json.as_array().expect("an array of findings");
+    let orphan = findings
+        .iter()
+        .find(|f| f["level"] == "fail" && f["what"].as_str().unwrap_or("").contains("orphan"))
+        .expect("the orphan finding");
+    assert!(
+        orphan["fix"].as_str().unwrap_or("").contains("grove prune"),
+        "{json}"
+    );
+    assert!(findings.iter().any(|f| f["level"] == "ok"), "{json}");
+}

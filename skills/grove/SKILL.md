@@ -193,10 +193,14 @@ The signature — any one of these is enough to suspect it:
 Check the machine before you check the branch:
 
 ```
+grove health
 grove ls
 ```
 
-The footer reports load against core count and how many instances are up. Load at or past
+`health` names what is costing someone — a listener no instance owns, orphaned or idle
+instances, a disk near full — and beside each FAIL the command that ends it; `--json` is
+for a decision made in code. `ls` shows the instances themselves, and its footer reports
+load against core count and how many instances are up. Load at or past
 the core count, with a crowd of instances behind it, means the machine is the suspect and
 the branch is probably innocent. A full disk is the other way a crowd costs someone, and
 the load line says nothing about it: a machine can idle at two on ten cores with no room

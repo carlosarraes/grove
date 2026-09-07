@@ -192,3 +192,56 @@ command = "mongorestore --db {{ db.name }} fixtures/propositions.archive"
         Some("fixtures/propositions.archive")
     );
 }
+
+#[test]
+fn a_service_can_declare_what_its_setup_produces_and_what_decides_it() {
+    let wt = worktree_with(
+        r#"
+version = 1
+
+[ports]
+names = ["web"]
+
+[[service]]
+name = "frontend"
+cwd = "frontend"
+setup = "npm ci"
+command = "npm run dev -- --port {{ port.web }}"
+
+[service.cache]
+path = "node_modules"
+key = ["package-lock.json", ".nvmrc"]
+"#,
+    );
+
+    let c = config::load(wt.path()).expect("load");
+    let cache = c.services[0].cache.as_ref().expect("cache declared");
+    assert_eq!(cache.path, "node_modules");
+    assert_eq!(cache.key, vec!["package-lock.json", ".nvmrc"]);
+}
+
+/// A cache memoizes `setup`; without one there is nothing to memoize, and a silent
+/// no-op would leave the author believing worktrees share what they do not.
+#[test]
+fn a_cache_without_a_setup_is_refused() {
+    let wt = worktree_with(
+        r#"
+version = 1
+
+[ports]
+names = ["web"]
+
+[[service]]
+name = "frontend"
+command = "npm run dev"
+
+[service.cache]
+path = "node_modules"
+key = ["package-lock.json"]
+"#,
+    );
+
+    let err = config::load(wt.path()).expect_err("must refuse");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("cache") && msg.contains("setup"), "{msg}");
+}

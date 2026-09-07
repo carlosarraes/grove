@@ -69,6 +69,12 @@ setup = "npm install"
 command = "npm run dev -- --port {{ port.frontend }} --strictPort"
 ready = { http = "http://localhost:{{ port.frontend }}/", timeout = "180s" }
 
+# Every worktree on this lockfile shares one node_modules, hardlinked out of grove's
+# store. Only the first pays for the install; the rest link it in seconds.
+[service.cache]
+path = "node_modules"
+key = ["package-lock.json"]
+
 # A fresh per-instance database is empty, so any route that looks up a tenant or
 # account answers 403 or 404 -- and the error names authentication, not missing data,
 # which sends you looking in the wrong place. Seed it here once, rather than in every
@@ -171,11 +177,18 @@ needed data, then deliberately remove and recreate that container.
   command            the process to run; must accept its port, usually via a flag
   ready.http         URL polled until it answers
   ready.timeout      how long to wait, e.g. "180s"
+  cache.path         what setup leaves behind, relative to cwd (node_modules)
+  cache.key          the files that decide it, relative to cwd (package-lock.json).
+                     Worktrees whose key files match byte for byte share one copy,
+                     hardlinked from grove's store; a changed lockfile is a new copy.
+                     Only the first worktree on a lockfile pays for the install.
 
 Three fields run commands, and the difference between them is how often:
 `setup` once per worktree, `[[seed]]` once per instance, `prepare` every `up`. Put a
 dependency install in `setup`, fixture data in `[[seed]]`, and code generation in
 `prepare` -- generated output is the one that goes stale when it is only made once.
+Give a `setup` that installs dependencies a `cache`, or every worktree carries its own
+gigabyte of them.
 
 ### Two rules that prevent silent cross-talk
 

@@ -279,3 +279,9 @@ and commit it — it is checked in, so every later agent in every worktree only 
 `grove up`. A repo that keeps the file out of git still works: a worktree without a copy
 uses the main checkout's and says so on stderr, so nothing needs copying into new
 worktrees.
+
+Give every `setup` that installs dependencies a `[service.cache]` block naming what it
+produces and the lockfile that decides it. Worktrees on the same lockfile then share one
+copy through grove's store, hardlinked in, and only the first pays for the install. Without
+it each worktree carries its own gigabyte, which is how a machine running many agents
+fills its disk.

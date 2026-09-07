@@ -28,7 +28,8 @@ Two things break the moment you run more than one worktree at a time:
   tests on somebody's unrelated branch. `grove ls` reports the machine's load alongside
   the instances, and `grove down --idle 2h` reclaims the forgotten ones. What `down` gives
   back is CPU; the checkout and the dependencies `setup` installed stay until
-  `git worktree remove`, which grove never runs for you.
+  `git worktree remove`, which grove never runs for you. A `[service.cache]` block
+  makes worktrees on the same lockfile share one copy of their dependencies instead.
 
 grove reads secrets from your main checkout, rewrites the handful of values that must
 differ, assigns each worktree a port block it keeps across restarts, and gives each its
@@ -108,6 +109,10 @@ ready = { http = "http://localhost:{{ port.backend }}/health", timeout = "180s" 
 name = "frontend"
 prepare = "npm run contracts:generate"   # every `up`, once the backend answers
 command = "npm run dev -- --strictPort --port {{ port.frontend }}"
+
+[service.cache]                            # worktrees on one lockfile share one copy
+path = "node_modules"
+key = ["package-lock.json"]
 ```
 
 `grove --llm` prints the full schema and a worked example — that's what an agent reads to

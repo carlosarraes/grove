@@ -50,6 +50,32 @@ command = "python3 -u -m http.server {{ port.web }}"
 ready = { http = "http://127.0.0.1:{{ port.web }}/", timeout = "30s" }
 "#;
 
+/// A `setup` whose output is shared through the store. It logs every real run to a file
+/// beside the worktrees, so a test can count installs across several of them.
+const CACHE_CONFIG: &str = r#"
+version = 1
+
+[ports]
+names = ["web"]
+
+[[secrets]]
+from = "backend/.env.local"
+into = "backend/.env.local"
+
+[secrets.set]
+API_URL = "http://localhost:{{ port.web }}"
+
+[[service]]
+name = "web"
+setup = "mkdir -p node_modules && head -c 1048576 /dev/zero > node_modules/blob && echo installed >> ../installs.log"
+command = "python3 -u -m http.server {{ port.web }}"
+ready = { http = "http://127.0.0.1:{{ port.web }}/", timeout = "30s" }
+
+[service.cache]
+path = "node_modules"
+key = ["package-lock.json"]
+"#;
+
 const EXPOSURE_CONFIG: &str = r#"
 version = 1
 
@@ -207,6 +233,7 @@ impl Cli {
         command
             .current_dir(cwd)
             .env("GROVE_STATE_DIR", self.state.path())
+            .env("GROVE_CACHE_DIR", self.state.path().join("store"))
             .env("GROVE_PORT_RANGE", self.port_range());
         if let Some(docker) = &self.docker {
             command
@@ -1684,6 +1711,7 @@ impl Cli {
             .expect("binary")
             .current_dir(cwd)
             .env("GROVE_STATE_DIR", self.state.path())
+            .env("GROVE_CACHE_DIR", self.state.path().join("store"))
             .env("GROVE_PORT_RANGE", self.port_range())
             .env("GROVE_LOAD", load)
             .env("GROVE_CORES", cores)
@@ -3020,4 +3048,77 @@ ready = { http = "http://127.0.0.1:{{ port.api }}/", timeout = "30s" }
     let stderr = String::from_utf8_lossy(&out).into_owned();
     assert!(stderr.contains("api not started"), "{stderr}");
     assert!(stderr.contains("already answers"), "{stderr}");
+}
+
+/// Commit a lockfile in the main checkout, so worktrees created afterwards carry it.
+fn with_lockfile(cli: &Cli, text: &str) {
+    std::fs::write(cli.fx.main.join("package-lock.json"), text).expect("lockfile");
+    common::git(&cli.fx.main, &["add", "package-lock.json"]);
+    common::git(&cli.fx.main, &["commit", "-m", "lockfile"]);
+}
+
+fn installs(cli: &Cli) -> usize {
+    std::fs::read_to_string(cli.fx.main.parent().unwrap().join("worktrees/installs.log"))
+        .map(|s| s.lines().count())
+        .unwrap_or(0)
+}
+
+/// The whole point: the second worktree on a lockfile pays nothing for its dependencies.
+/// Names are private per worktree, blocks are shared — the inode says which.
+#[test]
+fn a_second_worktree_on_the_same_lockfile_links_instead_of_installing() {
+    let cli = Cli::with_config(CACHE_CONFIG);
+    with_lockfile(&cli, "lockfile A\n");
+    let a = cli.worktree("feat_search");
+    let b = cli.worktree("fix_login");
+
+    cli.run(&a, &["up"]).success();
+    assert_eq!(installs(&cli), 1);
+
+    let out = cli.run(&b, &["up"]).success().get_output().stderr.clone();
+    let stderr = String::from_utf8_lossy(&out).into_owned();
+    assert!(stderr.contains("linked from the store"), "{stderr}");
+    assert_eq!(installs(&cli), 1, "the second worktree ran setup again");
+
+    use std::os::unix::fs::MetadataExt;
+    let blob_a = a.join("node_modules/blob").metadata().expect("a's blob");
+    let blob_b = b.join("node_modules/blob").metadata().expect("b's blob");
+    assert_eq!(
+        blob_a.ino(),
+        blob_b.ino(),
+        "the two worktrees hold different blocks"
+    );
+    assert!(
+        blob_b.nlink() >= 3,
+        "store + two worktrees, got nlink {}",
+        blob_b.nlink()
+    );
+
+    cli.run(&a, &["down"]).success();
+    cli.run(&b, &["down"]).success();
+}
+
+/// A changed lockfile is simply a different key. Nobody decides anything: the worktree
+/// installs once and its tree lands in the store beside the other.
+#[test]
+fn a_changed_lockfile_installs_again_into_its_own_entry() {
+    let cli = Cli::with_config(CACHE_CONFIG);
+    with_lockfile(&cli, "lockfile A\n");
+    let a = cli.worktree("feat_search");
+    let b = cli.worktree("fix_login");
+    cli.run(&a, &["up"]).success();
+
+    std::fs::write(b.join("package-lock.json"), "lockfile B\n").expect("edit lockfile");
+    let out = cli.run(&b, &["up"]).success().get_output().stderr.clone();
+    let stderr = String::from_utf8_lossy(&out).into_owned();
+    assert!(stderr.contains("stored as"), "{stderr}");
+    assert_eq!(installs(&cli), 2);
+
+    let entries = std::fs::read_dir(cli.state.path().join("store"))
+        .expect("store")
+        .count();
+    assert_eq!(entries, 2, "one entry per lockfile");
+
+    cli.run(&a, &["down"]).success();
+    cli.run(&b, &["down"]).success();
 }

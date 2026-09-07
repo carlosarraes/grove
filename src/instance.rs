@@ -87,6 +87,26 @@ enum SeedDecision {
 }
 
 /// How one blocking step of `up` names itself while it runs and when it fails.
+/// What `setup` did for one service, so `up` knows whether the tree on disk is new and
+/// which store entry it came from.
+enum SetupOutcome {
+    Skipped,
+    Installed,
+    Linked { hash: String },
+    Stored { hash: String },
+}
+
+/// A directory, a file, or a symlink — whatever `setup` or an earlier link left there.
+fn remove_path(path: &Path) -> Result<()> {
+    let meta = path.symlink_metadata()?;
+    if meta.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+    .with_context(|| format!("removing {}", path.display()))
+}
+
 struct Step<'a> {
     service: &'a str,
     kind: &'a str,
@@ -569,6 +589,7 @@ impl Instance {
     pub fn up(&mut self, fresh: bool) -> Result<Vec<SeedOutcome>> {
         self.refuse_taken_ports()?;
         let mut installed = false;
+        let mut keys = Vec::new();
         for service in &self.config.services {
             if let Some(setup) = &service.setup {
                 let cwd = match &service.cwd {
@@ -576,8 +597,18 @@ impl Instance {
                     None => self.resolved.worktree.clone(),
                 };
                 let log = self.instance_dir().join(format!("{}.log", service.name));
-                installed |= self.run_setup(&service.name, setup, &cwd, &log)?;
+                match self.run_setup(service, setup, &cwd, &log)? {
+                    SetupOutcome::Skipped => {}
+                    SetupOutcome::Installed => installed = true,
+                    SetupOutcome::Linked { hash } | SetupOutcome::Stored { hash } => {
+                        installed = true;
+                        keys.push((service.name.clone(), hash));
+                    }
+                }
             }
+        }
+        for (name, hash) in keys {
+            self.entry.cache_keys.insert(name, hash);
         }
         // Measured here, before anything below can fail: a service that will not start
         // has still put its dependencies on disk. The second arm is a one-time catch-up
@@ -695,25 +726,84 @@ impl Instance {
     }
 
     /// Dependency installs run once per worktree, tracked by a marker beside the logs.
-    /// Returns whether it ran, so the caller knows the tree it left behind is new.
-    fn run_setup(&self, name: &str, setup: &str, cwd: &Path, log: &Path) -> Result<bool> {
+    /// With a cache declared, "run" may mean linking a tree the store already holds —
+    /// a worktree on a lockfile some other worktree installed pays seconds, not minutes.
+    fn run_setup(
+        &self,
+        service: &crate::config::Service,
+        setup: &str,
+        cwd: &Path,
+        log: &Path,
+    ) -> Result<SetupOutcome> {
+        let name = &service.name;
         let marker = self.instance_dir().join(format!(".setup-{name}"));
         if marker.exists() {
-            return Ok(false);
+            return Ok(SetupOutcome::Skipped);
         }
-        self.run_step(
-            &Step {
-                service: name,
-                kind: "setup",
-                doing: "installing dependencies",
-                done: "dependencies installed",
-            },
-            setup,
-            cwd,
-            log,
-        )?;
+        let step = Step {
+            service: name,
+            kind: "setup",
+            doing: "installing dependencies",
+            done: "dependencies installed",
+        };
+        let Some(cache) = &service.cache else {
+            self.run_step(&step, setup, cwd, log)?;
+            std::fs::write(&marker, setup)?;
+            return Ok(SetupOutcome::Installed);
+        };
+
+        let store = crate::store::dir()?;
+        let hash = crate::store::key(cwd, cache, setup)?;
+        let built = cwd.join(&cache.path);
+        let entry = crate::store::entry(&store, &hash);
+
+        if entry.exists() {
+            // A tree already at the path — from an install under a grove that did not
+            // share, or a link that never finished — is replaced, not merged. It costs
+            // seconds; merging would leave a shape nothing ever produced.
+            if built.symlink_metadata().is_ok() {
+                remove_path(&built)?;
+            }
+            let began = std::time::Instant::now();
+            let linked = crate::store::link_tree(&entry, &built)
+                .with_context(|| format!("linking {} from the store", built.display()))?;
+            eprintln!(
+                "{name}: dependencies {} from the store ({hash}, {}s)",
+                if linked.hardlinked {
+                    "linked"
+                } else {
+                    "copied"
+                },
+                began.elapsed().as_secs()
+            );
+            std::fs::create_dir_all(self.instance_dir())?;
+            std::fs::write(&marker, setup)?;
+            return Ok(SetupOutcome::Linked { hash });
+        }
+
+        self.run_step(&step, setup, cwd, log)?;
+        if !built.exists() {
+            // Recorded as a plain install: an empty store entry would make every later
+            // worktree "link" nothing and believe its dependencies were in place.
+            eprintln!(
+                "{name}: setup left no {} behind, so there is nothing to store — check cache.path",
+                cache.path
+            );
+            std::fs::write(&marker, setup)?;
+            return Ok(SetupOutcome::Installed);
+        }
+        let promoted = crate::store::promote(&built, &store, &hash)
+            .with_context(|| format!("storing {}", built.display()))?;
+        eprintln!(
+            "{name}: dependencies stored as {hash}{}",
+            if promoted.shared {
+                ""
+            } else {
+                " (this worktree keeps a private copy: another one stored it first)"
+            }
+        );
         std::fs::write(&marker, setup)?;
-        Ok(true)
+        Ok(SetupOutcome::Stored { hash })
     }
 
     /// Code generation runs on **every** `up`, marker-free by design: what it produces has

@@ -101,6 +101,19 @@ pub struct Service {
     pub prepare: Option<String>,
     pub command: String,
     pub ready: Option<Ready>,
+    /// What `setup` produces and what decides it, so worktrees on the same inputs share
+    /// one copy instead of each installing their own.
+    pub cache: Option<Cache>,
+}
+
+/// `path` is what `setup` leaves behind, `key` the files that determine its contents —
+/// both relative to the service's cwd. Two worktrees whose key files match byte for
+/// byte get one tree, hardlinked into each.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Cache {
+    pub path: String,
+    pub key: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -157,6 +170,39 @@ pub fn parse(text: &str) -> Result<Config> {
 
 impl Config {
     fn validate(&self) -> Result<()> {
+        for service in &self.services {
+            let Some(cache) = &service.cache else {
+                continue;
+            };
+            // A cache memoizes `setup`. Declaring one without the other would be a
+            // silent no-op that leaves the author believing worktrees share a tree.
+            if service.setup.is_none() {
+                anyhow::bail!(
+                    "service {:?} declares a cache but no setup — the cache stores what \
+                     setup produces, so there is nothing to store",
+                    service.name
+                );
+            }
+            if cache.key.is_empty() {
+                anyhow::bail!(
+                    "service {:?}: cache.key must name at least one file, or every \
+                     worktree would share one tree whatever its lockfile says",
+                    service.name
+                );
+            }
+            for relative in std::iter::once(&cache.path).chain(&cache.key) {
+                let inside = !relative.is_empty()
+                    && !relative.starts_with('/')
+                    && !relative.split('/').any(|part| part == "..");
+                if !inside {
+                    anyhow::bail!(
+                        "service {:?}: cache path {relative:?} must be relative to the \
+                         service's cwd and stay inside it",
+                        service.name
+                    );
+                }
+            }
+        }
         for name in &self.ports.names {
             // A port name lands in `{{ port.<name> }}`, where a hyphen parses as
             // subtraction, and in `GROVE_PORT_<NAME>`, which must be a legal shell

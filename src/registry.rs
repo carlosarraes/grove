@@ -48,6 +48,11 @@ pub struct Entry {
     /// written before this existed and on worktrees where no setup has run.
     #[serde(default)]
     pub disk_bytes: Option<u64>,
+    /// Which store entry each service's dependencies came from, by service name.
+    /// Recorded so `prune` can tell an entry somebody would link from again from one
+    /// nobody will — the store itself has no way to know who uses it.
+    #[serde(default)]
+    pub cache_keys: BTreeMap<String, String>,
 }
 
 /// Enough to reach a datastore without the config that declared it: the port to speak to,
@@ -184,6 +189,7 @@ impl Registry {
                 last_used: None,
                 instance_dir: None,
                 disk_bytes: None,
+                cache_keys: BTreeMap::new(),
             };
             state.instances.insert(key, entry.clone());
             Ok(entry)

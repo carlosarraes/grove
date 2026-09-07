@@ -46,47 +46,68 @@ fn listeners(entries: &[Entry]) -> Vec<Verdict> {
         .iter()
         .flat_map(|e| e.ports.values().map(move |p| (*p, e)))
         .collect();
+    // The shared datastore listens inside the range on every machine, and it is nobody's
+    // stray. Each instance records where its database lives, so no config is needed to
+    // tell a datastore from a server a `down` missed.
+    let datastores: BTreeMap<u16, &str> = entries
+        .iter()
+        .filter_map(|e| e.db_resource.as_ref())
+        .map(|db| (db.port, db.name.as_str()))
+        .collect();
+    let mut verdicts: Vec<Verdict> = datastores
+        .iter()
+        .map(|(port, name)| {
+            if ports::is_free(*port) {
+                Verdict::Warn(format!(
+                    "datastore {name} recorded on port {port} is not answering; grove up starts it"
+                ))
+            } else {
+                Verdict::Ok(format!("datastore {name} listening on port {port}"))
+            }
+        })
+        .collect();
     let range = ports::range();
     let strays: Vec<u16> = range
         .clone()
-        .filter(|port| !running.contains(port) && !ports::is_free(*port))
+        .filter(|port| {
+            !running.contains(port) && !datastores.contains_key(port) && !ports::is_free(*port)
+        })
         .collect();
     if strays.is_empty() {
-        return vec![Verdict::Ok(format!(
+        verdicts.push(Verdict::Ok(format!(
             "nothing listens on {}..{} without a running instance",
             range.start, range.end
-        ))];
+        )));
+        return verdicts;
     }
-    strays
-        .into_iter()
-        .map(|port| {
-            let owner = listener(port);
-            let who = match &owner {
-                Some(o) => format!(" (pid {}, {})", o.pid, o.command),
-                None => String::new(),
-            };
-            let reserved_by = match reserved.get(&port) {
-                Some(e) if !e.worktree.exists() => {
-                    format!("; reserved by {}, whose worktree is gone", e.slug)
-                }
-                Some(e) => format!("; reserved by {} (stopped)", e.slug),
-                None => "; not a port grove reserved".to_string(),
-            };
-            let fix = match &owner {
-                Some(o) => format!(
-                    "kill -TERM -{}   # its process group; no grove handle reaches it",
-                    o.pgid
-                ),
-                None => format!("lsof -iTCP:{port} -sTCP:LISTEN   # names the process"),
-            };
-            Verdict::Fail {
-                what: format!(
-                    "port {port} is listening{who} but no instance is running there{reserved_by}"
-                ),
-                fix,
+    verdicts.extend(strays.into_iter().map(|port| {
+        let owner = listener(port);
+        let who = match &owner {
+            Some(o) => format!(" (pid {}, {})", o.pid, o.command),
+            None => String::new(),
+        };
+        let reserved_by = match reserved.get(&port) {
+            Some(e) if !e.worktree.exists() => {
+                format!("; reserved by {}, whose worktree is gone", e.slug)
             }
-        })
-        .collect()
+            Some(e) => format!("; reserved by {} (stopped)", e.slug),
+            None => "; not a port grove reserved".to_string(),
+        };
+        let fix = match &owner {
+            Some(o) => format!(
+                "kill -TERM -{}   # its process group; no grove handle reaches it",
+                o.pgid
+            ),
+            None => format!("lsof -iTCP:{port} -sTCP:LISTEN   # names the process"),
+        };
+        Verdict::Fail {
+            what: format!(
+                "port {port} is listening{who} but no instance is running there{reserved_by}"
+            ),
+            fix,
+        }
+    }));
+    verdicts
 }
 
 struct Listener {

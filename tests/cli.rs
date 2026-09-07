@@ -3324,3 +3324,38 @@ fn health_json_lists_every_finding_with_its_fix() {
     );
     assert!(findings.iter().any(|f| f["level"] == "ok"), "{json}");
 }
+
+/// The shared datastore listens inside grove's range on every machine, and it is nobody's
+/// stray. The registry records where each instance's database lives, which is enough to
+/// tell it from a server a `down` missed.
+#[test]
+fn health_does_not_mistake_a_recorded_datastore_for_a_stray_listener() {
+    let cli = Cli::new();
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+    cli.run(&wt, &["down"]).success();
+
+    let port = cli.ports.start + 90;
+    let _datastore = TcpListener::bind(("127.0.0.1", port)).expect("stand in for mongo");
+    let registry = registry_of(&cli);
+    let mut entry = registry.get(&wt).expect("get").expect("entry");
+    entry.db_name = Some("app_feat_search".into());
+    entry.db_resource = Some(grove::registry::DbResource {
+        name: "mongo".into(),
+        port,
+    });
+    registry.record(&entry).expect("record");
+
+    let out = cli
+        .run(&wt, &["health"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&out).into_owned();
+    assert!(!stdout.contains("FAIL"), "{stdout}");
+    assert!(
+        stdout.contains("mongo"),
+        "should name the datastore it recognised: {stdout}"
+    );
+}

@@ -119,6 +119,9 @@ enum Command {
         /// Expose to the local network using this IPv4 address or hostname
         #[arg(long, value_name = "HOST")]
         expose_host: Option<String>,
+        /// Reinstall dependencies from scratch and replace the store entry they came from
+        #[arg(long)]
+        no_cache: bool,
     },
     /// Stop this instance's services
     Down {
@@ -216,6 +219,7 @@ fn main() -> Result<()> {
             allow_main,
             expose,
             expose_host,
+            no_cache,
         }) => {
             let exposure = match expose_host {
                 Some(host) => grove::exposure::Exposure::explicit(&host)?,
@@ -250,7 +254,7 @@ fn main() -> Result<()> {
                 eprintln!("started shared {started}");
             }
             instance.render_for_up(exposure)?;
-            for outcome in instance.up(fresh)? {
+            for outcome in instance.up(fresh, no_cache)? {
                 eprintln!("{outcome}");
             }
             print_summary(&instance);
@@ -491,7 +495,7 @@ fn main() -> Result<()> {
             }
             // `up` only starts what is not already running, so stopping first is what
             // makes this a restart rather than a no-op.
-            instance.up(false)?;
+            instance.up(false, false)?;
             print_summary(&instance);
             Ok(())
         }

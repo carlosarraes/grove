@@ -586,7 +586,7 @@ impl Instance {
     ///
     /// Dependencies first, then seeds, then the services — a seed that writes straight to
     /// the datastore needs the dependencies but not a listening server.
-    pub fn up(&mut self, fresh: bool) -> Result<Vec<SeedOutcome>> {
+    pub fn up(&mut self, fresh: bool, no_cache: bool) -> Result<Vec<SeedOutcome>> {
         self.refuse_taken_ports()?;
         let mut installed = false;
         let mut keys = Vec::new();
@@ -597,7 +597,7 @@ impl Instance {
                     None => self.resolved.worktree.clone(),
                 };
                 let log = self.instance_dir().join(format!("{}.log", service.name));
-                match self.run_setup(service, setup, &cwd, &log)? {
+                match self.run_setup(service, setup, &cwd, &log, no_cache)? {
                     SetupOutcome::Skipped => {}
                     SetupOutcome::Installed => installed = true,
                     SetupOutcome::Linked { hash } | SetupOutcome::Stored { hash } => {
@@ -734,10 +734,19 @@ impl Instance {
         setup: &str,
         cwd: &Path,
         log: &Path,
+        no_cache: bool,
     ) -> Result<SetupOutcome> {
         let name = &service.name;
         let marker = self.instance_dir().join(format!(".setup-{name}"));
-        if marker.exists() {
+        if no_cache {
+            // Forget that the last install happened, so this one is not skipped; the
+            // store entry it came from is forgotten below, once its key is known.
+            match std::fs::remove_file(&marker) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("removing {}", marker.display())),
+            }
+        } else if marker.exists() {
             return Ok(SetupOutcome::Skipped);
         }
         let step = Step {
@@ -756,6 +765,11 @@ impl Instance {
         let hash = crate::store::key(cwd, cache, setup)?;
         let built = cwd.join(&cache.path);
         let entry = crate::store::entry(&store, &hash);
+        if no_cache {
+            // The distrusted entry goes before the reinstall, so what this worktree
+            // builds becomes the entry every later worktree on this lockfile links from.
+            crate::store::evict(&store, &hash)?;
+        }
 
         if entry.exists() {
             // A tree already at the path — from an install under a grove that did not
@@ -781,6 +795,13 @@ impl Instance {
             return Ok(SetupOutcome::Linked { hash });
         }
 
+        // Setup starts from what a fresh worktree has. A tree already here may be
+        // hardlinked from a store entry other worktrees share, and a tool that rewrites a
+        // file in place — rather than unlinking and recreating it — would write through
+        // the link into every one of them.
+        if built.symlink_metadata().is_ok() {
+            remove_path(&built)?;
+        }
         self.run_step(&step, setup, cwd, log)?;
         if !built.exists() {
             // Recorded as a plain install: an empty store entry would make every later

@@ -3122,3 +3122,42 @@ fn a_changed_lockfile_installs_again_into_its_own_entry() {
     cli.run(&a, &["down"]).success();
     cli.run(&b, &["down"]).success();
 }
+
+/// `--no-cache` is the escape hatch for a store entry you distrust: it is evicted and the
+/// worktree reinstalls from scratch, and what it builds becomes the entry every later
+/// worktree on that lockfile links from.
+#[test]
+fn up_no_cache_reinstalls_and_replaces_the_store_entry() {
+    use std::os::unix::fs::MetadataExt;
+    let cli = Cli::with_config(CACHE_CONFIG);
+    with_lockfile(&cli, "lockfile A\n");
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+    let before = wt.join("node_modules/blob").metadata().expect("blob").ino();
+    assert_eq!(installs(&cli), 1);
+    cli.run(&wt, &["down"]).success();
+
+    let out = cli
+        .run(&wt, &["up", "--no-cache"])
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let stderr = String::from_utf8_lossy(&out).into_owned();
+    assert!(stderr.contains("stored as"), "{stderr}");
+    assert_eq!(installs(&cli), 2, "--no-cache must run setup again");
+
+    let after = wt.join("node_modules/blob").metadata().expect("blob");
+    assert_ne!(
+        after.ino(),
+        before,
+        "the old entry's blocks are still what the worktree holds"
+    );
+    assert!(
+        after.nlink() >= 2,
+        "the fresh tree must be the new store entry, got nlink {}",
+        after.nlink()
+    );
+
+    cli.run(&wt, &["down"]).success();
+}

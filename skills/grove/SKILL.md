@@ -109,6 +109,7 @@ grove prune                      # then forgets the instance and frees its ports
 ```
 
 The database stays until `grove prune --purge`, and `prune` names every one it leaves.
+It also drops store entries no remaining worktree links from.
 
 When several have already piled up, stop the ones nobody is working in:
 

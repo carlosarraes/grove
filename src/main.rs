@@ -516,7 +516,23 @@ fn main() -> Result<()> {
                 registry.reap()?
             };
 
-            if orphans.is_empty() {
+            // After the reap, so a reaped orphan's key no longer counts. Referenced means a
+            // worktree that still exists recorded it: an entry only a deleted worktree
+            // knew about would never be linked from again.
+            let referenced: std::collections::HashSet<String> = registry
+                .list()?
+                .iter()
+                .filter(|e| e.worktree.exists())
+                .flat_map(|e| e.cache_keys.values().cloned())
+                .collect();
+            let store = grove::store::dir()?;
+            let swept = if dry_run {
+                grove::store::unreferenced(&store, &referenced)?
+            } else {
+                grove::store::gc(&store, &referenced)?
+            };
+
+            if orphans.is_empty() && swept.is_empty() {
                 println!("nothing to reclaim");
                 return Ok(());
             }
@@ -584,6 +600,14 @@ fn main() -> Result<()> {
                 0 => {}
                 1 => println!("1 database left in place (--purge drops it)"),
                 n => println!("{n} databases left in place (--purge drops them)"),
+            }
+            match swept.len() {
+                0 => {}
+                n => println!(
+                    "{} {n} store {} no worktree references",
+                    if dry_run { "would remove" } else { "removed" },
+                    if n == 1 { "entry" } else { "entries" }
+                ),
             }
             if dry_run {
                 println!("{} orphaned. Nothing reclaimed (--dry-run).", orphans.len());

@@ -3161,3 +3161,45 @@ fn up_no_cache_reinstalls_and_replaces_the_store_entry() {
 
     cli.run(&wt, &["down"]).success();
 }
+
+/// A store entry is only worth keeping while some registered worktree would link from
+/// it. Deleting one frees nothing a worktree holds, so the only mistake possible is
+/// removing an entry a stopped instance would have used on its next `up`.
+#[test]
+fn prune_removes_store_entries_no_worktree_references() {
+    let cli = Cli::with_config(CACHE_CONFIG);
+    with_lockfile(&cli, "lockfile A\n");
+    let kept = cli.worktree("feat_search");
+    let doomed = cli.worktree("fix_login");
+    cli.run(&kept, &["up"]).success();
+    std::fs::write(doomed.join("package-lock.json"), "lockfile B\n").expect("edit lockfile");
+    cli.run(&doomed, &["up"]).success();
+    cli.run(&kept, &["down"]).success();
+    cli.run(&doomed, &["down"]).success();
+    let store = cli.state.path().join("store");
+    assert_eq!(std::fs::read_dir(&store).expect("store").count(), 2);
+    let kept_hash = registry_of(&cli)
+        .get(&kept)
+        .expect("get")
+        .expect("entry")
+        .cache_keys
+        .get("web")
+        .cloned()
+        .expect("kept's key recorded");
+
+    std::fs::remove_dir_all(&doomed).expect("delete the worktree");
+    let out = cli
+        .run(&cli.fx.main, &["prune"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&out).into_owned();
+    assert!(stdout.contains("store"), "{stdout}");
+
+    let left: Vec<String> = std::fs::read_dir(&store)
+        .expect("store")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left, vec![kept_hash], "{stdout}");
+}

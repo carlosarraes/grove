@@ -167,24 +167,27 @@ pub fn evict(store: &Path, hash: &str) -> Result<()> {
 /// deleting an entry a registered worktree would have linked from, which is what
 /// `referenced` exists to prevent.
 pub fn gc(store: &Path, referenced: &HashSet<String>) -> Result<Vec<String>> {
+    let doomed = unreferenced(store, referenced)?;
+    for name in &doomed {
+        std::fs::remove_dir_all(store.join(name))
+            .with_context(|| format!("removing store entry {name}"))?;
+    }
+    Ok(doomed)
+}
+
+/// What `gc` would remove, so a dry run can name it without touching it.
+pub fn unreferenced(store: &Path, referenced: &HashSet<String>) -> Result<Vec<String>> {
     let entries = match std::fs::read_dir(store) {
         Ok(entries) => entries,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e).with_context(|| format!("reading {}", store.display())),
     };
-    let mut removed = Vec::new();
-    for item in entries {
-        let item = item?;
-        let name = item.file_name().to_string_lossy().into_owned();
-        if referenced.contains(&name) {
-            continue;
-        }
-        std::fs::remove_dir_all(item.path())
-            .with_context(|| format!("removing store entry {name}"))?;
-        removed.push(name);
-    }
-    removed.sort();
-    Ok(removed)
+    let mut doomed: Vec<String> = entries
+        .map(|item| Ok(item?.file_name().to_string_lossy().into_owned()))
+        .collect::<Result<_>>()?;
+    doomed.retain(|name| !referenced.contains(name));
+    doomed.sort();
+    Ok(doomed)
 }
 
 /// 64-bit FNV-1a, hand-rolled like the 32-bit one in `resolve` and for the same reason:

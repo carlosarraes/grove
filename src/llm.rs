@@ -165,6 +165,12 @@ needed data, then deliberately remove and recreate that container.
   if_exists          skip unless this path exists, relative to cwd -- for a fixture
                      that may not have been fetched
 
+  [idle]             optional; opt in to stopping forgotten instances
+  stop_after         e.g. "2h". Every `grove up` for this repo first stops its sibling
+                     instances nobody has touched for this long, ports kept, and says
+                     so. Without it, `up` only warns about the pile-up. An instance is
+                     touched by any grove command in it and by its services writing logs.
+
   [[service]]        repeatable; a long-running process
   name               identifier, also the log file name
   cwd                working directory relative to the worktree root

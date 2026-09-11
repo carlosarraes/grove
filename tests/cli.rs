@@ -3360,6 +3360,55 @@ fn health_does_not_mistake_a_recorded_datastore_for_a_stray_listener() {
     );
 }
 
+/// An instance nobody has touched past the repo's window is stopped by the next `up`,
+/// whoever runs it. The pile-up forms one agent at a time, and `up` is the one moment the
+/// agent adding to it is present — so with the repo opted in, that moment acts.
+#[test]
+fn up_stops_sibling_instances_idle_past_the_repos_window() {
+    let config = CONFIG.replace("[ports]", "[idle]\nstop_after = \"1h\"\n\n[ports]");
+    let cli = Cli::with_config(&config);
+    let stale = cli.worktree("fix_login");
+    let fresh = cli.worktree("feat_search");
+    cli.run(&stale, &["up"]).success();
+    backdate(&cli, &stale, 3 * 3600);
+
+    let out = cli
+        .run(&fresh, &["up"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&out).into_owned();
+    assert!(stdout.contains("stopped fix_login"), "{stdout}");
+    assert!(stdout.contains("idle"), "{stdout}");
+
+    let entry = registry_of(&cli).get(&stale).expect("get").expect("entry");
+    assert!(!entry.is_running(), "the stale instance is still running");
+    assert!(!entry.ports.is_empty(), "its ports must stay reserved");
+
+    cli.run(&fresh, &["down"]).success();
+}
+
+/// Without the opt-in, `up` only warns, as it always has.
+#[test]
+fn up_leaves_idle_siblings_alone_when_the_repo_declares_no_window() {
+    let cli = Cli::new();
+    let stale = cli.worktree("fix_login");
+    let fresh = cli.worktree("feat_search");
+    cli.run(&stale, &["up"]).success();
+    backdate(&cli, &stale, 3 * 3600);
+
+    cli.run(&fresh, &["up"]).success();
+    let entry = registry_of(&cli).get(&stale).expect("get").expect("entry");
+    assert!(
+        entry.is_running(),
+        "up stopped a sibling without being asked to"
+    );
+
+    cli.run(&stale, &["down"]).success();
+    cli.run(&fresh, &["down"]).success();
+}
+
 /// Memory is the number this machine ran out of on 2026-09-10 while load and disk looked
 /// survivable. Health reports it from the gauge that separates a healthy machine from a
 /// dying one: swap, not free pages.

@@ -245,3 +245,24 @@ key = ["package-lock.json"]
     let msg = format!("{err:#}");
     assert!(msg.contains("cache") && msg.contains("setup"), "{msg}");
 }
+
+#[test]
+fn a_repo_can_declare_how_long_an_untouched_instance_may_run() {
+    let wt = worktree_with(
+        r#"
+version = 1
+
+[ports]
+names = ["web"]
+
+[idle]
+stop_after = "90m"
+
+[[service]]
+name = "web"
+command = "python3 -m http.server {{ port.web }}"
+"#,
+    );
+    let c = config::load(wt.path()).expect("load");
+    assert_eq!(c.idle.as_ref().map(|i| i.stop_after.as_str()), Some("90m"));
+}

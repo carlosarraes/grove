@@ -120,7 +120,9 @@ grove down --all-but-this        # everything except the worktree you are in
 ```
 
 These keep each instance's port reservation, so a URL written down while one was running
-still works when it comes back. (`grove prune` is the other case: instances whose worktree
+still works when it comes back. A repo that declares `[idle] stop_after = "2h"` in
+`.grove.toml` gets this sweep for free: every `grove up` stops sibling instances past the
+window before starting, so the running set never outgrows what someone touched recently. (`grove prune` is the other case: instances whose worktree
 has been deleted.)
 
 **Read the list before sweeping when other agents share the machine.** grove counts an

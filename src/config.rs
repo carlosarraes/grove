@@ -21,6 +21,19 @@ pub struct Config {
     pub services: Vec<Service>,
     #[serde(default, rename = "seed")]
     pub seeds: Vec<Seed>,
+    /// How long an instance of this repo may run untouched before the next `grove up`
+    /// stops it. Opt-in: without it, `up` only warns about the pile-up.
+    pub idle: Option<Idle>,
+}
+
+/// The pile-up forms one agent at a time, and `up` is the one moment the agent adding to
+/// it is present. A repo that declares a window turns that moment from a warning into
+/// the sweep — ports kept, so a stopped instance comes back on the same URLs.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Idle {
+    /// e.g. `"2h"`; the same grammar as `ready.timeout`.
+    pub stop_after: String,
 }
 
 /// Data an instance needs before it is useful — the organisation row a guarded route
@@ -170,6 +183,10 @@ pub fn parse(text: &str) -> Result<Config> {
 
 impl Config {
     fn validate(&self) -> Result<()> {
+        if let Some(idle) = &self.idle {
+            crate::instance::parse_duration(&idle.stop_after)
+                .with_context(|| format!("[idle] stop_after = {:?}", idle.stop_after))?;
+        }
         for service in &self.services {
             let Some(cache) = &service.cache else {
                 continue;

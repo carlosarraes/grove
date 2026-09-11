@@ -234,6 +234,9 @@ fn main() -> Result<()> {
                 instance.refuse_in_main()?;
             }
             instance.touch()?;
+            if let Some(idle) = &instance.config.idle {
+                enforce_idle(&instance, &idle.stop_after)?;
+            }
 
             if exposure.is_exposed() {
                 eprintln!(
@@ -681,6 +684,78 @@ fn warn_if_stale(instance: &Instance) {
     println!("  grove restart {}", stale.join(" "));
 }
 
+/// Running instances past the window, oldest first. `repo` narrows the field to one
+/// repo's instances — the ones whose config declared the window — by the state directory
+/// they share, since the registry does not record which checkout an instance belongs to.
+///
+/// Never the instance the caller is standing in. Weak protection — it does nothing for
+/// a sibling agent — but it removes the one outcome nobody would expect, and someone
+/// three hours into debugging here has issued no grove command to prove it.
+fn idle_candidates<'a>(
+    running: &'a [Entry],
+    here: &Path,
+    window: Option<std::time::Duration>,
+    now: u64,
+    repo: Option<&Path>,
+) -> Vec<(&'a Entry, u64)> {
+    let mut doomed: Vec<(&Entry, u64)> = running
+        .iter()
+        .filter(|e| e.worktree != here)
+        .filter(|e| {
+            repo.is_none_or(|repo| e.instance_dir.as_deref().and_then(Path::parent) == Some(repo))
+        })
+        .filter_map(|e| match (window, e.idle_seconds(now)) {
+            (None, age) => Some((e, age.unwrap_or(0))),
+            (Some(w), Some(age)) if age >= w.as_secs() => Some((e, age)),
+            // No evidence either way is not evidence of neglect.
+            (Some(_), _) => None,
+        })
+        .collect();
+    doomed.sort_by_key(|(_, age)| std::cmp::Reverse(*age));
+    doomed
+}
+
+/// The repo opted in with `[idle] stop_after`: this `up` stops its sibling instances
+/// nobody has touched past the window, ports kept. The pile-up forms one agent at a time
+/// and this is the one moment the agent adding to it is present — the moment `survey`
+/// already warns in; here the warning becomes the sweep.
+fn enforce_idle(instance: &Instance, stop_after: &str) -> Result<()> {
+    let registry = grove::instance::registry()?;
+    let now = grove::registry::now();
+    let window = grove::instance::parse_duration(stop_after)?;
+    let running: Vec<Entry> = registry
+        .list()?
+        .into_iter()
+        .filter(Entry::is_running)
+        .collect();
+    let repo = instance
+        .entry
+        .instance_dir
+        .as_deref()
+        .and_then(Path::parent);
+    let doomed = idle_candidates(
+        &running,
+        &instance.resolved.worktree,
+        Some(window),
+        now,
+        repo,
+    );
+    for (entry, age) in doomed {
+        let mut entry = entry.clone();
+        for handle in entry.services.values() {
+            grove::supervise::stop(handle)?;
+        }
+        entry.services.clear();
+        registry.record(&entry)?;
+        println!(
+            "stopped {}  (idle {}, past this repo's [idle] stop_after = {stop_after:?}; ports kept)",
+            entry.slug,
+            human_age(age)
+        );
+    }
+    Ok(())
+}
+
 /// Stop instances across the machine, keeping their port reservations — the difference
 /// between this and `prune`, and the reason it is spelled as `down`: a forgotten box is
 /// one you want back tomorrow on the ports whose URLs are already written down.
@@ -696,21 +771,7 @@ fn sweep(here: &Path, idle: Option<&str>, dry_run: bool) -> Result<()> {
         .into_iter()
         .filter(Entry::is_running)
         .collect();
-
-    // Never the instance the caller is standing in. Weak protection — it does nothing for
-    // a sibling agent — but it removes the one outcome nobody would expect, and someone
-    // three hours into debugging here has issued no grove command to prove it.
-    let mut doomed: Vec<(&Entry, u64)> = running
-        .iter()
-        .filter(|e| e.worktree != here)
-        .filter_map(|e| match (window, e.idle_seconds(now)) {
-            (None, age) => Some((e, age.unwrap_or(0))),
-            (Some(w), Some(age)) if age >= w.as_secs() => Some((e, age)),
-            // No evidence either way is not evidence of neglect.
-            (Some(_), _) => None,
-        })
-        .collect();
-    doomed.sort_by_key(|(_, age)| std::cmp::Reverse(*age));
+    let doomed = idle_candidates(&running, here, window, now, None);
 
     if doomed.is_empty() {
         println!("nothing to stop — {} running", running.len());

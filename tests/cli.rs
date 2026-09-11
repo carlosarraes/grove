@@ -3359,3 +3359,25 @@ fn health_does_not_mistake_a_recorded_datastore_for_a_stray_listener() {
         "should name the datastore it recognised: {stdout}"
     );
 }
+
+/// Memory is the number this machine ran out of on 2026-09-10 while load and disk looked
+/// survivable. Health reports it from the gauge that separates a healthy machine from a
+/// dying one: swap, not free pages.
+#[test]
+fn health_reports_memory_and_swap() {
+    let cli = Cli::new();
+    let wt = cli.worktree("feat_search");
+    let out = cli
+        .run(&wt, &["health", "--json"])
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
+    let memory = json
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|f| f["what"].as_str().unwrap_or("").contains("swap"))
+        .expect("a finding about memory and swap");
+    assert!(memory["what"].as_str().unwrap().contains("free"), "{json}");
+}

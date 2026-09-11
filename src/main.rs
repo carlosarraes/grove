@@ -799,12 +799,22 @@ fn disk_footer(entries: &[Entry]) -> Option<String> {
         .filter(|e| e.worktree.exists() && e.disk_bytes.is_none())
         .count();
     let mut line = format!(
-        "{} on disk in dependencies across {} instances",
+        "{} on disk in private dependencies across {} instances",
         human_size(measured.iter().sum()),
         measured.len()
     );
     if unmeasured > 0 {
         line.push_str(&format!(", {unmeasured} unmeasured"));
+    }
+    // The shared trees once, whatever the number of worktrees linking them — the point of
+    // the store is that this number stops growing with the fleet.
+    if let Ok(store) = grove::store::dir()
+        && store.exists()
+    {
+        line.push_str(&format!(
+            ", store {}",
+            human_size(grove::footprint::tree_size(&store))
+        ));
     }
     Some(line)
 }

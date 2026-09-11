@@ -8,12 +8,14 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::Command;
 
-/// Bytes allocated to git-ignored paths under `worktree`, or None when git cannot say.
+/// Bytes this worktree holds alone under its git-ignored paths, or None when git cannot
+/// say.
 ///
 /// Blocks rather than lengths: node_modules is the many-tiny-files case, where a
 /// thirty-byte file still occupies a four-kilobyte block, and blocks are what `df` gets
-/// back after `rm -rf`. A block reached through several names counts once, so a tree
-/// hardlinked out of a shared store is charged to the first worktree that names it.
+/// back after `rm -rf`. Only blocks with a single name count: a block shared with the
+/// store, or with uv's cache, survives this worktree's removal and is charged to the
+/// store instead (`tree_size`), once, whatever the number of worktrees linking it.
 pub fn measure(worktree: &Path) -> Option<u64> {
     let listed = Command::new("git")
         .args([
@@ -29,19 +31,37 @@ pub fn measure(worktree: &Path) -> Option<u64> {
         .ok()
         .filter(|o| o.status.success())?;
 
-    let mut seen = HashSet::new();
     let total = listed
         .stdout
         .split(|b| *b == 0)
         .filter(|entry| !entry.is_empty())
-        .map(|entry| walk(&worktree.join(OsStr::from_bytes(entry)), &mut seen))
+        .map(|entry| {
+            walk(
+                &worktree.join(OsStr::from_bytes(entry)),
+                Sharing::PrivateOnly,
+                &mut HashSet::new(),
+            )
+        })
         .sum();
     Some(total)
 }
 
+/// Bytes under a tree grove owns outright — a store entry — counting every block once.
+pub fn tree_size(root: &Path) -> u64 {
+    walk(root, Sharing::CountOnce, &mut HashSet::new())
+}
+
+#[derive(Clone, Copy)]
+enum Sharing {
+    /// A block with more than one name belongs to whoever else names it.
+    PrivateOnly,
+    /// Every block, but a block with several names inside the tree once.
+    CountOnce,
+}
+
 /// Advisory, so a path that vanishes or refuses to be read mid-walk counts as nothing
 /// rather than failing the `up` that asked.
-fn walk(path: &Path, seen: &mut HashSet<(u64, u64)>) -> u64 {
+fn walk(path: &Path, sharing: Sharing, seen: &mut HashSet<(u64, u64)>) -> u64 {
     // Never through a symlink: `node_modules/.bin` and pnpm layouts point outside the
     // tree, and those blocks are not this worktree's to free.
     let Ok(meta) = path.symlink_metadata() else {
@@ -58,10 +78,17 @@ fn walk(path: &Path, seen: &mut HashSet<(u64, u64)>) -> u64 {
         let Ok(entries) = std::fs::read_dir(path) else {
             return 0;
         };
-        return entries.flatten().map(|e| walk(&e.path(), seen)).sum();
+        return entries
+            .flatten()
+            .map(|e| walk(&e.path(), sharing, seen))
+            .sum();
     }
-    if meta.nlink() > 1 && !seen.insert((meta.dev(), meta.ino())) {
-        return 0;
+    if meta.nlink() > 1 {
+        match sharing {
+            Sharing::PrivateOnly => return 0,
+            Sharing::CountOnce if !seen.insert((meta.dev(), meta.ino())) => return 0,
+            Sharing::CountOnce => {}
+        }
     }
     meta.blocks() * 512
 }

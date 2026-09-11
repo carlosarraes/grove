@@ -28,6 +28,7 @@ pub fn check(cwd: &Path) -> Result<Vec<Verdict>> {
     verdicts.push(idle(&entries, now)?);
     verdicts.extend(store_state(&entries)?);
     verdicts.extend(unmanaged(cwd, &entries));
+    verdicts.push(memory());
     verdicts.push(machine(&entries));
     Ok(verdicts)
 }
@@ -179,12 +180,19 @@ fn disk(cwd: &Path, entries: &[Entry]) -> Verdict {
         ));
     };
     let percent = (free * 100).checked_div(total).unwrap_or(100);
+    let store = store::dir()
+        .ok()
+        .filter(|d| d.exists())
+        .map(|d| crate::footprint::tree_size(&d));
     let what = format!(
-        "{} free of {} ({percent}%) on the volume holding {}; grove's instances hold {} in dependencies",
+        "{} free of {} ({percent}%) on the volume holding {}; instances hold {} in private dependencies, the store {}",
         human_size(free),
         human_size(total),
         cwd.display(),
-        human_size(held)
+        human_size(held),
+        store
+            .map(human_size)
+            .unwrap_or_else(|| "nothing".to_string())
     );
     if percent < 10 {
         Verdict::Fail {
@@ -289,6 +297,121 @@ fn unmanaged(cwd: &Path, entries: &[Entry]) -> Option<Verdict> {
             if strangers.len() == 1 { "" } else { "s" }
         ))
     })
+}
+
+/// The gauge that separates a healthy machine from a dying one. Free pages are not it:
+/// macOS keeps them near zero on purpose and parks reclaimable cache elsewhere, so 60M
+/// free reads the same on both. Swap at its ceiling and growing is the incident signal.
+pub struct Memory {
+    pub free_percent: u64,
+    pub swap_used: u64,
+    pub swap_total: u64,
+}
+
+impl Memory {
+    pub fn sample() -> Option<Memory> {
+        if cfg!(target_os = "macos") {
+            let pressure = Command::new("memory_pressure").output().ok()?;
+            let swap = Command::new("sysctl").arg("vm.swapusage").output().ok()?;
+            Memory::from_macos(
+                &String::from_utf8_lossy(&pressure.stdout),
+                &String::from_utf8_lossy(&swap.stdout),
+            )
+        } else {
+            Memory::from_meminfo(&std::fs::read_to_string("/proc/meminfo").ok()?)
+        }
+    }
+
+    /// `memory_pressure`'s last line and `sysctl vm.swapusage`, as printed.
+    pub fn from_macos(pressure: &str, swap: &str) -> Option<Memory> {
+        let free_percent = pressure
+            .lines()
+            .find_map(|l| l.strip_prefix("System-wide memory free percentage:"))?
+            .trim()
+            .trim_end_matches('%')
+            .parse()
+            .ok()?;
+        let field = |name: &str| -> Option<u64> {
+            let rest = swap.split(&format!("{name} = ")).nth(1)?;
+            let token = rest.split_whitespace().next()?;
+            let (number, unit) = token.split_at(token.len() - 1);
+            let scale: f64 = match unit {
+                "K" => 1024.0,
+                "M" => 1024.0 * 1024.0,
+                "G" => 1024.0 * 1024.0 * 1024.0,
+                _ => return None,
+            };
+            Some((number.parse::<f64>().ok()? * scale) as u64)
+        };
+        Some(Memory {
+            free_percent,
+            swap_used: field("used")?,
+            swap_total: field("total")?,
+        })
+    }
+
+    /// `/proc/meminfo`. MemAvailable rather than MemFree, for the same reason as above.
+    pub fn from_meminfo(text: &str) -> Option<Memory> {
+        let kb = |name: &str| -> Option<u64> {
+            text.lines()
+                .find_map(|l| l.strip_prefix(name))?
+                .trim()
+                .trim_start_matches(':')
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        };
+        let total = kb("MemTotal")?;
+        let available = kb("MemAvailable")?;
+        let swap_total = kb("SwapTotal")?;
+        let swap_free = kb("SwapFree")?;
+        Some(Memory {
+            free_percent: (available * 100).checked_div(total)?,
+            swap_used: swap_total.saturating_sub(swap_free) * 1024,
+            swap_total: swap_total * 1024,
+        })
+    }
+
+    fn swap_percent(&self) -> Option<u64> {
+        (self.swap_used * 100).checked_div(self.swap_total)
+    }
+
+    /// Swap within a tenth of its ceiling; without swap, almost nothing available.
+    pub fn exhausted(&self) -> bool {
+        match self.swap_percent() {
+            Some(used) => used >= 90,
+            None => self.free_percent < 5,
+        }
+    }
+
+    fn strained(&self) -> bool {
+        self.swap_percent().is_some_and(|used| used >= 70) || self.free_percent < 10
+    }
+}
+
+fn memory() -> Verdict {
+    let Some(m) = Memory::sample() else {
+        return Verdict::Warn("could not read memory and swap on this platform".to_string());
+    };
+    let what = format!(
+        "memory {}% free, swap {} of {} used",
+        m.free_percent,
+        human_size(m.swap_used),
+        human_size(m.swap_total)
+    );
+    if m.exhausted() {
+        Verdict::Fail {
+            what: format!("{what} — the machine is out of memory and paging"),
+            fix:
+                "grove down --idle 2h   # idle dev servers with file watchers are the usual weight"
+                    .to_string(),
+        }
+    } else if m.strained() {
+        Verdict::Warn(what)
+    } else {
+        Verdict::Ok(what)
+    }
 }
 
 fn machine(entries: &[Entry]) -> Verdict {

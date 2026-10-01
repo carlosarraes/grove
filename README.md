@@ -167,6 +167,8 @@ Grove completes each cache link in a staging directory before it replaces depend
 the previous install remains available and the command fails. A file inventory detects
 truncated entries. Use `grove up --no-cache` to rebuild an entry that fails that check.
 `--fresh` controls service restarts, not cache invalidation.
+If the new install succeeds but old-backup cleanup fails, Grove warns with the backup
+path and continues startup. The backup remains for later cleanup.
 
 Version 0.1.22 uses new cache keys so entries from earlier versions cannot bypass the
 inventory check. Each key needs one initial install after the upgrade. Setup must leave

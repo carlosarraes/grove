@@ -3725,3 +3725,57 @@ fn phase_durations_report_failed_seeds_without_changing_the_exit_status() {
     assert!(stderr.contains("seed broken failed"));
     assert!(!stderr.contains("timing: web: process start:"));
 }
+
+#[test]
+fn backup_cleanup_failure_warns_without_failing_a_completed_install() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for warm in [false, true] {
+        let cli = Cli::with_config(CACHE_CONFIG);
+        with_lockfile(&cli, "cleanup fixture\n");
+        if warm {
+            let seed = cli.worktree("seed");
+            cli.run(&seed, &["up"]).success();
+        }
+        let wt = cli.worktree("old_install");
+        let protected = wt.join("node_modules/protected");
+        std::fs::create_dir_all(&protected).unwrap();
+        std::fs::write(protected.join("old"), "old install").unwrap();
+        // A deterministic filesystem error, without a concurrent writer's timing race.
+        std::fs::set_permissions(&protected, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let output = cli.run(&wt, &["up"]).get_output().clone();
+        let backup = std::fs::read_dir(&wt)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".node_modules.grove-backup-")
+            })
+            .expect("failed cleanup retains the backup")
+            .path();
+        // Restore permissions before assertions so fixture cleanup also works on failure.
+        std::fs::set_permissions(
+            backup.join("protected"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "warm={warm}: {stderr}");
+        assert!(
+            stderr.contains("warning: web: old install cleanup failed"),
+            "{stderr}"
+        );
+        assert!(stderr.contains(backup.to_str().unwrap()), "{stderr}");
+        phase_seconds(&stderr, "web: old install cleanup", "failed");
+        assert!(backup.join("protected/old").exists());
+        assert!(wt.join("node_modules/blob").exists());
+        assert!(service_pid(&cli, &wt, "web") > 0);
+        let entry = registry_of(&cli).get(&wt).unwrap().unwrap();
+        assert!(entry.instance_dir.unwrap().join(".setup-web").exists());
+        let retry = cli.run(&wt, &["up"]).success().get_output().clone();
+        assert!(!String::from_utf8_lossy(&retry.stderr).contains("tree creation"));
+        assert_eq!(installs(&cli), 1);
+    }
+}

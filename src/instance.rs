@@ -134,12 +134,22 @@ impl InstallChange {
         })
     }
 
-    fn commit(mut self) -> Result<()> {
+    fn commit(mut self, service: &str) {
         self.committed = true;
-        if self.backup.symlink_metadata().is_ok() {
-            remove_path(&self.backup)?;
+        let cleanup = crate::timing::measure(&format!("{service}: old install cleanup"), || {
+            match self.backup.symlink_metadata() {
+                Ok(_) => remove_path(&self.backup),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+            }
+        });
+        if let Err(error) = cleanup {
+            eprintln!(
+                "warning: {service}: old install cleanup failed: {error:#}; \
+                 backup retained at {}. The new dependencies are ready.",
+                self.backup.display()
+            );
         }
-        Ok(())
     }
 }
 
@@ -894,9 +904,7 @@ impl Instance {
                         std::fs::rename(&staged, &built)?;
                         Ok(change)
                     })?;
-                crate::timing::measure(&format!("{name}: old install cleanup"), || {
-                    change.commit()
-                })?;
+                change.commit(name);
                 Ok(linked)
             })();
             if staged.exists() {
@@ -930,7 +938,7 @@ impl Instance {
             crate::store::promote(&built, &store, &hash)
         })
         .with_context(|| format!("storing {}", built.display()))?;
-        crate::timing::measure(&format!("{name}: old install cleanup"), || change.commit())?;
+        change.commit(name);
         eprintln!(
             "{name}: dependencies stored as {hash}{}",
             if promoted.shared {

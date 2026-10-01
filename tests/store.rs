@@ -62,8 +62,9 @@ fn linking_a_tree_shares_blocks_and_keeps_symlinks() {
 
     let to = dir.path().join("worktree/node_modules");
     let linked = store::link_tree(&from, &to).expect("link");
-    assert!(
-        linked.hardlinked,
+    assert_eq!(
+        linked.method,
+        store::LinkMethod::Hardlink,
         "same filesystem, so blocks must be shared"
     );
 

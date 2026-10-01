@@ -181,6 +181,28 @@ These separate lock waits, tree creation, inventory checks, replacement, cleanup
 and service readiness. Dependency setup totals include their nested cache phases.
 Do not add those totals to the individual phase durations.
 
+## Opt-in macOS clone trial
+
+On macOS, `GROVE_MACOS_CLONE=1 grove up` clones a warm cache entry into the staging directory.
+The flag is off by default. Linux ignores it and retains hardlinks.
+Cold installs and cache publication retain the existing path.
+A matching setup marker still skips setup, so the flag alone does not replace an existing install.
+
+The trial uses APFS directory cloning. Apple discourages this API for directory trees:
+see [clonefile](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/man/man2/clonefile.2).
+Unsupported volumes and clone errors fail setup and preserve the previous install.
+Unset the flag to use the normal path. Grove does not silently retry with another strategy.
+
+The clone must pass the existing inventory count before replacement. This count detects
+missing entries, but does not verify file names or contents. Grove preserves symlinks without following them.
+Cleanup of the old install stays synchronous. Cleanup errors warn and retain the backup.
+
+Disk accounting has a known trial limitation. Grove detects shared hardlinks, but cannot
+distinguish APFS clone blocks from private blocks through that check.
+The private-dependency figures in `ls` and `health` can therefore overstate unique disk use
+and space reclaimable from cloned installs. Those figures are not reliable for clone trials.
+This change does not fix accounting for cloned blocks.
+
 ## What it doesn't do
 
 Create worktrees (it attaches to whatever it finds), sandbox anything (a service can read

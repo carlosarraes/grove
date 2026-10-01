@@ -58,10 +58,15 @@ pub fn key(cwd: &Path, cache: &Cache, setup: &str) -> Result<String> {
     Ok(format!("{:016x}", hash.finish()))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum LinkMethod {
+    Hardlink,
+    Copy,
+    Clone,
+}
+
 pub struct Linked {
-    /// False when the blocks had to be copied — another filesystem, or one that refuses
-    /// links — so the caller can say the worktree got a copy rather than a share.
-    pub hardlinked: bool,
+    pub method: LinkMethod,
     pub files: u64,
 }
 
@@ -70,7 +75,7 @@ pub struct Linked {
 /// tree itself, and a link followed here would become a copy that drifts.
 pub fn link_tree(from: &Path, to: &Path) -> Result<Linked> {
     let mut linked = Linked {
-        hardlinked: true,
+        method: LinkMethod::Hardlink,
         files: 0,
     };
     link_dir(from, to, &mut linked)?;
@@ -95,7 +100,7 @@ fn link_dir(from: &Path, to: &Path, state: &mut Linked) -> Result<()> {
             link_dir(&src, &dst, state)?;
         } else {
             state.files += 1;
-            if state.hardlinked {
+            if state.method == LinkMethod::Hardlink {
                 match std::fs::hard_link(&src, &dst) {
                     Ok(()) => continue,
                     // Once one file cannot be linked none of them can, so stop trying
@@ -108,7 +113,7 @@ fn link_dir(from: &Path, to: &Path, state: &mut Linked) -> Result<()> {
                                 | ErrorKind::TooManyLinks
                         ) =>
                     {
-                        state.hardlinked = false;
+                        state.method = LinkMethod::Copy;
                     }
                     Err(e) => return Err(e).with_context(|| format!("linking {}", dst.display())),
                 }
@@ -141,7 +146,7 @@ pub fn promote(built: &Path, store: &Path, hash: &str) -> Result<Promoted> {
         std::fs::write(staging.join("files"), linked.files.to_string())?;
         std::fs::rename(&staging, target.parent().expect("entry parent"))?;
         Ok(Promoted {
-            shared: linked.hardlinked,
+            shared: linked.method == LinkMethod::Hardlink,
         })
     })();
     if staging.exists() {
@@ -180,10 +185,17 @@ pub fn link_entry(store: &Path, hash: &str, to: &Path) -> Result<Linked> {
             .parse::<u64>()
             .context("invalid store inventory")
     })?;
-    let linked = crate::timing::measure(&format!("cache {hash}: tree creation"), || {
+    let mut linked = crate::timing::measure(&format!("cache {hash}: tree creation"), || {
+        #[cfg(target_os = "macos")]
+        if std::env::var_os("GROVE_MACOS_CLONE").as_deref() == Some(std::ffi::OsStr::new("1")) {
+            return clone_tree(&entry(store, hash), to);
+        }
         link_tree(&entry(store, hash), to)
     })?;
     crate::timing::measure(&format!("cache {hash}: inventory validation"), || {
+        if linked.method == LinkMethod::Clone {
+            linked.files = count_files(to)?;
+        }
         if linked.files != count {
             bail!(
                 "store entry {hash} is incomplete: expected {count} files, found {}; run grove up --no-cache",
@@ -193,6 +205,47 @@ pub fn link_entry(store: &Path, hash: &str, to: &Path) -> Result<Linked> {
         Ok(())
     })?;
     Ok(linked)
+}
+
+#[cfg(target_os = "macos")]
+fn clone_tree(from: &Path, to: &Path) -> Result<Linked> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    if !from.symlink_metadata()?.is_dir() {
+        bail!("cache tree {} is not a directory", from.display());
+    }
+    let source = CString::new(from.as_os_str().as_bytes())?;
+    let destination = CString::new(to.as_os_str().as_bytes())?;
+    const CLONE_NOFOLLOW: u32 = 1;
+    // Both strings remain valid and NUL-terminated throughout the syscall.
+    let result = unsafe { libc::clonefile(source.as_ptr(), destination.as_ptr(), CLONE_NOFOLLOW) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "cloning {} to {} (GROVE_MACOS_CLONE=1)",
+                from.display(),
+                to.display()
+            )
+        });
+    }
+    Ok(Linked {
+        method: LinkMethod::Clone,
+        files: 0,
+    })
+}
+
+fn count_files(path: &Path) -> Result<u64> {
+    let mut files = 0;
+    for item in std::fs::read_dir(path)? {
+        let item = item?;
+        if item.file_type()?.is_dir() {
+            files += count_files(&item.path())?;
+        } else {
+            files += 1;
+        }
+    }
+    Ok(files)
 }
 
 /// Forget one entry. Worktrees that linked from it keep their blocks; only the store's

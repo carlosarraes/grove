@@ -892,7 +892,12 @@ impl Instance {
                 std::process::id()
             ));
             std::fs::create_dir_all(staged.parent().expect("dependency parent"))?;
-            std::fs::create_dir(&staged)?;
+            if staged.try_exists()? {
+                bail!(
+                    "unfinished dependency staging directory at {}",
+                    staged.display()
+                );
+            }
             let began = std::time::Instant::now();
             eprintln!("{name}: linking dependencies from the store ({hash})");
             let result: Result<crate::store::Linked> = (|| {
@@ -913,10 +918,10 @@ impl Instance {
             let linked: crate::store::Linked = result?;
             eprintln!(
                 "{name}: dependencies {} from the store ({hash}, {}s)",
-                if linked.hardlinked {
-                    "linked"
-                } else {
-                    "copied"
+                match linked.method {
+                    crate::store::LinkMethod::Hardlink => "linked",
+                    crate::store::LinkMethod::Copy => "copied",
+                    crate::store::LinkMethod::Clone => "cloned",
                 },
                 began.elapsed().as_secs()
             );

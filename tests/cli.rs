@@ -262,7 +262,8 @@ impl Cli {
             .current_dir(cwd)
             .env("GROVE_STATE_DIR", self.state.path())
             .env("GROVE_CACHE_DIR", self.state.path().join("store"))
-            .env("GROVE_PORT_RANGE", self.port_range());
+            .env("GROVE_PORT_RANGE", self.port_range())
+            .env_remove("GROVE_MACOS_CLONE");
         if let Some(docker) = &self.docker {
             command
                 .env("GROVE_DOCKER", &docker.program)
@@ -3778,4 +3779,131 @@ fn backup_cleanup_failure_warns_without_failing_a_completed_install() {
         assert!(!String::from_utf8_lossy(&retry.stderr).contains("tree creation"));
         assert_eq!(installs(&cli), 1);
     }
+}
+
+fn up_with_clone(cli: &Cli, wt: &Path) -> std::process::Output {
+    Command::cargo_bin("grove")
+        .unwrap()
+        .current_dir(wt)
+        .env("GROVE_STATE_DIR", cli.state.path())
+        .env("GROVE_CACHE_DIR", cli.state.path().join("store"))
+        .env("GROVE_PORT_RANGE", cli.port_range())
+        .env("GROVE_MACOS_CLONE", "1")
+        .arg("up")
+        .output()
+        .unwrap()
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn clone_trial_isolates_writes_and_preserves_links_modes_and_replacement() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let config = CACHE_CONFIG.replace(
+        "echo installed >> ../installs.log",
+        "ln -s blob node_modules/tool && chmod 755 node_modules/blob && echo installed >> ../installs.log",
+    );
+    let cli = Cli::with_config(&config);
+    with_lockfile(&cli, "clone fixture\n");
+    let seed = cli.worktree("seed");
+    cli.run(&seed, &["up"]).success();
+    let wt = cli.worktree("clone");
+    for replacement in [false, true] {
+        if replacement {
+            let entry = registry_of(&cli).get(&wt).unwrap().unwrap();
+            std::fs::remove_file(entry.instance_dir.unwrap().join(".setup-web")).unwrap();
+            std::fs::write(wt.join("node_modules/obsolete"), "old").unwrap();
+        }
+        let output = up_with_clone(&cli, &wt);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert!(
+            stderr.contains("dependencies cloned from the store"),
+            "{stderr}"
+        );
+        let original = seed.join("node_modules/blob");
+        let copy = wt.join("node_modules/blob");
+        assert_ne!(
+            original.metadata().unwrap().ino(),
+            copy.metadata().unwrap().ino()
+        );
+        assert_eq!(copy.metadata().unwrap().permissions().mode() & 0o777, 0o755);
+        assert_eq!(
+            std::fs::read_link(wt.join("node_modules/tool")).unwrap(),
+            Path::new("blob")
+        );
+        assert_eq!(
+            std::fs::read(&copy).unwrap(),
+            std::fs::read(&original).unwrap()
+        );
+        std::fs::write(&copy, "private change").unwrap();
+        assert_eq!(original.metadata().unwrap().len(), 1048576);
+        assert!(!wt.join("node_modules/obsolete").exists());
+    }
+    let normal = cli.worktree("default");
+    cli.run(&normal, &["up"]).success();
+    assert_eq!(
+        seed.join("node_modules/blob").metadata().unwrap().ino(),
+        normal.join("node_modules/blob").metadata().unwrap().ino()
+    );
+    assert_eq!(installs(&cli), 1);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn clone_trial_rejects_invalid_stores_before_replacing_the_old_install() {
+    for corruption in ["incomplete", "not a directory"] {
+        let cli = Cli::with_config(CACHE_CONFIG);
+        with_lockfile(&cli, "clone fixture\n");
+        let seed = cli.worktree("seed");
+        cli.run(&seed, &["up"]).success();
+        let entry = registry_of(&cli).get(&seed).unwrap().unwrap();
+        let tree = grove::store::entry(&cli.state.path().join("store"), &entry.cache_keys["web"]);
+        if corruption == "incomplete" {
+            std::fs::remove_file(tree.join("blob")).unwrap();
+        } else {
+            let original = tree.with_file_name("original");
+            std::fs::rename(&tree, &original).unwrap();
+            std::os::unix::fs::symlink(&original, &tree).unwrap();
+        }
+        let wt = cli.worktree("old_install");
+        std::fs::create_dir(wt.join("node_modules")).unwrap();
+        std::fs::write(wt.join("node_modules/old"), "keep me").unwrap();
+        let output = up_with_clone(&cli, &wt);
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(corruption), "{stderr}");
+        assert_eq!(
+            std::fs::read_to_string(wt.join("node_modules/old")).unwrap(),
+            "keep me"
+        );
+        let entry = registry_of(&cli).get(&wt).unwrap().unwrap();
+        assert!(!entry.instance_dir.unwrap().join(".setup-web").exists());
+        assert!(!std::fs::read_dir(&wt).unwrap().any(|e| {
+            e.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".node_modules.grove-stage-")
+        }));
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn clone_trial_flag_keeps_hardlinks_on_linux() {
+    use std::os::unix::fs::MetadataExt;
+    let cli = Cli::with_config(CACHE_CONFIG);
+    with_lockfile(&cli, "clone fixture\n");
+    let seed = cli.worktree("seed");
+    cli.run(&seed, &["up"]).success();
+    let wt = cli.worktree("linux");
+    let output = up_with_clone(&cli, &wt);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        seed.join("node_modules/blob").metadata().unwrap().ino(),
+        wt.join("node_modules/blob").metadata().unwrap().ino()
+    );
 }

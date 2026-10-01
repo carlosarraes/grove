@@ -391,3 +391,35 @@ fn recording_a_stale_entry_does_not_roll_back_exposure() {
         "an unrelated stale service/database write must not return the instance to loopback"
     );
 }
+
+#[test]
+fn an_idle_snapshot_cannot_stop_a_resumed_instance() {
+    let h = Harness::new();
+    let resolved = h.resolved("resumed");
+    let mut entry = h.registry.reserve(&resolved, &names()).expect("reserve");
+    let handle = grove::supervise::spawn(
+        "exec sleep 60",
+        &resolved.worktree,
+        &Default::default(),
+        &h._state.path().join("service.log"),
+    )
+    .expect("spawn");
+    entry.services.insert("web".into(), handle);
+    entry.last_used = Some(grove::registry::now() - 7200);
+    h.registry.record(&entry).expect("record");
+    h.registry.touch(&resolved.worktree).expect("resume");
+    let stopped = h
+        .registry
+        .stop_if_idle(&entry, std::time::Duration::from_secs(3600))
+        .expect("sweep");
+    let alive = grove::supervise::is_alive(&handle);
+    let recorded = h
+        .registry
+        .get(&resolved.worktree)
+        .expect("read")
+        .expect("entry");
+    grove::supervise::stop(&handle).expect("cleanup");
+    assert!(!stopped, "a stale candidate stopped a resumed instance");
+    assert!(alive, "the resumed service died");
+    assert_eq!(recorded.services.get("web"), Some(&handle));
+}

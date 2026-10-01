@@ -741,12 +741,9 @@ fn enforce_idle(instance: &Instance, stop_after: &str) -> Result<()> {
         repo,
     );
     for (entry, age) in doomed {
-        let mut entry = entry.clone();
-        for handle in entry.services.values() {
-            grove::supervise::stop(handle)?;
+        if !registry.stop_if_idle(entry, window)? {
+            continue;
         }
-        entry.services.clear();
-        registry.record(&entry)?;
         println!(
             "stopped {}  (idle {}, past this repo's [idle] stop_after = {stop_after:?}; ports kept)",
             entry.slug,

@@ -226,6 +226,28 @@ impl Registry {
         })
     }
 
+    /// Recheck and stop under the registry lock so a concurrent touch or restart
+    /// cannot replace activity or service handles between the decision and the stop.
+    pub fn stop_if_idle(&self, candidate: &Entry, window: std::time::Duration) -> Result<bool> {
+        self.with_lock(|state| {
+            let Some(entry) = state.instances.get_mut(&key(&candidate.worktree)) else {
+                return Ok(false);
+            };
+            if entry.services != candidate.services
+                || !entry
+                    .idle_seconds(now())
+                    .is_some_and(|age| age >= window.as_secs())
+            {
+                return Ok(false);
+            }
+            for handle in entry.services.values() {
+                crate::supervise::stop(handle)?;
+            }
+            entry.services.clear();
+            Ok(true)
+        })
+    }
+
     pub fn set_exposure(&self, worktree: &Path, exposure: crate::exposure::Exposure) -> Result<()> {
         self.with_lock(|state| {
             let entry = state

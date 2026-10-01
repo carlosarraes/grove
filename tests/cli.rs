@@ -97,16 +97,44 @@ command = "printf '%s' '{{ host.bind }}' > bind-host.txt; exec python3 -u -m htt
 ready = { http = "http://127.0.0.1:{{ port.web }}/", timeout = "30s" }
 "#;
 
-/// Every test gets its own slice of the port space. The allocator's bind check only sees
-/// what is already listening, and two tests in the same hundred milliseconds can both
-/// pick a free block before either service has bound it — the loser then dies on bind
-/// while the winner answers its readiness probe. One registry per machine prevents that
-/// in production; one range per test is the equivalent here.
+// Production uses 20000..30000. Sharing that range made health tests report live
+// lane servers as stray listeners. Keep fixture ranges separate, skip occupied
+// ranges, and hold a lease across setup and teardown for concurrent test processes.
 static NEXT_SLICE: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+fn claim_test_ports() -> (std::ops::Range<u16>, std::fs::File) {
+    let locks = std::env::temp_dir().join("grove-cli-test-ports");
+    std::fs::create_dir_all(&locks).expect("port lease directory");
+    for _ in 0..190 {
+        let slice = NEXT_SLICE.fetch_add(1, std::sync::atomic::Ordering::SeqCst) % 190;
+        let low = 30000 + slice * 100;
+        let range = low..low + 100;
+        let lease = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(locks.join(low.to_string()))
+            .expect("port lease");
+        match lease.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => continue,
+            Err(error) => panic!("port lease: {error}"),
+        }
+        let listeners: std::io::Result<Vec<_>> = range
+            .clone()
+            .map(|port| TcpListener::bind(("0.0.0.0", port)))
+            .collect();
+        if listeners.is_ok() {
+            return (range, lease);
+        }
+    }
+    panic!("no unoccupied CLI test range in 30000..49000");
+}
 
 struct Cli {
     state: TempDir,
     ports: std::ops::Range<u16>,
+    _port_lease: std::fs::File,
     fx: Fixture,
     started: std::cell::RefCell<Vec<std::path::PathBuf>>,
     docker: Option<FakeDocker>,
@@ -200,11 +228,11 @@ impl Cli {
         common::git(&fx.main, &["add", "--force", ".grove.toml"]);
         common::git(&fx.main, &["commit", "-m", "add grove config"]);
 
-        let slice = NEXT_SLICE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let low = 20000 + slice * 100;
+        let (ports, port_lease) = claim_test_ports();
         Cli {
             state: TempDir::new().expect("tempdir"),
-            ports: low..low + 100,
+            ports,
+            _port_lease: port_lease,
             fx,
             started: std::cell::RefCell::new(Vec::new()),
             docker: None,

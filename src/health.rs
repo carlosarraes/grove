@@ -299,13 +299,13 @@ fn unmanaged(cwd: &Path, entries: &[Entry]) -> Option<Verdict> {
     })
 }
 
-/// The gauge that separates a healthy machine from a dying one. Free pages are not it:
-/// macOS keeps them near zero on purpose and parks reclaimable cache elsewhere, so 60M
-/// free reads the same on both. Swap at its ceiling and growing is the incident signal.
+/// Memory availability and swap usage, with the kernel pressure level on macOS.
 pub struct Memory {
     pub free_percent: u64,
     pub swap_used: u64,
     pub swap_total: u64,
+    /// macOS reports 1 (normal), 2 (warning), or 4 (critical). Linux has no value here.
+    pub pressure_level: Option<u32>,
 }
 
 impl Memory {
@@ -313,9 +313,14 @@ impl Memory {
         if cfg!(target_os = "macos") {
             let pressure = Command::new("memory_pressure").output().ok()?;
             let swap = Command::new("sysctl").arg("vm.swapusage").output().ok()?;
+            let level = Command::new("sysctl")
+                .args(["-n", "kern.memorystatus_vm_pressure_level"])
+                .output()
+                .ok()?;
             Memory::from_macos(
                 &String::from_utf8_lossy(&pressure.stdout),
                 &String::from_utf8_lossy(&swap.stdout),
+                &String::from_utf8_lossy(&level.stdout),
             )
         } else {
             Memory::from_meminfo(&std::fs::read_to_string("/proc/meminfo").ok()?)
@@ -323,7 +328,11 @@ impl Memory {
     }
 
     /// `memory_pressure`'s last line and `sysctl vm.swapusage`, as printed.
-    pub fn from_macos(pressure: &str, swap: &str) -> Option<Memory> {
+    pub fn from_macos(pressure: &str, swap: &str, level: &str) -> Option<Memory> {
+        let pressure_level = match level.trim().parse().ok()? {
+            level @ (1 | 2 | 4) => level,
+            _ => return None,
+        };
         let free_percent = pressure
             .lines()
             .find_map(|l| l.strip_prefix("System-wide memory free percentage:"))?
@@ -347,6 +356,7 @@ impl Memory {
             free_percent,
             swap_used: field("used")?,
             swap_total: field("total")?,
+            pressure_level: Some(pressure_level),
         })
     }
 
@@ -370,6 +380,7 @@ impl Memory {
             free_percent: (available * 100).checked_div(total)?,
             swap_used: swap_total.saturating_sub(swap_free) * 1024,
             swap_total: swap_total * 1024,
+            pressure_level: None,
         })
     }
 
@@ -377,8 +388,12 @@ impl Memory {
         (self.swap_used * 100).checked_div(self.swap_total)
     }
 
-    /// Swap within a tenth of its ceiling; without swap, almost nothing available.
+    /// macOS uses kernel pressure because its allocated swap can grow.
+    /// Linux uses its configured swap capacity, or available memory without swap.
     pub fn exhausted(&self) -> bool {
+        if let Some(level) = self.pressure_level {
+            return level == 4;
+        }
         match self.swap_percent() {
             Some(used) => used >= 90,
             None => self.free_percent < 5,
@@ -386,6 +401,9 @@ impl Memory {
     }
 
     fn strained(&self) -> bool {
+        if let Some(level) = self.pressure_level {
+            return level >= 2;
+        }
         self.swap_percent().is_some_and(|used| used >= 70) || self.free_percent < 10
     }
 }
@@ -402,7 +420,7 @@ fn memory() -> Verdict {
     );
     if m.exhausted() {
         Verdict::Fail {
-            what: format!("{what} — the machine is out of memory and paging"),
+            what: format!("{what} — memory pressure is critical"),
             fix:
                 "grove down --idle 2h   # idle dev servers with file watchers are the usual weight"
                     .to_string(),

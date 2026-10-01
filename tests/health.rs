@@ -6,7 +6,7 @@ use grove::health::Memory;
 fn macos_memory_is_read_from_memory_pressure_and_swapusage() {
     let pressure = "The system has 25769803776 (6291456 pages with a page size of 4096).\n\nStats: \n...\nSystem-wide memory free percentage: 71%\n";
     let swap = "vm.swapusage: total = 15360.00M  used = 5120.00M  free = 10240.00M  (encrypted)\n";
-    let m = Memory::from_macos(pressure, swap).expect("parse");
+    let m = Memory::from_macos(pressure, swap, "1").expect("parse");
     assert_eq!(m.free_percent, 71);
     assert_eq!(m.swap_used, 5120 << 20);
     assert_eq!(m.swap_total, 15360 << 20);
@@ -28,12 +28,14 @@ fn swap_near_its_ceiling_is_a_failure_whatever_free_pages_say() {
         free_percent: 40,
         swap_used: 15 << 30,
         swap_total: 15 << 30,
+        pressure_level: None,
     };
     assert!(m.exhausted());
     let ok = Memory {
         free_percent: 3,
         swap_used: 1 << 30,
         swap_total: 15 << 30,
+        pressure_level: None,
     };
     assert!(
         !ok.exhausted(),
@@ -43,6 +45,35 @@ fn swap_near_its_ceiling_is_a_failure_whatever_free_pages_say() {
         free_percent: 30,
         swap_used: 0,
         swap_total: 0,
+        pressure_level: None,
     };
     assert!(!none.exhausted());
+}
+
+#[test]
+fn allocated_macos_swap_does_not_establish_memory_exhaustion() {
+    let memory = Memory::from_macos(
+        "System-wide memory free percentage: 40%\n",
+        "vm.swapusage: total = 25600.00M  used = 25171.81M  free = 428.19M\n",
+        "2",
+    )
+    .expect("parse macOS sample");
+    assert!(!memory.exhausted(), "allocated swap is not a fixed ceiling");
+}
+
+#[test]
+fn macos_critical_pressure_does_not_require_full_swap() {
+    let pressure = "System-wide memory free percentage: 20%\n";
+    let swap = "vm.swapusage: total = 1024.00M  used = 1.00M  free = 1023.00M\n";
+    assert!(
+        Memory::from_macos(pressure, swap, "4")
+            .expect("parse")
+            .exhausted()
+    );
+    assert!(
+        !Memory::from_macos(pressure, swap, "1")
+            .expect("parse")
+            .exhausted()
+    );
+    assert!(Memory::from_macos(pressure, swap, "unknown").is_none());
 }

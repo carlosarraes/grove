@@ -597,24 +597,27 @@ impl Instance {
                 .with_context(|| format!("opening {}", log.display()))?;
             let errors = sink.try_clone().context("duplicating the log handle")?;
 
-            let status = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(&command)
-                .current_dir(&cwd)
-                .envs(&environment)
-                .stdout(std::process::Stdio::from(sink))
-                .stderr(std::process::Stdio::from(errors))
-                .status()
-                .with_context(|| format!("running seed {}: {command}", seed.name))?;
+            crate::timing::measure(&format!("seed {}", seed.name), || {
+                let status = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&command)
+                    .current_dir(&cwd)
+                    .envs(&environment)
+                    .stdout(std::process::Stdio::from(sink))
+                    .stderr(std::process::Stdio::from(errors))
+                    .status()
+                    .with_context(|| format!("running seed {}: {command}", seed.name))?;
 
-            if !status.success() {
-                bail!(
-                    "seed {} failed: {command}\nfull output in {}\n{}",
-                    seed.name,
-                    log.display(),
-                    tail(&log, 30).unwrap_or_default()
-                );
-            }
+                if !status.success() {
+                    bail!(
+                        "seed {} failed: {command}\nfull output in {}\n{}",
+                        seed.name,
+                        log.display(),
+                        tail(&log, 30).unwrap_or_default()
+                    );
+                }
+                Ok(())
+            })?;
             write_seed_marker(
                 &marker,
                 &command,
@@ -661,9 +664,10 @@ impl Instance {
                 };
                 let log = self.instance_dir().join(format!("{}.log", service.name));
                 eprintln!("{}: checking dependency setup", service.name);
-                match self
-                    .run_setup(service, setup, &cwd, &log, no_cache)
-                    .with_context(|| format!("{}: dependency setup failed", service.name))?
+                match crate::timing::measure(&format!("{}: dependency setup", service.name), || {
+                    self.run_setup(service, setup, &cwd, &log, no_cache)
+                })
+                .with_context(|| format!("{}: dependency setup failed", service.name))?
                 {
                     SetupOutcome::Skipped => {}
                     SetupOutcome::Installed => installed = true,
@@ -684,7 +688,9 @@ impl Instance {
         // `up` never reruns setup, so without it those would never get a figure.
         let declares_setup = self.config.services.iter().any(|s| s.setup.is_some());
         if installed || (declares_setup && self.entry.disk_bytes.is_none()) {
-            self.entry.disk_bytes = crate::footprint::measure(&self.resolved.worktree);
+            self.entry.disk_bytes = crate::timing::measure("dependency footprint", || {
+                Ok(crate::footprint::measure(&self.resolved.worktree))
+            })?;
             self.registry.record(&self.entry)?;
         }
         let seeded = self.seed(false)?;
@@ -706,7 +712,9 @@ impl Instance {
             if let Some(prepare) = &service.prepare {
                 let command = render::value(prepare, &context)
                     .with_context(|| format!("rendering prepare for {}", service.name))?;
-                self.run_prepare(&service.name, &command, &cwd, &log)?;
+                crate::timing::measure(&format!("{}: prepare", service.name), || {
+                    self.run_prepare(&service.name, &command, &cwd, &log)
+                })?;
             }
 
             let already = self.entry.services.get(&service.name).copied();
@@ -739,29 +747,34 @@ impl Instance {
             let command = render::value(&service.command, &context)
                 .with_context(|| format!("rendering the command for {}", service.name))?;
             let environment = self.environment()?;
-            let handle = supervise::spawn(&command, &cwd, &environment, &log)?;
+            let handle =
+                crate::timing::measure(&format!("{}: process start", service.name), || {
+                    supervise::spawn(&command, &cwd, &environment, &log)
+                })?;
             self.entry.services.insert(service.name.clone(), handle);
             self.registry.record(&self.entry)?;
 
             if let Some(ready) = &service.ready {
                 let url = render::value(&ready.http, &context)?;
                 let timeout = parse_duration(&ready.timeout)?;
-                supervise::wait_ready(&handle, &url, timeout).map_err(|why| {
-                    let tail = tail(&log, 30).unwrap_or_default();
-                    match why {
-                        // Spelled out rather than wrapped: "never became ready" reads as
-                        // slow, and a reader waits. This one died, and the tail says why.
-                        supervise::NotReady::Exited { url } => anyhow::anyhow!(
-                            "{} exited before answering on {url}\n\
+                crate::timing::measure(&format!("{}: readiness", service.name), || {
+                    supervise::wait_ready(&handle, &url, timeout).map_err(|why| {
+                        let tail = tail(&log, 30).unwrap_or_default();
+                        match why {
+                            // Spelled out rather than wrapped: "never became ready" reads as
+                            // slow, and a reader waits. This one died, and the tail says why.
+                            supervise::NotReady::Exited { url } => anyhow::anyhow!(
+                                "{} exited before answering on {url}\n\
                              full output in {}\n{tail}",
-                            service.name,
-                            log.display()
-                        ),
-                        timed_out => anyhow::anyhow!(
-                            "{} never became ready: {timed_out}\n{tail}",
-                            service.name
-                        ),
-                    }
+                                service.name,
+                                log.display()
+                            ),
+                            timed_out => anyhow::anyhow!(
+                                "{} never became ready: {timed_out}\n{tail}",
+                                service.name
+                            ),
+                        }
+                    })
                 })?;
             }
         }
@@ -812,7 +825,9 @@ impl Instance {
             .truncate(false)
             .write(true)
             .open(marker.with_extension("lock"))?;
-        instance_lock.lock()?;
+        crate::timing::measure(&format!("{name}: setup lock wait"), || {
+            Ok(instance_lock.lock()?)
+        })?;
         let step = Step {
             service: name,
             kind: "setup",
@@ -845,12 +860,18 @@ impl Instance {
         }
         let entry = crate::store::entry(&store, &hash);
         eprintln!("{name}: checking dependency cache ({hash})");
-        let mut lease = crate::store::lock_key(&store, &hash, true)?;
+        let mut lease = crate::timing::measure(&format!("{name}: shared cache lock wait"), || {
+            crate::store::lock_key(&store, &hash, true)
+        })?;
         if no_cache || !entry.exists() {
             drop(lease);
-            lease = crate::store::lock_key(&store, &hash, false)?;
+            lease = crate::timing::measure(&format!("{name}: exclusive cache lock wait"), || {
+                crate::store::lock_key(&store, &hash, false)
+            })?;
             if no_cache {
-                crate::store::evict(&store, &hash)?;
+                crate::timing::measure(&format!("{name}: cache eviction"), || {
+                    crate::store::evict(&store, &hash)
+                })?;
             }
         }
         let _lease = lease;
@@ -867,9 +888,15 @@ impl Instance {
             let result: Result<crate::store::Linked> = (|| {
                 let linked = crate::store::link_entry(&store, &hash, &staged)
                     .with_context(|| format!("linking {} from the store", built.display()))?;
-                let change = InstallChange::begin(&built)?;
-                std::fs::rename(&staged, &built)?;
-                change.commit()?;
+                let change =
+                    crate::timing::measure(&format!("{name}: dependency replacement"), || {
+                        let change = InstallChange::begin(&built)?;
+                        std::fs::rename(&staged, &built)?;
+                        Ok(change)
+                    })?;
+                crate::timing::measure(&format!("{name}: old install cleanup"), || {
+                    change.commit()
+                })?;
                 Ok(linked)
             })();
             if staged.exists() {
@@ -899,9 +926,11 @@ impl Instance {
         if !built.is_dir() {
             bail!("{name}: setup left no {} directory to cache", cache.path);
         }
-        let promoted = crate::store::promote(&built, &store, &hash)
-            .with_context(|| format!("storing {}", built.display()))?;
-        change.commit()?;
+        let promoted = crate::timing::measure(&format!("{name}: cache publication"), || {
+            crate::store::promote(&built, &store, &hash)
+        })
+        .with_context(|| format!("storing {}", built.display()))?;
+        crate::timing::measure(&format!("{name}: old install cleanup"), || change.commit())?;
         eprintln!(
             "{name}: dependencies stored as {hash}{}",
             if promoted.shared {

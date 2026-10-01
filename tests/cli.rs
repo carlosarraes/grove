@@ -3626,3 +3626,74 @@ fn every_configured_setup_reports_completion_before_up_succeeds() {
     assert!(wt.join("backend-ready").exists());
     assert!(wt.join("node_modules/blob").exists());
 }
+
+fn phase_seconds(stderr: &str, phase: &str, outcome: &str) -> f64 {
+    let prefix = format!("timing: {phase}: {outcome} (");
+    let value = stderr
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix(&prefix)
+                .and_then(|value| value.strip_suffix("s)"))
+        })
+        .unwrap_or_else(|| panic!("missing {prefix} in {stderr}"));
+    let seconds: f64 = value.parse().expect("duration in seconds");
+    assert!(seconds.is_finite() && seconds >= 0.0);
+    seconds
+}
+
+#[test]
+fn phase_durations_distinguish_warm_link_work_from_setup_and_seeds() {
+    let config = format!("{CACHE_CONFIG}\n[[seed]]\nname = \"demo\"\ncommand = \"sleep 0.1\"\n");
+    let config = config.replace("[[service]]", "[[service]]\nprepare = \"sleep 0.1\"");
+    let cli = Cli::with_config(&config);
+    with_lockfile(&cli, "timing fixture\n");
+    let seed = cli.worktree("seed");
+    cli.run(&seed, &["up"]).success();
+    let wt = cli.worktree("warm");
+    std::fs::create_dir(wt.join("node_modules")).unwrap();
+    std::fs::write(wt.join("node_modules/old"), "old install").unwrap();
+    let output = cli.run(&wt, &["up"]).success().get_output().clone();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for phase in [
+        "web: setup lock wait",
+        "web: shared cache lock wait",
+        "web: dependency setup",
+        "web: dependency replacement",
+        "web: old install cleanup",
+        "dependency footprint",
+        "web: process start",
+        "web: readiness",
+    ] {
+        phase_seconds(&stderr, phase, "ok");
+    }
+    let entry = registry_of(&cli).get(&wt).unwrap().unwrap();
+    let hash = &entry.cache_keys["web"];
+    for phase in ["inventory read", "tree creation", "inventory validation"] {
+        phase_seconds(&stderr, &format!("cache {hash}: {phase}"), "ok");
+    }
+    assert!(phase_seconds(&stderr, "seed demo", "ok") >= 0.1);
+    assert!(phase_seconds(&stderr, "web: prepare", "ok") >= 0.1);
+    assert_eq!(installs(&cli), 1);
+    assert!(!wt.join("node_modules/old").exists());
+    assert!(wt.join("node_modules/blob").exists());
+    let output = cli.run(&wt, &["up"]).success().get_output().clone();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("timing: seed demo:"),
+        "a skipped seed must not report execution time"
+    );
+    assert!(!stderr.contains("tree creation:"));
+}
+
+#[test]
+fn phase_durations_report_failed_seeds_without_changing_the_exit_status() {
+    let cli = Cli::with_config(&format!(
+        "{CONFIG}\n[[seed]]\nname = \"broken\"\ncommand = \"sleep 0.1; exit 7\"\n"
+    ));
+    let wt = cli.worktree("broken");
+    let output = cli.run(&wt, &["up"]).failure().get_output().clone();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(phase_seconds(&stderr, "seed broken", "failed") >= 0.1);
+    assert!(stderr.contains("seed broken failed"));
+    assert!(!stderr.contains("timing: web: process start:"));
+}

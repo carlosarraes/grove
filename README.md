@@ -174,6 +174,11 @@ its declared cache key files unchanged. Include all installation inputs in `cach
 Grove runs the configured setup command and its lifecycle scripts. Those scripts can
 still modify other repository files.
 
+Setup emits `timing:` lines on stderr with a phase name, outcome and duration in seconds.
+These separate lock waits, tree creation, inventory checks, replacement, cleanup, seeds
+and service readiness. Dependency setup totals include their nested cache phases.
+Do not add those totals to the individual phase durations.
+
 ## What it doesn't do
 
 Create worktrees (it attaches to whatever it finds), sandbox anything (a service can read

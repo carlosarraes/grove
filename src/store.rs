@@ -171,20 +171,27 @@ pub fn lock_key(store: &Path, hash: &str, shared: bool) -> Result<File> {
 
 /// Check the entry inventory after linking, before the caller replaces its install.
 pub fn link_entry(store: &Path, hash: &str, to: &Path) -> Result<Linked> {
-    let count = std::fs::read_to_string(store.join(hash).join("files"))
-        .with_context(|| {
-            format!("store entry {hash} has no complete inventory; run grove up --no-cache")
-        })?
-        .trim()
-        .parse::<u64>()
-        .context("invalid store inventory")?;
-    let linked = link_tree(&entry(store, hash), to)?;
-    if linked.files != count {
-        bail!(
-            "store entry {hash} is incomplete: expected {count} files, found {}; run grove up --no-cache",
-            linked.files
-        );
-    }
+    let count = crate::timing::measure(&format!("cache {hash}: inventory read"), || {
+        std::fs::read_to_string(store.join(hash).join("files"))
+            .with_context(|| {
+                format!("store entry {hash} has no complete inventory; run grove up --no-cache")
+            })?
+            .trim()
+            .parse::<u64>()
+            .context("invalid store inventory")
+    })?;
+    let linked = crate::timing::measure(&format!("cache {hash}: tree creation"), || {
+        link_tree(&entry(store, hash), to)
+    })?;
+    crate::timing::measure(&format!("cache {hash}: inventory validation"), || {
+        if linked.files != count {
+            bail!(
+                "store entry {hash} is incomplete: expected {count} files, found {}; run grove up --no-cache",
+                linked.files
+            );
+        }
+        Ok(())
+    })?;
     Ok(linked)
 }
 

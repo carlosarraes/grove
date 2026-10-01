@@ -149,8 +149,8 @@ name = "frontend"
 prepare = "npm run contracts:generate"
 ```
 
-Three config fields run commands and the difference is only how often: `setup` once per
-worktree (dependency installs), `[[seed]]` once per instance (fixture data), `prepare` on
+Three config fields run commands: `setup` when its command or cache inputs change
+(dependency installs), `[[seed]]` once per instance (fixture data), `prepare` on
 every `up` (generation). A failing `prepare` fails `up` and prints what it printed, rather
 than starting a service on top of half a file.
 
@@ -292,3 +292,12 @@ produces and the lockfile that decides it. Worktrees on the same lockfile then s
 copy through grove's store, hardlinked in, and only the first pays for the install. Without
 it each worktree carries its own gigabyte, which is how a machine running many agents
 fills its disk.
+
+
+After a lockfile change, run plain `grove up`. Grove checks the cache inputs even in
+an existing worktree. Use `--no-cache` only to rebuild an entry you distrust.
+`--fresh` restarts services and does not select a different dependency cache.
+
+Cache entries published by 0.1.22 include a file inventory and use a new key format.
+The first worktree on each key installs once after this upgrade. Later worktrees reuse
+that entry. Capture the full output and exit code when a refresh fails.

@@ -65,7 +65,7 @@ ready = { http = "http://localhost:{{ port.backend }}/openapi.json", timeout = "
 [[service]]
 name = "frontend"
 cwd = "frontend"
-setup = "npm install"
+setup = "npm ci"
 command = "npm run dev -- --port {{ port.frontend }} --strictPort"
 ready = { http = "http://localhost:{{ port.frontend }}/", timeout = "180s" }
 
@@ -174,7 +174,7 @@ needed data, then deliberately remove and recreate that container.
   [[service]]        repeatable; a long-running process
   name               identifier, also the log file name
   cwd                working directory relative to the worktree root
-  setup              run ONCE per worktree before first start (uv sync, npm install)
+  setup              install before first start; repeat when the command or cache key changes
   prepare            run on EVERY up, before this service starts and after the services
                      declared above it are answering -- for generated code that must
                      track what it was generated from, e.g. a typed client built from
@@ -188,9 +188,12 @@ needed data, then deliberately remove and recreate that container.
                      Worktrees whose key files match byte for byte share one copy,
                      hardlinked from grove's store; a changed lockfile is a new copy.
                      Only the first worktree on a lockfile pays for the install.
+                     Ordinary up refreshes existing worktrees when these inputs change.
+                     Concurrent readers share an entry; replacement and GC wait for them.
+                     A failed refresh preserves the previous install.
 
 Three fields run commands, and the difference between them is how often:
-`setup` once per worktree, `[[seed]]` once per instance, `prepare` every `up`. Put a
+`setup` when its inputs change, `[[seed]]` once per instance, `prepare` every `up`. Put a
 dependency install in `setup`, fixture data in `[[seed]]`, and code generation in
 `prepare` -- generated output is the one that goes stale when it is only made once.
 Give a `setup` that installs dependencies a `cache`, or every worktree carries its own

@@ -107,6 +107,69 @@ fn remove_path(path: &Path) -> Result<()> {
     .with_context(|| format!("removing {}", path.display()))
 }
 
+/// Restore the previous install if setup or publication fails.
+struct InstallChange {
+    path: PathBuf,
+    backup: PathBuf,
+    committed: bool,
+}
+
+impl InstallChange {
+    fn begin(path: &Path) -> Result<Self> {
+        let backup = path.with_file_name(format!(
+            ".{}.grove-backup-{}",
+            path.file_name().unwrap().to_string_lossy(),
+            std::process::id()
+        ));
+        if backup.symlink_metadata().is_ok() {
+            bail!("unfinished dependency backup at {}", backup.display());
+        }
+        if path.symlink_metadata().is_ok() {
+            std::fs::rename(path, &backup)?;
+        }
+        Ok(Self {
+            path: path.to_owned(),
+            backup,
+            committed: false,
+        })
+    }
+
+    fn commit(mut self) -> Result<()> {
+        self.committed = true;
+        if self.backup.symlink_metadata().is_ok() {
+            remove_path(&self.backup)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for InstallChange {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if self.path.symlink_metadata().is_ok()
+            && let Err(error) = remove_path(&self.path)
+        {
+            eprintln!(
+                "could not remove failed install {}: {error:#}; backup at {}",
+                self.path.display(),
+                self.backup.display()
+            );
+            return;
+        }
+        if self.backup.symlink_metadata().is_ok()
+            && let Err(error) = std::fs::rename(&self.backup, &self.path)
+        {
+            eprintln!(
+                "could not restore {}: {error}; backup at {}",
+                self.path.display(),
+                self.backup.display()
+            );
+        }
+    }
+}
+
 struct Step<'a> {
     service: &'a str,
     kind: &'a str,
@@ -597,7 +660,11 @@ impl Instance {
                     None => self.resolved.worktree.clone(),
                 };
                 let log = self.instance_dir().join(format!("{}.log", service.name));
-                match self.run_setup(service, setup, &cwd, &log, no_cache)? {
+                eprintln!("{}: checking dependency setup", service.name);
+                match self
+                    .run_setup(service, setup, &cwd, &log, no_cache)
+                    .with_context(|| format!("{}: dependency setup failed", service.name))?
+                {
                     SetupOutcome::Skipped => {}
                     SetupOutcome::Installed => installed = true,
                     SetupOutcome::Linked { hash } | SetupOutcome::Stored { hash } => {
@@ -605,6 +672,7 @@ impl Instance {
                         keys.push((service.name.clone(), hash));
                     }
                 }
+                eprintln!("{}: dependency setup complete", service.name);
             }
         }
         for (name, hash) in keys {
@@ -738,17 +806,13 @@ impl Instance {
     ) -> Result<SetupOutcome> {
         let name = &service.name;
         let marker = self.instance_dir().join(format!(".setup-{name}"));
-        if no_cache {
-            // Forget that the last install happened, so this one is not skipped; the
-            // store entry it came from is forgotten below, once its key is known.
-            match std::fs::remove_file(&marker) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e).with_context(|| format!("removing {}", marker.display())),
-            }
-        } else if marker.exists() {
-            return Ok(SetupOutcome::Skipped);
-        }
+        std::fs::create_dir_all(self.instance_dir())?;
+        let instance_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(marker.with_extension("lock"))?;
+        instance_lock.lock()?;
         let step = Step {
             service: name,
             kind: "setup",
@@ -756,6 +820,12 @@ impl Instance {
             done: "dependencies installed",
         };
         let Some(cache) = &service.cache else {
+            if !no_cache && std::fs::read_to_string(&marker).ok().as_deref() == Some(setup) {
+                return Ok(SetupOutcome::Skipped);
+            }
+            if marker.exists() {
+                std::fs::remove_file(&marker)?;
+            }
             self.run_step(&step, setup, cwd, log)?;
             std::fs::write(&marker, setup)?;
             return Ok(SetupOutcome::Installed);
@@ -764,23 +834,48 @@ impl Instance {
         let store = crate::store::dir()?;
         let hash = crate::store::key(cwd, cache, setup)?;
         let built = cwd.join(&cache.path);
-        let entry = crate::store::entry(&store, &hash);
-        if no_cache {
-            // The distrusted entry goes before the reinstall, so what this worktree
-            // builds becomes the entry every later worktree on this lockfile links from.
-            crate::store::evict(&store, &hash)?;
+        if !no_cache
+            && built.is_dir()
+            && std::fs::read_to_string(&marker).ok().as_deref() == Some(hash.as_str())
+        {
+            return Ok(SetupOutcome::Skipped);
         }
-
-        if entry.exists() {
-            // A tree already at the path — from an install under a grove that did not
-            // share, or a link that never finished — is replaced, not merged. It costs
-            // seconds; merging would leave a shape nothing ever produced.
-            if built.symlink_metadata().is_ok() {
-                remove_path(&built)?;
+        if marker.exists() {
+            std::fs::remove_file(&marker)?;
+        }
+        let entry = crate::store::entry(&store, &hash);
+        eprintln!("{name}: checking dependency cache ({hash})");
+        let mut lease = crate::store::lock_key(&store, &hash, true)?;
+        if no_cache || !entry.exists() {
+            drop(lease);
+            lease = crate::store::lock_key(&store, &hash, false)?;
+            if no_cache {
+                crate::store::evict(&store, &hash)?;
             }
+        }
+        let _lease = lease;
+        if entry.exists() {
+            let staged = built.with_file_name(format!(
+                ".{}.grove-stage-{}",
+                built.file_name().unwrap().to_string_lossy(),
+                std::process::id()
+            ));
+            std::fs::create_dir_all(staged.parent().expect("dependency parent"))?;
+            std::fs::create_dir(&staged)?;
             let began = std::time::Instant::now();
-            let linked = crate::store::link_tree(&entry, &built)
-                .with_context(|| format!("linking {} from the store", built.display()))?;
+            eprintln!("{name}: linking dependencies from the store ({hash})");
+            let result: Result<crate::store::Linked> = (|| {
+                let linked = crate::store::link_entry(&store, &hash, &staged)
+                    .with_context(|| format!("linking {} from the store", built.display()))?;
+                let change = InstallChange::begin(&built)?;
+                std::fs::rename(&staged, &built)?;
+                change.commit()?;
+                Ok(linked)
+            })();
+            if staged.exists() {
+                let _ = std::fs::remove_dir_all(&staged);
+            }
+            let linked: crate::store::Linked = result?;
             eprintln!(
                 "{name}: dependencies {} from the store ({hash}, {}s)",
                 if linked.hardlinked {
@@ -790,40 +885,32 @@ impl Instance {
                 },
                 began.elapsed().as_secs()
             );
-            std::fs::create_dir_all(self.instance_dir())?;
-            std::fs::write(&marker, setup)?;
+            std::fs::write(&marker, &hash)?;
             return Ok(SetupOutcome::Linked { hash });
         }
 
-        // Setup starts from what a fresh worktree has. A tree already here may be
-        // hardlinked from a store entry other worktrees share, and a tool that rewrites a
-        // file in place — rather than unlinking and recreating it — would write through
-        // the link into every one of them.
-        if built.symlink_metadata().is_ok() {
-            remove_path(&built)?;
-        }
+        let change = InstallChange::begin(&built)?;
         self.run_step(&step, setup, cwd, log)?;
-        if !built.exists() {
-            // Recorded as a plain install: an empty store entry would make every later
-            // worktree "link" nothing and believe its dependencies were in place.
-            eprintln!(
-                "{name}: setup left no {} behind, so there is nothing to store — check cache.path",
-                cache.path
+        if crate::store::key(cwd, cache, setup)? != hash {
+            bail!(
+                "{name}: setup changed its cache key files; refusing to publish dependencies under stale inputs"
             );
-            std::fs::write(&marker, setup)?;
-            return Ok(SetupOutcome::Installed);
+        }
+        if !built.is_dir() {
+            bail!("{name}: setup left no {} directory to cache", cache.path);
         }
         let promoted = crate::store::promote(&built, &store, &hash)
             .with_context(|| format!("storing {}", built.display()))?;
+        change.commit()?;
         eprintln!(
             "{name}: dependencies stored as {hash}{}",
             if promoted.shared {
                 ""
             } else {
-                " (this worktree keeps a private copy: another one stored it first)"
+                " (private copy)"
             }
         );
-        std::fs::write(&marker, setup)?;
+        std::fs::write(&marker, &hash)?;
         Ok(SetupOutcome::Stored { hash })
     }
 

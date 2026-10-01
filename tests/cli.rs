@@ -3431,3 +3431,198 @@ fn health_reports_memory_and_swap() {
         .expect("a finding about memory and swap");
     assert!(memory["what"].as_str().unwrap().contains("free"), "{json}");
 }
+
+#[test]
+fn an_existing_worktree_switches_to_the_cached_changed_lockfile() {
+    let config = CACHE_CONFIG.replace(
+        "head -c 1048576 /dev/zero > node_modules/blob",
+        "cp package-lock.json node_modules/blob",
+    );
+    let cli = Cli::with_config(&config);
+    with_lockfile(&cli, "version A\n");
+    let existing = cli.worktree("existing");
+    let seed = cli.worktree("seed");
+    cli.run(&existing, &["up"]).success();
+    std::fs::write(seed.join("package-lock.json"), "version B\n").expect("lockfile");
+    cli.run(&seed, &["up"]).success();
+    std::fs::write(existing.join("package-lock.json"), "version B\n").expect("lockfile");
+    cli.run(&existing, &["up"]).success();
+    assert_eq!(
+        std::fs::read_to_string(existing.join("node_modules/blob")).unwrap(),
+        "version B\n"
+    );
+    assert_eq!(
+        installs(&cli),
+        2,
+        "reuse the warm entry instead of installing again"
+    );
+}
+
+#[test]
+fn a_failed_store_link_keeps_the_existing_dependencies() {
+    let cli = Cli::with_config(CACHE_CONFIG);
+    with_lockfile(&cli, "lockfile A\n");
+    let existing = cli.worktree("existing");
+    cli.run(&existing, &["up"]).success();
+    let entry = registry_of(&cli).get(&existing).unwrap().unwrap();
+    let hash = &entry.cache_keys["web"];
+    let tree = grove::store::entry(&cli.state.path().join("store"), hash);
+    std::fs::remove_dir_all(&tree).expect("remove fixture store");
+    std::fs::write(&tree, "invalid tree").expect("corrupt fixture store");
+    std::fs::remove_file(entry.instance_dir.unwrap().join(".setup-web")).expect("forget setup");
+    cli.run(&existing, &["up"]).failure();
+    assert!(
+        existing.join("node_modules/blob").exists(),
+        "failed refresh destroyed the old install"
+    );
+}
+
+#[test]
+fn a_truncated_store_does_not_produce_a_successful_install() {
+    let cli = Cli::with_config(CACHE_CONFIG);
+    with_lockfile(&cli, "lockfile A\n");
+    let seed = cli.worktree("seed");
+    let fresh = cli.worktree("fresh");
+    cli.run(&seed, &["up"]).success();
+    let entry = registry_of(&cli).get(&seed).unwrap().unwrap();
+    let tree = grove::store::entry(&cli.state.path().join("store"), &entry.cache_keys["web"]);
+    std::fs::remove_file(tree.join("blob")).expect("truncate store");
+    let output = cli
+        .run(&fresh, &["up"])
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    assert!(String::from_utf8_lossy(&output).contains("incomplete"));
+    let state = registry_of(&cli).get(&fresh).unwrap().unwrap();
+    assert!(!state.instance_dir.unwrap().join(".setup-web").exists());
+    assert!(!fresh.join("node_modules").exists());
+}
+
+#[test]
+fn a_failed_reinstall_restores_the_previous_install() {
+    let cli = Cli::with_config(CACHE_CONFIG);
+    with_lockfile(&cli, "lockfile A\n");
+    let wt = cli.worktree("existing");
+    cli.run(&wt, &["up"]).success();
+    let failing = CACHE_CONFIG.replace(
+        "mkdir -p node_modules &&",
+        "exit 1; mkdir -p node_modules &&",
+    );
+    std::fs::write(wt.join(".grove.toml"), failing).unwrap();
+    cli.run(&wt, &["up"]).failure();
+    assert!(wt.join("node_modules/blob").exists());
+}
+
+#[test]
+fn simultaneous_worktrees_install_one_shared_entry() {
+    let cli = Cli::with_config(&CACHE_CONFIG.replace(
+        "mkdir -p node_modules &&",
+        "sleep 1; mkdir -p node_modules &&",
+    ));
+    with_lockfile(&cli, "lockfile A\n");
+    let worktrees = [
+        cli.worktree("first"),
+        cli.worktree("second"),
+        cli.worktree("third"),
+    ];
+    let mut children = Vec::new();
+    for wt in &worktrees {
+        children.push(
+            std::process::Command::new(assert_cmd::cargo::cargo_bin("grove"))
+                .arg("up")
+                .current_dir(wt)
+                .env("GROVE_STATE_DIR", cli.state.path())
+                .env("GROVE_CACHE_DIR", cli.state.path().join("store"))
+                .env("GROVE_PORT_RANGE", cli.port_range())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("start up"),
+        );
+    }
+    for child in children {
+        let output = child.wait_with_output().expect("wait up");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(
+        installs(&cli),
+        1,
+        "concurrent cache misses must share one install"
+    );
+    for wt in worktrees {
+        assert!(wt.join("node_modules/blob").exists());
+    }
+}
+
+#[test]
+fn a_warm_nested_cache_creates_the_missing_parent_directory() {
+    let config = CACHE_CONFIG.replace("node_modules", "build/deps");
+    let cli = Cli::with_config(&config);
+    with_lockfile(&cli, "lockfile A\n");
+    let seed = cli.worktree("seed");
+    let fresh = cli.worktree("fresh");
+    cli.run(&seed, &["up"]).success();
+    assert!(!fresh.join("build").exists());
+    cli.run(&fresh, &["up"]).success();
+    assert!(fresh.join("build/deps/blob").exists());
+    assert_eq!(installs(&cli), 1);
+}
+
+#[test]
+fn setup_cannot_publish_a_tree_under_changed_cache_inputs() {
+    let config = CACHE_CONFIG.replace(
+        "mkdir -p node_modules &&",
+        "echo changed > package-lock.json; mkdir -p node_modules &&",
+    );
+    let cli = Cli::with_config(&config);
+    with_lockfile(&cli, "lockfile A\n");
+    let wt = cli.worktree("changed");
+    let output = cli.run(&wt, &["up"]).failure().get_output().stderr.clone();
+    assert!(String::from_utf8_lossy(&output).contains("setup changed its cache key files"));
+    let entry = registry_of(&cli).get(&wt).unwrap().unwrap();
+    assert!(!entry.instance_dir.unwrap().join(".setup-web").exists());
+    assert!(!wt.join("node_modules").exists());
+    assert!(!cli.state.path().join("store").exists());
+}
+
+#[test]
+fn a_frontend_setup_failure_after_backend_setup_names_the_failed_step() {
+    let config = CACHE_CONFIG.replace("name = \"web\"", "name = \"frontend\"").replace(
+        "[[service]]",
+        "[[service]]\nname = \"backend\"\nsetup = \"touch backend-ready\"\ncommand = \"sleep 60\"\n\n[[service]]",
+    );
+    let cli = Cli::with_config(&config);
+    let wt = cli.worktree("missing_lockfile");
+    let output = cli.run(&wt, &["up"]).failure().get_output().clone();
+    assert!(wt.join("backend-ready").exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("frontend: dependency setup failed"));
+}
+
+#[test]
+fn every_configured_setup_reports_completion_before_up_succeeds() {
+    let config = CACHE_CONFIG.replace("name = \"web\"", "name = \"frontend\"").replace(
+        "[[service]]",
+        "[[service]]\nname = \"backend\"\nsetup = \"touch backend-ready\"\ncommand = \"sleep 60\"\n\n[[service]]",
+    );
+    let cli = Cli::with_config(&config);
+    with_lockfile(&cli, "lockfile A\n");
+    let wt = cli.worktree("complete");
+    cli.run(&wt, &["up"]).success();
+    let output = cli.run(&wt, &["up"]).success().get_output().clone();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("backend: dependency setup complete"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("frontend: dependency setup complete"),
+        "{stderr}"
+    );
+    assert!(wt.join("backend-ready").exists());
+    assert!(wt.join("node_modules/blob").exists());
+}

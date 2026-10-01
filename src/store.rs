@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
+use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -37,6 +38,7 @@ pub fn entry(store: &Path, hash: &str) -> PathBuf {
 /// directory must not share an entry.
 pub fn key(cwd: &Path, cache: &Cache, setup: &str) -> Result<String> {
     let mut hash = Fnv64::new();
+    hash.write(b"grove-cache-v2");
     hash.write(cache.path.as_bytes());
     hash.write(setup.as_bytes());
     for name in &cache.key {
@@ -81,8 +83,11 @@ fn link_dir(from: &Path, to: &Path, state: &mut Linked) -> Result<()> {
         let item = item?;
         let src = item.path();
         let dst = to.join(item.file_name());
-        let meta = src.symlink_metadata()?;
+        let meta = src
+            .symlink_metadata()
+            .with_context(|| format!("reading {}", src.display()))?;
         if meta.is_symlink() {
+            state.files += 1;
             let target = std::fs::read_link(&src)?;
             std::os::unix::fs::symlink(target, &dst)
                 .with_context(|| format!("linking {}", dst.display()))?;
@@ -121,35 +126,66 @@ pub struct Promoted {
     pub shared: bool,
 }
 
-/// Move a freshly built tree into the store and link it back, so the worktree that paid
-/// for the install shares it like every later one. A rename is atomic on one
-/// filesystem; losing the race to a sibling `up` leaves this worktree the private copy
-/// it had a moment ago, which is correct and merely unshared.
+/// Publish a complete tree and its inventory by atomic rename. The caller holds
+/// the exclusive entry lease, and the original install stays intact on failure.
 pub fn promote(built: &Path, store: &Path, hash: &str) -> Result<Promoted> {
     let target = entry(store, hash);
     if target.exists() {
         return Ok(Promoted { shared: false });
     }
-    let parent = target.parent().expect("entry has a parent");
-    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    match std::fs::rename(built, &target) {
-        Ok(()) => {
-            link_tree(&target, built)?;
-            Ok(Promoted { shared: true })
-        }
-        Err(_) if target.exists() => Ok(Promoted { shared: false }),
-        Err(e) if e.kind() == ErrorKind::CrossesDevices => {
-            // Built somewhere the store cannot claim by rename: copy it in under a
-            // temporary name so a half-copied entry never looks complete.
-            let staging = store.join(format!("{hash}.tmp-{}", std::process::id()));
-            link_tree(built, &staging.join("tree"))?;
-            if std::fs::rename(&staging, target.parent().expect("parent")).is_err() {
-                let _ = std::fs::remove_dir_all(&staging);
-            }
-            Ok(Promoted { shared: false })
-        }
-        Err(e) => Err(e).with_context(|| format!("moving {} into the store", built.display())),
+    std::fs::create_dir_all(store)?;
+    let staging = store.join(format!("{hash}.tmp-{}", std::process::id()));
+    std::fs::create_dir(&staging)?;
+    let result = (|| {
+        let linked = link_tree(built, &staging.join("tree"))?;
+        std::fs::write(staging.join("files"), linked.files.to_string())?;
+        std::fs::rename(&staging, target.parent().expect("entry parent"))?;
+        Ok(Promoted {
+            shared: linked.hardlinked,
+        })
+    })();
+    if staging.exists() {
+        let _ = std::fs::remove_dir_all(&staging);
     }
+    result
+}
+
+/// Shared leases allow simultaneous links. A refresh or GC takes the exclusive lease.
+/// Lock files live outside the store and must never be unlinked while clients run.
+pub fn lock_key(store: &Path, hash: &str, shared: bool) -> Result<File> {
+    let locks = store.with_extension("locks");
+    std::fs::create_dir_all(&locks)?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(locks.join(hash))?;
+    if shared {
+        lock.lock_shared()?;
+    } else {
+        lock.lock()?;
+    }
+    Ok(lock)
+}
+
+/// Check the entry inventory after linking, before the caller replaces its install.
+pub fn link_entry(store: &Path, hash: &str, to: &Path) -> Result<Linked> {
+    let count = std::fs::read_to_string(store.join(hash).join("files"))
+        .with_context(|| {
+            format!("store entry {hash} has no complete inventory; run grove up --no-cache")
+        })?
+        .trim()
+        .parse::<u64>()
+        .context("invalid store inventory")?;
+    let linked = link_tree(&entry(store, hash), to)?;
+    if linked.files != count {
+        bail!(
+            "store entry {hash} is incomplete: expected {count} files, found {}; run grove up --no-cache",
+            linked.files
+        );
+    }
+    Ok(linked)
 }
 
 /// Forget one entry. Worktrees that linked from it keep their blocks; only the store's
@@ -169,8 +205,8 @@ pub fn evict(store: &Path, hash: &str) -> Result<()> {
 pub fn gc(store: &Path, referenced: &HashSet<String>) -> Result<Vec<String>> {
     let doomed = unreferenced(store, referenced)?;
     for name in &doomed {
-        std::fs::remove_dir_all(store.join(name))
-            .with_context(|| format!("removing store entry {name}"))?;
+        let _lease = lock_key(store, name, false)?;
+        evict(store, name).with_context(|| format!("removing store entry {name}"))?;
     }
     Ok(doomed)
 }
@@ -185,7 +221,11 @@ pub fn unreferenced(store: &Path, referenced: &HashSet<String>) -> Result<Vec<St
     let mut doomed: Vec<String> = entries
         .map(|item| Ok(item?.file_name().to_string_lossy().into_owned()))
         .collect::<Result<_>>()?;
-    doomed.retain(|name| !referenced.contains(name));
+    doomed.retain(|name| {
+        name.len() == 16
+            && name.bytes().all(|b| b.is_ascii_hexdigit())
+            && !referenced.contains(name)
+    });
     doomed.sort();
     Ok(doomed)
 }

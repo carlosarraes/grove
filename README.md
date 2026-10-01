@@ -157,6 +157,23 @@ repo's own fixture or settings constructor.
 | `prune` | stop and forget instances whose worktree is gone |
 | `doctor` | check everything needed to start, and say what to fix |
 
+## Refresh dependencies
+
+After a lockfile change, run `grove up`. Existing worktrees check their cache inputs
+and reuse the matching shared install. Concurrent cache misses produce one install.
+Warm links can run together. A refresh or prune waits for active readers of that entry.
+
+Grove completes each cache link in a staging directory before it replaces dependencies. If setup or linking fails,
+the previous install remains available and the command fails. A file inventory detects
+truncated entries. Use `grove up --no-cache` to rebuild an entry that fails that check.
+`--fresh` controls service restarts, not cache invalidation.
+
+Version 0.1.22 uses new cache keys so entries from earlier versions cannot bypass the
+inventory check. Each key needs one initial install after the upgrade. Setup must leave
+its declared cache key files unchanged. Include all installation inputs in `cache.key`.
+Grove runs the configured setup command and its lifecycle scripts. Those scripts can
+still modify other repository files.
+
 ## What it doesn't do
 
 Create worktrees (it attaches to whatever it finds), sandbox anything (a service can read

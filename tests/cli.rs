@@ -3008,10 +3008,11 @@ ready = { http = "http://127.0.0.1:{{ port.api }}/", timeout = "30s" }
 
     // Kill only `api`, the way a crash would, so `web` keeps the instance "running".
     let pid = service_pid(&cli, &wt, "api");
-    std::process::Command::new("kill")
-        .args(["-9", &format!("-{pid}")])
-        .status()
-        .expect("kill");
+    rustix::process::kill_process_group(
+        rustix::process::Pid::from_raw(i32::try_from(pid).expect("pid fits i32")).expect("pid"),
+        rustix::process::Signal::KILL,
+    )
+    .expect("kill api process group");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while ureq::get(format!("http://127.0.0.1:{port}/"))
         .call()

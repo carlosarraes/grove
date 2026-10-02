@@ -205,7 +205,9 @@ the log when a pipeline hides Grove's status.
 
 The log covers Grove's output. Services keep their separate logs. Invalid CLI arguments and worktree resolution failures occur
 before a run log can start. An abrupt termination can leave a partial log without a footer.
-Grove keeps logs until instance-state cleanup and does not rotate them automatically.
+At the start of each `up`, Grove keeps the newest 50 run logs and deletes older ones.
+Active logs remain until a later run can prune them, so concurrent runs can exceed the cap temporarily.
+Rotation errors warn without failing startup.
 
 On a readiness timeout, Grove prints the service log path and makes a TCP check with
 a one-second limit. An accepted connection means a listener accepted TCP, even though

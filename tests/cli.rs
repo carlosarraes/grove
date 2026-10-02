@@ -4237,3 +4237,35 @@ fn up_logs_cancel_the_worker_before_it_can_start_services() {
     let body = std::fs::read_to_string(saved_up_log(&output)).unwrap();
     assert!(body.contains("grove up exit code: 143"), "{body}");
 }
+
+#[test]
+fn up_logs_keep_the_newest_fifty_without_deleting_active_or_unrelated_files() {
+    let cli = Cli::with_config(INPUT_SETUP_CONFIG);
+    let wt = input_setup_worktree(&cli);
+    let output = cli.run(&wt, &["up"]).success().get_output().clone();
+    let log = saved_up_log(&output);
+    let dir = log.parent().unwrap();
+    for number in 1..=60 {
+        std::fs::write(dir.join(format!("{number}-123.log")), "old run").unwrap();
+    }
+    std::fs::write(dir.join("notes.log"), "keep").unwrap();
+    let active = std::fs::File::create(dir.join("0-123.log")).unwrap();
+    active.lock().unwrap();
+    cli.run(&wt, &["up"]).success();
+    assert!(!dir.join("12-123.log").exists());
+    assert!(dir.join("13-123.log").exists());
+    assert!(
+        dir.join("0-123.log").exists(),
+        "active log must survive rotation"
+    );
+    assert!(dir.join("notes.log").exists());
+    assert_eq!(
+        std::fs::read_dir(dir).unwrap().count(),
+        52,
+        "50 recent, one active, one unrelated"
+    );
+    drop(active);
+    cli.run(&wt, &["up"]).success();
+    assert!(!dir.join("0-123.log").exists());
+    assert_eq!(std::fs::read_dir(dir).unwrap().count(), 51);
+}

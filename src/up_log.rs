@@ -52,7 +52,16 @@ pub fn run(cwd: &Path) -> Result<i32> {
         .mode(0o600)
         .open(&path)
         .with_context(|| format!("creating {}", path.display()))?;
+    file.lock().context("locking the active up log")?;
     let log = Arc::new(Mutex::new(file));
+    if let Err(error) = prune_logs(&directory) {
+        let warning = format!(
+            "warning: could not rotate up logs in {}: {error:#}",
+            directory.display()
+        );
+        let _ = writeln!(std::io::stderr(), "{warning}");
+        writeln!(log.lock().unwrap(), "{warning}")?;
+    }
 
     // A separate process keeps every existing print and top-level error in the log.
     // The private argument is not inherited by setup commands or nested Grove runs.
@@ -141,4 +150,43 @@ fn tee(
         }
     }
     log_error.map_or(Ok(()), Err)
+}
+
+/// Retain the newest 50 owned run files. Active older logs survive until a later up.
+fn prune_logs(directory: &Path) -> Result<()> {
+    let mut logs = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str().and_then(|name| name.strip_suffix(".log")) else {
+            continue;
+        };
+        let Some((timestamp, pid)) = name.split_once('-') else {
+            continue;
+        };
+        if let (Ok(timestamp), Ok(pid)) = (timestamp.parse::<u128>(), pid.parse::<u32>()) {
+            logs.push(((timestamp, pid), entry.path()));
+        }
+    }
+    logs.sort_by_key(|(key, _)| std::cmp::Reverse(*key));
+    for (_, path) in logs.into_iter().skip(50) {
+        let file = match OpenOptions::new().write(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        match file.try_lock() {
+            Ok(()) => match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            },
+            Err(std::fs::TryLockError::WouldBlock) => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }

@@ -168,7 +168,23 @@ the previous install remains available and the command fails. A file inventory d
 truncated entries. Use `grove up --no-cache` to rebuild an entry that fails that check.
 `--fresh` controls service restarts, not cache invalidation.
 If the new install succeeds but old-backup cleanup fails, Grove warns with the backup
-path and continues startup. The backup remains for later cleanup.
+path and continues startup.
+
+Retained backups live under the instance state directory,
+in `dependency-backups/`, outside the worktree. Git cannot stage them with `git add -A`.
+The install and state directory must share a filesystem for the atomic backup move.
+Grove rejects a state directory inside the worktree for cached dependency replacement.
+
+Before replacement, Grove stops the service that owns the cached install, if Grove
+started that service. It stays stopped through replacement and synchronous cleanup.
+Normal startup then runs prepare and readiness checks in service declaration order.
+An unchanged setup marker leaves the service process alive.
+
+A failed setup restores the previous install and attempts to restart the stopped service.
+The command then returns the error.
+If recovery also fails, Grove reports both failures. A startup failure after a successful
+install leaves the new dependencies in place. Grove does not stop external watchers.
+Concurrent `up` and `restart` calls for one instance wait through setup and startup.
 
 Version 0.1.22 uses new cache keys so entries from earlier versions cannot bypass the
 inventory check. Each key needs one initial install after the upgrade. Setup must leave

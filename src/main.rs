@@ -240,6 +240,7 @@ fn main() -> Result<()> {
             expose_host,
             no_cache,
         }) => {
+            let _up_lock = grove::instance::lock_up(&cwd)?;
             let exposure = match expose_host {
                 Some(host) => grove::exposure::Exposure::explicit(&host)?,
                 None if expose => grove::exposure::Exposure::detect()?,
@@ -509,6 +510,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Command::Restart { service }) => {
+            let _up_lock = grove::instance::lock_up(&cwd)?;
             let mut instance = Instance::open(&cwd)?;
             instance.refuse_in_main()?;
             instance.touch()?;

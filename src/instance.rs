@@ -115,17 +115,14 @@ struct InstallChange {
 }
 
 impl InstallChange {
-    fn begin(path: &Path) -> Result<Self> {
-        let backup = path.with_file_name(format!(
-            ".{}.grove-backup-{}",
-            path.file_name().unwrap().to_string_lossy(),
-            std::process::id()
-        ));
+    fn begin(path: &Path, backup: PathBuf) -> Result<Self> {
         if backup.symlink_metadata().is_ok() {
             bail!("unfinished dependency backup at {}", backup.display());
         }
         if path.symlink_metadata().is_ok() {
-            std::fs::rename(path, &backup)?;
+            std::fs::rename(path, &backup).with_context(|| {
+                format!("moving {} to {}; the install and Grove state directory must be on the same filesystem", path.display(), backup.display())
+            })?;
         }
         Ok(Self {
             path: path.to_owned(),
@@ -153,27 +150,32 @@ impl InstallChange {
     }
 }
 
+impl InstallChange {
+    fn rollback(&mut self) -> Result<()> {
+        if self.path.symlink_metadata().is_ok() {
+            remove_path(&self.path)?;
+        }
+        if self.backup.symlink_metadata().is_ok() {
+            std::fs::rename(&self.backup, &self.path).with_context(|| {
+                format!(
+                    "restoring {} from {}",
+                    self.path.display(),
+                    self.backup.display()
+                )
+            })?;
+        }
+        self.committed = true;
+        Ok(())
+    }
+}
+
 impl Drop for InstallChange {
     fn drop(&mut self) {
-        if self.committed {
-            return;
-        }
-        if self.path.symlink_metadata().is_ok()
-            && let Err(error) = remove_path(&self.path)
+        if !self.committed
+            && let Err(error) = self.rollback()
         {
             eprintln!(
-                "could not remove failed install {}: {error:#}; backup at {}",
-                self.path.display(),
-                self.backup.display()
-            );
-            return;
-        }
-        if self.backup.symlink_metadata().is_ok()
-            && let Err(error) = std::fs::rename(&self.backup, &self.path)
-        {
-            eprintln!(
-                "could not restore {}: {error}; backup at {}",
-                self.path.display(),
+                "dependency rollback failed: {error:#}; backup at {}",
                 self.backup.display()
             );
         }
@@ -292,6 +294,20 @@ impl std::fmt::Display for SeedOutcome {
             SeedOutcome::Skipped { name, why } => write!(f, "seed {name} ... skipped ({why})"),
         }
     }
+}
+
+/// Hold from before Instance::open through startup so a waiting `up` reads fresh handles.
+pub fn lock_up(cwd: &Path) -> Result<std::fs::File> {
+    let resolved = resolve::resolve(cwd)?;
+    let directory = state_dir()?.join(resolved.state_key()).join(&resolved.slug);
+    std::fs::create_dir_all(&directory)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(directory.join("up.lock"))?;
+    crate::timing::measure("instance up lock wait", || Ok(lock.lock()?))?;
+    Ok(lock)
 }
 
 /// Where grove keeps the registry and per-service logs. `GROVE_STATE_DIR` overrides
@@ -663,10 +679,34 @@ impl Instance {
     /// Dependencies first, then seeds, then the services — a seed that writes straight to
     /// the datastore needs the dependencies but not a listening server.
     pub fn up(&mut self, fresh: bool, no_cache: bool) -> Result<Vec<SeedOutcome>> {
+        let mut stopped = BTreeSet::new();
+        let result = self.up_inner(fresh, no_cache, &mut stopped);
+        if let Err(mut error) = result {
+            for service in self.config.services.clone() {
+                if stopped.contains(&service.name)
+                    && let Err(recovery) = self.start_service(&service, false)
+                {
+                    error = error.context(format!(
+                        "{}: service recovery also failed: {recovery:#}",
+                        service.name
+                    ));
+                }
+            }
+            return Err(error);
+        }
+        result
+    }
+
+    fn up_inner(
+        &mut self,
+        fresh: bool,
+        no_cache: bool,
+        stopped: &mut BTreeSet<String>,
+    ) -> Result<Vec<SeedOutcome>> {
         self.refuse_taken_ports()?;
         let mut installed = false;
         let mut keys = Vec::new();
-        for service in &self.config.services {
+        for service in self.config.services.clone() {
             if let Some(setup) = &service.setup {
                 let cwd = match &service.cwd {
                     Some(dir) => self.resolved.worktree.join(dir),
@@ -675,7 +715,7 @@ impl Instance {
                 let log = self.instance_dir().join(format!("{}.log", service.name));
                 eprintln!("{}: checking dependency setup", service.name);
                 match crate::timing::measure(&format!("{}: dependency setup", service.name), || {
-                    self.run_setup(service, setup, &cwd, &log, no_cache)
+                    self.run_setup(&service, setup, &cwd, &log, no_cache, stopped)
                 })
                 .with_context(|| format!("{}: dependency setup failed", service.name))?
                 {
@@ -705,93 +745,162 @@ impl Instance {
         }
         let seeded = self.seed(false)?;
 
-        let context = self.render_context();
-
-        for service in &self.config.services {
-            let cwd = match &service.cwd {
-                Some(dir) => self.resolved.worktree.join(dir),
-                None => self.resolved.worktree.clone(),
-            };
-            let log = self.instance_dir().join(format!("{}.log", service.name));
-
-            // Before the skip below, not after: a running service is precisely the case
-            // where generated code goes stale unnoticed. Services start in declaration
-            // order and each waits for its readiness probe, so by the time this runs the
-            // services declared above are answering — which is what a generator reading
-            // this worktree's own backend needs.
-            if let Some(prepare) = &service.prepare {
-                let command = render::value(prepare, &context)
-                    .with_context(|| format!("rendering prepare for {}", service.name))?;
-                crate::timing::measure(&format!("{}: prepare", service.name), || {
-                    self.run_prepare(&service.name, &command, &cwd, &log)
-                })?;
-            }
-
-            let already = self.entry.services.get(&service.name).copied();
-            if let Some(handle) = already {
-                if fresh {
-                    supervise::stop(&handle)?;
-                } else if supervise::is_alive(&handle) {
-                    continue;
-                }
-            }
-
-            // Before starting, not after: the readiness probe cannot tell this service's
-            // answer from another process's on the same port. A reservation is stable
-            // across restarts and nothing re-checks it, so a port that already answers is
-            // held by something else — and a service started on it would die on bind
-            // while grove reported the other process's answers as readiness.
-            if let Some(ready) = &service.ready {
-                let url = render::value(&ready.http, &context)?;
-                if supervise::probe(&url, std::time::Duration::from_secs(1)) {
-                    bail!(
-                        "{} not started: {url} already answers, so its port is already \
-                         in use by another process\n\
-                         `grove ls` names the instances holding ports; anything else \
-                         on that port is not grove's to stop",
-                        service.name
-                    );
-                }
-            }
-
-            let command = render::value(&service.command, &context)
-                .with_context(|| format!("rendering the command for {}", service.name))?;
-            let environment = self.environment()?;
-            let handle =
-                crate::timing::measure(&format!("{}: process start", service.name), || {
-                    supervise::spawn(&command, &cwd, &environment, &log)
-                })?;
-            self.entry.services.insert(service.name.clone(), handle);
-            self.registry.record(&self.entry)?;
-
-            if let Some(ready) = &service.ready {
-                let url = render::value(&ready.http, &context)?;
-                let timeout = parse_duration(&ready.timeout)?;
-                crate::timing::measure(&format!("{}: readiness", service.name), || {
-                    supervise::wait_ready(&handle, &url, timeout).map_err(|why| {
-                        let tail = tail(&log, 30).unwrap_or_default();
-                        match why {
-                            // Spelled out rather than wrapped: "never became ready" reads as
-                            // slow, and a reader waits. This one died, and the tail says why.
-                            supervise::NotReady::Exited { url } => anyhow::anyhow!(
-                                "{} exited before answering on {url}\n\
-                             full output in {}\n{tail}",
-                                service.name,
-                                log.display()
-                            ),
-                            timed_out => anyhow::anyhow!(
-                                "{} never became ready: {timed_out}\nTCP check: {} (observed after timeout)\nfull output in {}\n{tail}",
-                                service.name,
-                                supervise::tcp_observation(&url),
-                                log.display()
-                            ),
-                        }
-                    })
-                })?;
-            }
+        for service in self.config.services.clone() {
+            self.start_service(&service, fresh)?;
+            stopped.remove(&service.name);
         }
 
         Ok(seeded)
+    }
+
+    fn start_service(&mut self, service: &crate::config::Service, fresh: bool) -> Result<()> {
+        let context = self.render_context();
+        let cwd = match &service.cwd {
+            Some(dir) => self.resolved.worktree.join(dir),
+            None => self.resolved.worktree.clone(),
+        };
+        let log = self.instance_dir().join(format!("{}.log", service.name));
+
+        // Before the skip below, not after: a running service is precisely the case
+        // where generated code goes stale unnoticed. Services start in declaration
+        // order and each waits for its readiness probe, so by the time this runs the
+        // services declared above are answering — which is what a generator reading
+        // this worktree's own backend needs.
+        if let Some(prepare) = &service.prepare {
+            let command = render::value(prepare, &context)
+                .with_context(|| format!("rendering prepare for {}", service.name))?;
+            crate::timing::measure(&format!("{}: prepare", service.name), || {
+                self.run_prepare(&service.name, &command, &cwd, &log)
+            })?;
+        }
+
+        let already = self.entry.services.get(&service.name).copied();
+        if let Some(handle) = already {
+            if fresh {
+                supervise::stop(&handle)?;
+            } else if supervise::is_alive(&handle) {
+                return Ok(());
+            }
+        }
+
+        // Before starting, not after: the readiness probe cannot tell this service's
+        // answer from another process's on the same port. A reservation is stable
+        // across restarts and nothing re-checks it, so a port that already answers is
+        // held by something else — and a service started on it would die on bind
+        // while grove reported the other process's answers as readiness.
+        if let Some(ready) = &service.ready {
+            let url = render::value(&ready.http, &context)?;
+            if supervise::probe(&url, std::time::Duration::from_secs(1)) {
+                bail!(
+                    "{} not started: {url} already answers, so its port is already \
+                 in use by another process\n\
+                 `grove ls` names the instances holding ports; anything else \
+                 on that port is not grove's to stop",
+                    service.name
+                );
+            }
+        }
+
+        let command = render::value(&service.command, &context)
+            .with_context(|| format!("rendering the command for {}", service.name))?;
+        let environment = self.environment()?;
+        let handle = crate::timing::measure(&format!("{}: process start", service.name), || {
+            supervise::spawn(&command, &cwd, &environment, &log)
+        })?;
+        self.entry.services.insert(service.name.clone(), handle);
+        self.registry.record(&self.entry)?;
+
+        if let Some(ready) = &service.ready {
+            let url = render::value(&ready.http, &context)?;
+            let timeout = parse_duration(&ready.timeout)?;
+            crate::timing::measure(&format!("{}: readiness", service.name), || {
+                supervise::wait_ready(&handle, &url, timeout).map_err(|why| {
+                    let tail = tail(&log, 30).unwrap_or_default();
+                    match why {
+                        // Spelled out rather than wrapped: "never became ready" reads as
+                        // slow, and a reader waits. This one died, and the tail says why.
+                        supervise::NotReady::Exited { url } => anyhow::anyhow!(
+                            "{} exited before answering on {url}\n\
+                         full output in {}\n{tail}",
+                            service.name,
+                            log.display()
+                        ),
+                        timed_out => anyhow::anyhow!(
+                            "{} never became ready: {timed_out}\nTCP check: {} (observed after timeout)\nfull output in {}\n{tail}",
+                            service.name,
+                            supervise::tcp_observation(&url),
+                            log.display()
+                        ),
+                    }
+                })
+            })?;
+        }
+        Ok(())
+    }
+
+    /// A live process must not retain the dependency tree that this transaction removes.
+    fn replace_install<T>(
+        &mut self,
+        service: &crate::config::Service,
+        built: &Path,
+        stopped: &mut BTreeSet<String>,
+        install: impl FnOnce(&Self) -> Result<T>,
+    ) -> Result<T> {
+        let backups = self.instance_dir().join("dependency-backups");
+        std::fs::create_dir_all(&backups)?;
+        if backups
+            .canonicalize()?
+            .starts_with(self.resolved.worktree.canonicalize()?)
+        {
+            bail!("dependency backups require a Grove state directory outside the worktree");
+        }
+        let backup = backups.join(format!("{}-{}", service.name, std::process::id()));
+        let running = self
+            .entry
+            .services
+            .get(&service.name)
+            .copied()
+            .filter(supervise::is_alive);
+        if let Some(handle) = running {
+            crate::timing::measure(
+                &format!("{}: stop before dependency replacement", service.name),
+                || {
+                    supervise::stop(&handle)?;
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while supervise::is_alive(&handle) && std::time::Instant::now() < deadline {
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    if supervise::is_alive(&handle) {
+                        bail!(
+                            "{} did not stop; dependencies were not replaced",
+                            service.name
+                        );
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        if running.is_some() {
+            stopped.insert(service.name.clone());
+        }
+        (|| {
+            let mut change = InstallChange::begin(built, backup)?;
+            match install(self) {
+                Ok(value) => {
+                    change.commit(&service.name);
+                    Ok(value)
+                }
+                Err(error) => {
+                    if let Err(restore) = change.rollback() {
+                        stopped.remove(&service.name);
+                        return Err(
+                            error.context(format!("dependency rollback failed: {restore:#}"))
+                        );
+                    }
+                    Err(error)
+                }
+            }
+        })()
     }
 
     /// When none of this instance's services is running, nothing should be listening on
@@ -822,12 +931,13 @@ impl Instance {
     /// With a cache declared, "run" may mean linking a tree the store already holds —
     /// a worktree on a lockfile some other worktree installed pays seconds, not minutes.
     fn run_setup(
-        &self,
+        &mut self,
         service: &crate::config::Service,
         setup: &str,
         cwd: &Path,
         log: &Path,
         no_cache: bool,
+        stopped: &mut BTreeSet<String>,
     ) -> Result<SetupOutcome> {
         let name = &service.name;
         let marker = self.instance_dir().join(format!(".setup-{name}"));
@@ -913,13 +1023,12 @@ impl Instance {
             let result: Result<crate::store::Linked> = (|| {
                 let linked = crate::store::link_entry(&store, &hash, &staged)
                     .with_context(|| format!("linking {} from the store", built.display()))?;
-                let change =
+                self.replace_install(service, &built, stopped, |_| {
                     crate::timing::measure(&format!("{name}: dependency replacement"), || {
-                        let change = InstallChange::begin(&built)?;
                         std::fs::rename(&staged, &built)?;
-                        Ok(change)
-                    })?;
-                change.commit(name);
+                        Ok(())
+                    })
+                })?;
                 Ok(linked)
             })();
             if staged.exists() {
@@ -939,8 +1048,8 @@ impl Instance {
             return Ok(SetupOutcome::Linked { hash });
         }
 
-        let change = InstallChange::begin(&built)?;
-        self.run_step(&step, setup, cwd, log)?;
+        let promoted = self.replace_install(service, &built, stopped, |instance| {
+        instance.run_step(&step, setup, cwd, log)?;
         if crate::store::key(cwd, cache, setup)? != hash {
             bail!(
                 "{name}: setup changed its cache key files; refusing to publish dependencies under stale inputs"
@@ -953,7 +1062,8 @@ impl Instance {
             crate::store::promote(&built, &store, &hash)
         })
         .with_context(|| format!("storing {}", built.display()))?;
-        change.commit(name);
+            Ok(promoted)
+        })?;
         eprintln!(
             "{name}: dependencies stored as {hash}{}",
             if promoted.shared {

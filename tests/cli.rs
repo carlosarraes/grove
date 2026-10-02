@@ -3743,17 +3743,18 @@ fn backup_cleanup_failure_warns_without_failing_a_completed_install() {
         // A deterministic filesystem error, without a concurrent writer's timing race.
         std::fs::set_permissions(&protected, std::fs::Permissions::from_mode(0o555)).unwrap();
         let output = cli.run(&wt, &["up"]).get_output().clone();
-        let backup = std::fs::read_dir(&wt)
-            .unwrap()
-            .filter_map(Result::ok)
-            .find(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".node_modules.grove-backup-")
-            })
-            .expect("failed cleanup retains the backup")
-            .path();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let backup = std::path::PathBuf::from(
+            stderr
+                .lines()
+                .find_map(|line| {
+                    line.split_once("backup retained at ")
+                        .and_then(|(_, path)| {
+                            path.strip_suffix(". The new dependencies are ready.")
+                        })
+                })
+                .expect("failed cleanup retains the backup"),
+        );
         // Restore permissions before assertions so fixture cleanup also works on failure.
         std::fs::set_permissions(
             backup.join("protected"),
@@ -3769,6 +3770,13 @@ fn backup_cleanup_failure_warns_without_failing_a_completed_install() {
         assert!(stderr.contains(backup.to_str().unwrap()), "{stderr}");
         phase_seconds(&stderr, "web: old install cleanup", "failed");
         assert!(backup.join("protected/old").exists());
+        common::git(&wt, &["add", "-A"]);
+        let staged = common::git(&wt, &["diff", "--cached", "--name-only"]);
+        assert!(
+            !staged.contains("protected/old"),
+            "retained dependencies must stay out of Git: {staged}"
+        );
+
         assert!(wt.join("node_modules/blob").exists());
         assert!(service_pid(&cli, &wt, "web") > 0);
         let entry = registry_of(&cli).get(&wt).unwrap().unwrap();
@@ -3776,6 +3784,185 @@ fn backup_cleanup_failure_warns_without_failing_a_completed_install() {
         let retry = cli.run(&wt, &["up"]).success().get_output().clone();
         assert!(!String::from_utf8_lossy(&retry.stderr).contains("tree creation"));
         assert_eq!(installs(&cli), 1);
+    }
+}
+
+// Pin a directory descriptor like a watcher with in-flight cache operations. The
+// writer records whether its original tree still existed when TERM arrived.
+fn writer_fixture() -> Cli {
+    let config = CACHE_CONFIG.replace(
+        "mkdir -p node_modules && head -c 1048576 /dev/zero > node_modules/blob && echo installed >> ../installs.log",
+        "python3 setup.py",
+    ).replace("python3 -u -m http.server {{ port.web }}", "exec python3 writer.py {{ port.web }}");
+    let cli = Cli::with_config(&config);
+    with_lockfile(&cli, "old");
+    std::fs::write(
+        cli.fx.main.join("setup.py"),
+        r#"
+from pathlib import Path
+import time
+assert not Path('writer.running').exists(), 'live writer during install'
+Path('node_modules/.vite').mkdir(parents=True)
+Path('node_modules/version').write_text(Path('package-lock.json').read_text())
+if Path('fail-install').exists():
+    raise RuntimeError('deliberate install failure')
+"#,
+    )
+    .unwrap();
+    std::fs::write(cli.fx.main.join("writer.py"), r#"
+import http.server, os, signal, sys, threading, time
+from pathlib import Path
+root = Path.cwd()
+version = Path('node_modules/version').read_text()
+fd = os.open('node_modules/.vite', os.O_RDONLY)
+Path('writer.running').write_text(str(os.getpid()))
+def stop(*args):
+    with open(root / 'stops', 'a') as log:
+        log.write(version + ':' + str((root / 'node_modules/version').read_text() == version) + '\n')
+    (root / 'writer.running').unlink(missing_ok=True)
+    os._exit(0)
+signal.signal(signal.SIGTERM, stop)
+def write():
+    while True:
+        f = os.open('writer', os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600, dir_fd=fd)
+        os.write(f, version.encode())
+        os.close(f)
+        time.sleep(0.005)
+threading.Thread(target=write, daemon=True).start()
+Path('served-version').write_text(version)
+http.server.HTTPServer(('127.0.0.1', int(sys.argv[1])), http.server.SimpleHTTPRequestHandler).serve_forever()
+"#).unwrap();
+    common::git(&cli.fx.main, &["add", "setup.py", "writer.py"]);
+    common::git(&cli.fx.main, &["commit", "-m", "add dependency writer"]);
+    cli
+}
+
+#[test]
+fn dependency_refresh_stops_real_writer_before_swap_and_restarts_on_new_tree() {
+    for warm in [false, true] {
+        let cli = writer_fixture();
+        let wt = cli.worktree("writer");
+        cli.run(&wt, &["up"]).success();
+        let old = service_pid(&cli, &wt, "web");
+        cli.run(&wt, &["up"]).success();
+        assert_eq!(
+            service_pid(&cli, &wt, "web"),
+            old,
+            "unchanged setup must keep its process"
+        );
+        if warm {
+            let prime = cli.worktree("prime");
+            std::fs::write(prime.join("package-lock.json"), "new").unwrap();
+            cli.run(&prime, &["up"]).success();
+        }
+        std::fs::write(wt.join("package-lock.json"), "new").unwrap();
+        cli.run(&wt, &["up"]).success();
+        assert_ne!(service_pid(&cli, &wt, "web"), old);
+        assert_eq!(
+            std::fs::read_to_string(wt.join("stops")).unwrap(),
+            "old:True\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join("served-version")).unwrap(),
+            "new"
+        );
+    }
+}
+
+#[test]
+fn dependency_refresh_failure_restores_tree_and_recovers_real_writer() {
+    let cli = writer_fixture();
+    let wt = cli.worktree("recover");
+    cli.run(&wt, &["up"]).success();
+    let old = service_pid(&cli, &wt, "web");
+    std::fs::write(wt.join("package-lock.json"), "new").unwrap();
+    std::fs::write(wt.join("fail-install"), "").unwrap();
+    cli.run(&wt, &["up"]).failure();
+    assert_ne!(
+        service_pid(&cli, &wt, "web"),
+        old,
+        "the recovered writer needs a new process"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("node_modules/version")).unwrap(),
+        "old"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("stops")).unwrap(),
+        "old:True\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("served-version")).unwrap(),
+        "old"
+    );
+}
+
+fn spawn_start(cli: &Cli, wt: &Path, command: &str) -> std::process::Child {
+    std::process::Command::new(assert_cmd::cargo::cargo_bin!("grove"))
+        .current_dir(wt)
+        .env("GROVE_STATE_DIR", cli.state.path())
+        .env("GROVE_CACHE_DIR", cli.state.path().join("store"))
+        .env("GROVE_PORT_RANGE", cli.port_range())
+        .env_remove("GROVE_MACOS_CLONE")
+        .arg(command)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+#[test]
+fn concurrent_up_waits_through_prepare_and_reuses_the_started_service() {
+    for command in ["up", "restart"] {
+        let config = CACHE_CONFIG.replace(
+            "[[service]]",
+            "[[service]]\nprepare = \"python3 prepare.py\"",
+        );
+        let cli = Cli::with_config(&config);
+        with_lockfile(&cli, "concurrent");
+        std::fs::write(
+            cli.fx.main.join("prepare.py"),
+            r#"
+from pathlib import Path
+import time
+with open('entered', 'a') as f:
+    f.write('prepare\n')
+end = time.monotonic() + 15
+while not Path('release').exists() and time.monotonic() < end:
+    time.sleep(0.01)
+assert Path('release').exists(), 'test never released prepare'
+"#,
+        )
+        .unwrap();
+        common::git(&cli.fx.main, &["add", "prepare.py"]);
+        common::git(&cli.fx.main, &["commit", "-m", "add gated prepare"]);
+        let wt = cli.worktree("concurrent");
+        let first = spawn_start(&cli, &wt, "up");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !wt.join("entered").exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let second = spawn_start(&cli, &wt, command);
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let entries = std::fs::read_to_string(wt.join("entered")).unwrap();
+        std::fs::write(wt.join("release"), "").unwrap();
+        let first = first.wait_with_output().unwrap();
+        let second = second.wait_with_output().unwrap();
+        assert_eq!(
+            entries, "prepare\n",
+            "second up must wait for the whole first up"
+        );
+        assert!(
+            first.status.success(),
+            "{}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        assert!(
+            second.status.success(),
+            "{}",
+            String::from_utf8_lossy(&second.stderr)
+        );
+        assert!(service_pid(&cli, &wt, "web") > 0);
     }
 }
 

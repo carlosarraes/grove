@@ -99,7 +99,7 @@ pub enum ResourceKind {
     DockerShared,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Service {
     pub name: String,
@@ -124,14 +124,14 @@ pub struct Service {
 /// `path` is what `setup` leaves behind, `key` the files that determine its contents —
 /// both relative to the service's cwd. Two worktrees whose key files match byte for
 /// byte get one tree, hardlinked into each.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Cache {
     pub path: String,
     pub key: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Ready {
     /// URL polled until it answers.

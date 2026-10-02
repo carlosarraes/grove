@@ -18,7 +18,7 @@ pub struct Instance {
     pub entry: Entry,
     registry: Registry,
     state_dir: PathBuf,
-    recently_started_resources: BTreeSet<String>,
+    recently_created_resources: BTreeSet<String>,
     /// The mode used by rendering and commands in this process. It starts at the
     /// persisted mode, but `up` can target a new one before committing the transition.
     target_exposure: Exposure,
@@ -209,7 +209,7 @@ fn seed_decision(
     stored: Option<&StoredSeedMarker>,
     command: &str,
     current_resources: &BTreeMap<String, String>,
-    recently_started: &BTreeSet<String>,
+    recently_created: &BTreeSet<String>,
     force: bool,
 ) -> SeedDecision {
     if force {
@@ -226,7 +226,7 @@ fn seed_decision(
                     why: Some("command changed".to_string()),
                 };
             }
-            match recently_started.iter().next() {
+            match recently_created.iter().next() {
                 Some(name) => SeedDecision::Run {
                     why: Some(format!("resource {name} was recreated")),
                 },
@@ -239,7 +239,7 @@ fn seed_decision(
                     why: Some("command changed".to_string()),
                 };
             }
-            if let Some(name) = recently_started.iter().next() {
+            if let Some(name) = recently_created.iter().next() {
                 return SeedDecision::Run {
                     why: Some(format!("resource {name} was recreated")),
                 };
@@ -346,7 +346,7 @@ impl Instance {
             entry,
             registry,
             state_dir,
-            recently_started_resources: BTreeSet::new(),
+            recently_created_resources: BTreeSet::new(),
             target_exposure,
         };
 
@@ -517,9 +517,12 @@ impl Instance {
     pub fn resources(&mut self) -> Result<Vec<String>> {
         let mut started = Vec::new();
         for resource in &self.config.resources {
-            if crate::resource::ensure(resource)?.started {
+            let result = crate::resource::ensure(resource)?;
+            if result.started {
                 started.push(resource.name.clone());
-                self.recently_started_resources
+            }
+            if result.created {
+                self.recently_created_resources
                     .insert(resource.name.clone());
             }
         }
@@ -597,7 +600,7 @@ impl Instance {
                 stored.as_ref(),
                 &command,
                 &current_resources,
-                &self.recently_started_resources,
+                &self.recently_created_resources,
                 force,
             );
             if matches!(decision, SeedDecision::Skip) {

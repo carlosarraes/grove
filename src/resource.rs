@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
@@ -20,6 +21,16 @@ pub struct ContainerObservation {
     pub running: bool,
     pub exit_code: i64,
     pub nofile: Option<(u64, u64)>,
+    pub image: Option<String>,
+    pub port_bindings: BTreeMap<String, Option<Vec<PortBinding>>>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct PortBinding {
+    #[serde(rename = "HostIp")]
+    pub host_ip: String,
+    #[serde(rename = "HostPort")]
+    pub host_port: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,6 +43,7 @@ pub struct Observation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnsureResult {
     pub started: bool,
+    pub created: bool,
     pub observation: Observation,
 }
 
@@ -129,6 +141,7 @@ pub fn ensure(resource: &Resource) -> Result<EnsureResult> {
     match decide(resource) {
         Decision::Reuse { .. } => Ok(EnsureResult {
             started: false,
+            created: false,
             observation: observe(resource),
         }),
         Decision::Start(argv) => {
@@ -139,13 +152,41 @@ pub fn ensure(resource: &Resource) -> Result<EnsureResult> {
                     resource.name
                 );
             }
-            docker(&argv).with_context(|| {
-                format!(
-                    "starting `{}` on port {}. If you provide {} yourself, start it and \
+            let existing = observe(resource);
+            if existing.reachable {
+                return Ok(EnsureResult {
+                    started: false,
+                    created: false,
+                    observation: existing,
+                });
+            }
+            if let Some(error) = existing.docker_error {
+                bail!(
+                    "cannot inspect `{}` before starting it: {error}",
+                    container_name(resource)
+                );
+            }
+            let command = match &existing.container {
+                Some(container) => {
+                    validate_existing(resource, container)?;
+                    if container.running {
+                        // Another up can have started it before the port becomes ready.
+                        None
+                    } else {
+                        Some(vec!["start".to_string(), container.id.clone()])
+                    }
+                }
+                None => Some(argv),
+            };
+            if let Some(command) = &command {
+                docker(command).with_context(|| {
+                    format!(
+                        "starting `{}` on port {}. If you provide {} yourself, start it and \
                      run `grove up` again.",
-                    resource.name, resource.port, resource.name
-                )
-            })?;
+                        resource.name, resource.port, resource.name
+                    )
+                })?;
+            }
             wait_reachable(resource)?;
 
             if let Some(init) = &resource.init {
@@ -162,11 +203,45 @@ pub fn ensure(resource: &Resource) -> Result<EnsureResult> {
                 ]);
             }
             Ok(EnsureResult {
-                started: true,
+                started: command.is_some(),
+                created: existing.container.is_none(),
                 observation: observe(resource),
             })
         }
     }
+}
+
+fn validate_existing(resource: &Resource, container: &ContainerObservation) -> Result<()> {
+    if container.image.as_deref() != resource.image.as_deref() {
+        bail!(
+            "existing container `{}` image does not match configured image; preserve its data and reconcile the resource configuration",
+            container_name(resource)
+        );
+    }
+    let key = format!("{}/tcp", resource.port);
+    let expected_port = resource.port.to_string();
+    let bindings = container.port_bindings.get(&key).and_then(Option::as_ref);
+    let matches = container.port_bindings.len() == 1
+        && bindings.is_some_and(|bindings| {
+            bindings
+                .iter()
+                .any(|binding| matches!(binding.host_ip.as_str(), "" | "0.0.0.0" | "127.0.0.1"))
+                && bindings.iter().all(|binding| {
+                    binding.host_port == expected_port
+                        && matches!(
+                            binding.host_ip.as_str(),
+                            "" | "0.0.0.0" | "127.0.0.1" | "::" | "::1"
+                        )
+                })
+        });
+    if !matches {
+        bail!(
+            "existing container `{}` port binding does not match configured port {}; preserve its data and reconcile the resource configuration",
+            container_name(resource),
+            resource.port
+        );
+    }
+    Ok(())
 }
 
 fn wait_reachable(resource: &Resource) -> Result<()> {
@@ -263,6 +338,14 @@ struct DockerInspect {
     state: DockerState,
     #[serde(rename = "HostConfig")]
     host_config: DockerHostConfig,
+    #[serde(rename = "Config", default)]
+    config: Option<DockerConfig>,
+}
+
+#[derive(Deserialize)]
+struct DockerConfig {
+    #[serde(rename = "Image")]
+    image: String,
 }
 
 #[derive(Deserialize)]
@@ -277,6 +360,8 @@ struct DockerState {
 struct DockerHostConfig {
     #[serde(rename = "Ulimits", default)]
     ulimits: Option<Vec<DockerUlimit>>,
+    #[serde(rename = "PortBindings", default)]
+    port_bindings: Option<BTreeMap<String, Option<Vec<PortBinding>>>>,
 }
 
 #[derive(Deserialize)]
@@ -306,6 +391,8 @@ fn parse_inspect(json: &str) -> Result<Option<ContainerObservation>> {
         running: inspected.state.running,
         exit_code: inspected.state.exit_code,
         nofile,
+        image: inspected.config.map(|config| config.image),
+        port_bindings: inspected.host_config.port_bindings.unwrap_or_default(),
     }))
 }
 

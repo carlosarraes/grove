@@ -4539,3 +4539,192 @@ fn cancelling_heavy_admission_never_starts_the_child() {
     assert!(waiting, "expected admission wait, got {line}");
     assert!(!wt.join("ran").exists());
 }
+
+fn stopped_resource_fixture(port: u16, image: &str, bindings: serde_json::Value) -> Cli {
+    let cli = Cli::with_fake_docker(
+        &resource_seed_config(port, "echo seed >> seeded.log"),
+        "stopped-resource",
+    );
+    let docker = cli.docker.as_ref().expect("docker");
+    let inspect = serde_json::json!([{
+        "Id": "stopped-resource",
+        "State": {"Running": false, "ExitCode": 137},
+        "Config": {"Image": image},
+        "HostConfig": {"Ulimits": [], "PortBindings": bindings}
+    }]);
+    std::fs::write(&docker.inspect, inspect.to_string()).expect("inspect fixture");
+    std::fs::write(
+        &docker.program,
+        r#"#!/bin/sh
+root=$(dirname "$GROVE_DOCKER_INSPECT")
+printf '%s\n' "$*" >> "$root/docker-calls"
+case "$1" in
+  inspect) cat "$GROVE_DOCKER_INSPECT" ;;
+  start)
+    if [ -f "$root/fail-start" ]; then echo 'start failed deliberately' >&2; exit 42; fi
+    touch "$root/start-requested"
+    i=0
+    while [ ! -f "$root/port-ready" ] && [ "$i" -lt 500 ]; do
+      sleep 0.01; i=$((i + 1))
+    done
+    test -f "$root/port-ready"
+    ;;
+  run) echo 'unexpected replacement container' >&2; exit 91 ;;
+  *) exit 0 ;;
+esac
+"#,
+    )
+    .expect("docker script");
+    cli
+}
+
+#[test]
+fn up_restarts_a_compatible_stopped_resource_without_recreating_it() {
+    let reservation = TcpListener::bind("127.0.0.1:0").expect("reserve port");
+    let port = reservation.local_addr().expect("address").port();
+    let bindings = serde_json::json!({format!("{port}/tcp"): [
+        {"HostIp": "", "HostPort": port.to_string()}
+    ]});
+    let cli = stopped_resource_fixture(port, "mongo:8", bindings);
+    let wt = cli.worktree("resource_recovery");
+    cli.run(&wt, &["up"]).success();
+    let root = cli.state.path().to_path_buf();
+    let (stop, stopped) = std::sync::mpsc::channel();
+    drop(reservation);
+    let server = std::thread::spawn(move || {
+        while !root.join("start-requested").exists() {
+            match stopped.recv_timeout(std::time::Duration::from_millis(10)) {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                _ => return,
+            }
+        }
+        let _listener = TcpListener::bind(("127.0.0.1", port)).expect("resource port");
+        std::fs::write(root.join("port-ready"), "ready").expect("ready");
+        let _ = stopped.recv_timeout(std::time::Duration::from_secs(15));
+    });
+    let result = cli.run(&wt, &["up"]);
+    let _ = stop.send(());
+    server.join().expect("server");
+    result.success();
+    assert_eq!(
+        std::fs::read_to_string(wt.join("seeded.log")).expect("seed count"),
+        "seed\n"
+    );
+    let calls = std::fs::read_to_string(cli.state.path().join("docker-calls")).expect("calls");
+    assert!(
+        calls.lines().any(|line| line == "start stopped-resource"),
+        "{calls}"
+    );
+    assert!(
+        !calls.lines().any(|line| line.starts_with("run ")),
+        "{calls}"
+    );
+}
+
+#[test]
+fn up_refuses_stopped_resources_with_a_different_image_or_port_binding() {
+    for (image, bindings) in [
+        (
+            "mongo:7",
+            serde_json::json!({"0/tcp": [{"HostIp":"", "HostPort":"0"}]}),
+        ),
+        (
+            "mongo:8",
+            serde_json::json!({"0/tcp": [{"HostIp":"", "HostPort":"1234"}]}),
+        ),
+        (
+            "mongo:8",
+            serde_json::json!({"1234/tcp": [{"HostIp":"", "HostPort":"0"}]}),
+        ),
+        (
+            "mongo:8",
+            serde_json::json!({"0/tcp": [{"HostIp":"192.0.2.1", "HostPort":"0"}]}),
+        ),
+    ] {
+        let cli = stopped_resource_fixture(0, image, bindings);
+        let wt = cli.worktree("resource_mismatch");
+        let result = cli.run(&wt, &["up"]).failure();
+        let stderr = String::from_utf8_lossy(&result.get_output().stderr);
+        assert!(stderr.contains("does not match"), "{stderr}");
+        let calls = std::fs::read_to_string(cli.state.path().join("docker-calls")).expect("calls");
+        assert!(
+            !calls
+                .lines()
+                .any(|line| line.starts_with("start ") || line.starts_with("run ")),
+            "{calls}"
+        );
+    }
+}
+
+#[test]
+fn failed_resource_restart_does_not_create_a_replacement() {
+    let cli = stopped_resource_fixture(
+        0,
+        "mongo:8",
+        serde_json::json!({
+            "0/tcp": [{"HostIp":"", "HostPort":"0"}]
+        }),
+    );
+    std::fs::write(cli.state.path().join("fail-start"), "fail").expect("failure mode");
+    let wt = cli.worktree("resource_start_failure");
+    let result = cli.run(&wt, &["up"]).failure();
+    let stderr = String::from_utf8_lossy(&result.get_output().stderr);
+    assert!(stderr.contains("start failed deliberately"), "{stderr}");
+    let calls = std::fs::read_to_string(cli.state.path().join("docker-calls")).expect("calls");
+    assert!(
+        !calls.lines().any(|line| line.starts_with("run ")),
+        "{calls}"
+    );
+}
+
+#[test]
+fn resource_inspect_failure_never_creates_or_starts_a_container() {
+    let cli = stopped_resource_fixture(0, "mongo:8", serde_json::json!({}));
+    cli.docker.as_ref().unwrap().set_unreadable_inspect();
+    let wt = cli.worktree("inspect_failure");
+    cli.run(&wt, &["up"]).failure();
+    let calls = std::fs::read_to_string(cli.state.path().join("docker-calls")).unwrap();
+    assert!(
+        calls.lines().all(|line| line.starts_with("inspect ")),
+        "{calls}"
+    );
+}
+
+#[test]
+fn running_resource_waits_for_its_port_without_starting_it_again() {
+    let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = reservation.local_addr().unwrap().port();
+    let cli = stopped_resource_fixture(
+        port,
+        "mongo:8",
+        serde_json::json!({format!("{port}/tcp"): [{"HostIp":"127.0.0.1", "HostPort":port.to_string()}]}),
+    );
+    let docker = cli.docker.as_ref().unwrap();
+    let mut fixture: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&docker.inspect).unwrap()).unwrap();
+    fixture[0]["State"]["Running"] = true.into();
+    std::fs::write(&docker.inspect, fixture.to_string()).unwrap();
+    let root = cli.state.path().to_owned();
+    let (stop, stopped) = std::sync::mpsc::channel();
+    drop(reservation);
+    let server = std::thread::spawn(move || {
+        while !root.join("docker-calls").exists() {
+            match stopped.recv_timeout(std::time::Duration::from_millis(10)) {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                _ => return,
+            }
+        }
+        let _listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let _ = stopped.recv_timeout(std::time::Duration::from_secs(15));
+    });
+    let wt = cli.worktree("running_resource");
+    let result = cli.run(&wt, &["up"]);
+    let _ = stop.send(());
+    server.join().unwrap();
+    result.success();
+    let calls = std::fs::read_to_string(cli.state.path().join("docker-calls")).unwrap();
+    assert!(
+        calls.lines().all(|line| line.starts_with("inspect ")),
+        "{calls}"
+    );
+}

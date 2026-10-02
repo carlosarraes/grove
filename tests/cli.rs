@@ -876,11 +876,9 @@ fn doctor_warns_when_a_managed_resource_has_an_old_limit() {
 
 #[test]
 fn doctor_explains_a_stopped_managed_resource() {
-    let port = TcpListener::bind("127.0.0.1:0")
-        .expect("find port")
-        .local_addr()
-        .expect("address")
-        .port();
+    // Binding port zero allocates a nonzero port, so no listener can own this
+    // destination. An ephemeral port released here can be reused by another test.
+    let port = 0;
     let cli = Cli::with_fake_docker(
         &resource_seed_config(port, "true"),
         "stopped-container-abcdef",

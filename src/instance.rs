@@ -482,7 +482,7 @@ impl Instance {
             };
             let name = render::value(template, &bare)
                 .with_context(|| format!("rendering db_name {template:?}"))?;
-            self.entry.db_name = Some(name);
+            self.entry.db_name = Some(bounded_database_name(&name));
             // Recorded now, while the config that names the datastore is still readable.
             // `prune` needs it after the worktree has been deleted.
             self.entry.db_resource = Some(crate::registry::DbResource {
@@ -1325,6 +1325,23 @@ fn setup_identity(service: &crate::config::Service, setup: &str, cwd: &Path) -> 
         bytes.hash(&mut hash);
     }
     Ok(format!("setup-inputs-v1:{:016x}", hash.finish()))
+}
+
+// Keep valid existing names unchanged. Hash the full rendered name, including the slug.
+fn bounded_database_name(name: &str) -> String {
+    const LIMIT: usize = 63;
+    if name.len() <= LIMIT {
+        return name.to_owned();
+    }
+    // FNV-1a has a stable byte representation across processes and Grove versions.
+    let hash = name.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    });
+    let mut end = LIMIT - 17; // Separator plus sixteen hexadecimal digits.
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}_{hash:016x}", &name[..end])
 }
 
 #[cfg(test)]

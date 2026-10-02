@@ -4728,3 +4728,76 @@ fn running_resource_waits_for_its_port_without_starting_it_again() {
         "{calls}"
     );
 }
+
+#[test]
+fn long_database_names_are_bounded_stable_and_used_by_seed_env_and_registry() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("database listener");
+    let port = listener.local_addr().expect("address").port();
+    let config = format!(
+        r#"
+version = 1
+[[resource]]
+name = "mongo"
+kind = "docker-shared"
+port = {port}
+db_name = "app_{{{{ slug }}}}"
+[[secrets]]
+from = "backend/.env.local"
+into = "backend/.env.local"
+[secrets.set]
+DATABASE_NAME = "{{{{ db.name }}}}"
+[[seed]]
+name = "record"
+command = "printf '%s' '{{{{ db.name }}}}' > seed-db.txt"
+"#
+    );
+    let cli = Cli::with_config(&config);
+    let long_prefix = "feature_".to_owned() + &"long_branch_".repeat(6);
+    let slugs = [
+        "x".repeat(59),
+        "x".repeat(60),
+        format!("{long_prefix}a"),
+        format!("{long_prefix}b"),
+    ];
+    let mut names = Vec::new();
+    for slug in &slugs {
+        let wt = cli.worktree(slug);
+        cli.run(&wt, &["up"]).success();
+        let entry = registry_of(&cli)
+            .get(&wt)
+            .expect("registry")
+            .expect("instance");
+        let name = entry.db_name.expect("database name");
+        assert!(name.len() <= 63, "{} bytes: {name}", name.len());
+        if slug.len() == 59 {
+            assert_eq!(name, format!("app_{slug}"));
+        }
+        assert_eq!(
+            std::fs::read_to_string(wt.join("seed-db.txt")).expect("seed output"),
+            name
+        );
+        let env = std::fs::read_to_string(wt.join("backend/.env.local")).expect("rendered env");
+        assert!(
+            env.lines()
+                .any(|line| line == format!("DATABASE_NAME={name}")),
+            "database env differs"
+        );
+        cli.run(&wt, &["up"]).success();
+        assert_eq!(
+            registry_of(&cli)
+                .get(&wt)
+                .expect("registry")
+                .expect("instance")
+                .db_name
+                .as_deref(),
+            Some(name.as_str())
+        );
+        names.push(name);
+    }
+    let unique: std::collections::BTreeSet<_> = names.iter().collect();
+    assert_eq!(
+        unique.len(),
+        names.len(),
+        "long names share a truncated prefix but must differ"
+    );
+}

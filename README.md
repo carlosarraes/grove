@@ -306,9 +306,13 @@ just check     # fmt, clippy, tests, packaging
 just release 0.1.7
 ```
 
-## Resource recovery
+## Resource recovery and database names
 
 If a datastore port does not answer, Grove inspects its named container before it creates one.
 A stopped container restarts by ID only when its configured image and published ports match the resource.
 A mismatch or inspection error stops `up` without replacing the container or deleting its data.
 An existing running container gets the normal readiness wait. A reachable external datastore still needs no managed container.
+
+Rendered database names longer than 63 bytes use a shortened prefix and a stable 16-digit hash of the full name.
+Names at or below the limit stay unchanged. Grove uses the same bounded name in generated environment files, seeds and the registry.
+The instance slug, service paths and port allocation stay unchanged.

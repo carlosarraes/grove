@@ -780,8 +780,10 @@ impl Instance {
                                 log.display()
                             ),
                             timed_out => anyhow::anyhow!(
-                                "{} never became ready: {timed_out}\n{tail}",
-                                service.name
+                                "{} never became ready: {timed_out}\nTCP check: {} (observed after timeout)\nfull output in {}\n{tail}",
+                                service.name,
+                                supervise::tcp_observation(&url),
+                                log.display()
                             ),
                         }
                     })

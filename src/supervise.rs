@@ -132,6 +132,60 @@ pub fn probe(url: &str, timeout: Duration) -> bool {
     )
 }
 
+/// A bounded observation made after HTTP readiness fails, not a diagnosis of the app.
+pub fn tcp_observation(url: &str) -> &'static str {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let Ok(uri) = url.parse::<ureq::http::Uri>() else {
+        return "unknown (invalid URL)";
+    };
+    let Some(host) = uri.host() else {
+        return "unknown (missing host)";
+    };
+    let host = host.trim_matches(['[', ']']).to_owned();
+    let port = uri
+        .port_u16()
+        .unwrap_or(if uri.scheme_str() == Some("https") {
+            443
+        } else {
+            80
+        });
+    let budget = Duration::from_secs(1);
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + budget;
+        let result = match (host.as_str(), port).to_socket_addrs() {
+            Err(_) => "unknown (name resolution failed)",
+            Ok(addresses) => {
+                let mut result = "unknown (no addresses)";
+                for address in addresses {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        result = "unknown (TCP check timed out)";
+                        break;
+                    }
+                    match TcpStream::connect_timeout(&address, remaining) {
+                        Ok(_) => {
+                            result = "accepted (HTTP readiness failed)";
+                            break;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                            if result == "unknown (no addresses)" {
+                                result = "refused";
+                            }
+                        }
+                        Err(_) => result = "unknown (connection failed or timed out)",
+                    }
+                }
+                result
+            }
+        };
+        let _ = send.send(result);
+    });
+    receive
+        .recv_timeout(budget)
+        .unwrap_or("unknown (TCP check timed out)")
+}
+
 /// Why a service did not become ready. Two variants because they call for different
 /// reactions: a timeout means wait longer or read the log, an exit means the port was
 /// never this service's to answer on.

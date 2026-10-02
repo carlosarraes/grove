@@ -4071,3 +4071,34 @@ fn doctor_rejects_a_readiness_probe_without_an_explicit_timeout() {
     assert!(String::from_utf8_lossy(&output).contains("missing field `timeout`"));
 }
 
+#[test]
+fn readiness_timeout_names_the_log_and_observes_tcp_acceptance() {
+    for (command, accepted) in [
+        ("sleep 60", false),
+        (
+            "python3 -u -c 'import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind((\"127.0.0.1\",{{ port.web }})); s.listen(128); print(\"listening without HTTP\"); time.sleep(60)'",
+            true,
+        ),
+    ] {
+        let config = format!(
+            "version = 1\n[ports]\nnames = ['web']\n[[service]]\nname = 'web'\ncommand = '''{command}'''\nready = {{http = 'http://localhost:{{{{ port.web }}}}/', timeout = '2s'}}\n"
+        );
+        let cli = Cli::with_config(&config);
+        let wt = cli.worktree("timeout");
+        let output = cli.run(&wt, &["up"]).failure().get_output().stderr.clone();
+        let error = String::from_utf8_lossy(&output);
+        let entry = registry_of(&cli).get(&wt).unwrap().unwrap();
+        let log = entry.instance_dir.unwrap().join("web.log");
+        assert!(
+            error.contains(&format!("full output in {}", log.display())),
+            "{error}"
+        );
+        let expected = if accepted {
+            "TCP check: accepted"
+        } else {
+            "TCP check: refused"
+        };
+        assert!(error.contains(expected), "{error}");
+    }
+}
+

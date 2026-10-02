@@ -289,3 +289,21 @@ fn setup_inputs_reject_ambiguous_or_invalid_declarations() {
         assert!(error.contains(expected), "{error}");
     }
 }
+
+#[test]
+fn admission_config_rejects_invalid_limits() {
+    for fields in [
+        "max_load = 0",
+        "max_load = -1",
+        "max_load = nan",
+        "max_load = inf",
+        "timeout = '0s'",
+        "timeout = 'later'",
+        "timeout = '18446744073709551615d'",
+    ] {
+        let error =
+            grove::config::parse(&format!("version = 1\n[admission]\n{fields}\n")).unwrap_err();
+        assert!(format!("{error:#}").contains("admission"), "{error:#}");
+    }
+    assert!(grove::config::parse("version = 1\n[admission]\nmax_load = 12.5").is_ok());
+}

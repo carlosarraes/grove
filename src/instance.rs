@@ -1294,7 +1294,10 @@ pub fn parse_duration(text: &str) -> Result<std::time::Duration> {
         .trim()
         .parse()
         .with_context(|| format!("{text:?} is not a duration like \"180s\""))?;
-    Ok(std::time::Duration::from_millis(amount * multiplier))
+    let milliseconds = amount
+        .checked_mul(multiplier)
+        .with_context(|| format!("{text:?} is too large a duration"))?;
+    Ok(std::time::Duration::from_millis(milliseconds))
 }
 
 /// Keep uncached installs local while tracking the files that decide their contents.

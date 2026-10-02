@@ -165,6 +165,14 @@ needed data, then deliberately remove and recreate that container.
   if_exists          skip unless this path exists, relative to cwd -- for a fixture
                      that may not have been fetched
 
+  [admission]        optional; used only by `grove run --heavy -- <command>`
+    max_load         positive finite number; omit to use available core count
+    timeout          positive duration, default "10m"; covers admission only
+                     Waits for one-minute load strictly below max_load. Samples every
+                     2s, prints wait status every 15s. Timeout or unreadable load fails
+                     without a child. Plain run does not wait. Keep fleetlock's slot
+                     limit: load averages lag and do not measure memory or reserve capacity.
+
   [idle]             optional; opt in to stopping forgotten instances
   stop_after         e.g. "2h". Every `grove up` for this repo first stops its sibling
                      instances nobody has touched for this long, ports kept, and says

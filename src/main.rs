@@ -154,6 +154,9 @@ enum Command {
     },
     /// Run a command with this instance's environment overlaid
     Run {
+        /// Wait for load below the admission threshold before starting the command
+        #[arg(long)]
+        heavy: bool,
         #[arg(trailing_var_arg = true, required = true)]
         argv: Vec<String>,
     },
@@ -430,9 +433,13 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Some(Command::Run { argv }) => {
+        Some(Command::Run { argv, heavy }) => {
             let instance = Instance::open(&cwd)?;
             instance.touch()?;
+            if heavy {
+                load::wait_for_admission(&instance.config.admission.clone().unwrap_or_default())?;
+                instance.touch()?;
+            }
             let status = std::process::Command::new(&argv[0])
                 .args(&argv[1..])
                 .current_dir(&cwd)

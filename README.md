@@ -157,6 +157,32 @@ repo's own fixture or settings constructor.
 | `prune` | stop and forget instances whose worktree is gone |
 | `doctor` | check everything needed to start, and say what to fix |
 
+## Admit heavy commands by load
+
+`grove run --heavy -- <command>` waits until the one-minute load is below the available
+core count. Plain `grove run` does not wait. This flag does not start services or MongoDB.
+The child receives the normal instance environment and keeps its exit code.
+
+The optional root-level config section sets the threshold and admission timeout:
+
+```toml
+[admission]
+max_load = 10.0  # omit to use the available core count
+timeout = "10m"
+```
+
+The threshold must be positive and finite. The timeout must be greater than zero.
+
+Grove samples every two seconds and prints the load, threshold, and elapsed wait.
+It prints another wait message every 15 seconds, then reports admission or timeout.
+Timeout or an unreadable load fails without a child process. Ctrl-C cancels the wait.
+The timeout applies to admission, not command execution.
+
+Load averages lag behind new work and do not measure free memory. Keep fleetlock's
+concurrency limit. Use the order `fleetlock slot -> grove admission -> command`.
+A fleetlock hold cap can include the admission wait. Account for both budgets before
+changing the number of slots. This flag provides neither FIFO ordering nor a slot reservation.
+
 ## Refresh dependencies
 
 After a lockfile change, run `grove up`. Existing worktrees check their cache inputs

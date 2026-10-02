@@ -24,6 +24,24 @@ pub struct Config {
     /// How long an instance of this repo may run untouched before the next `grove up`
     /// stops it. Opt-in: without it, `up` only warns about the pile-up.
     pub idle: Option<Idle>,
+    pub admission: Option<Admission>,
+}
+
+/// Optional limits for `run --heavy`; ordinary commands do not wait.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Admission {
+    pub max_load: Option<f64>,
+    pub timeout: String,
+}
+
+impl Default for Admission {
+    fn default() -> Self {
+        Self {
+            max_load: None,
+            timeout: "10m".to_string(),
+        }
+    }
 }
 
 /// The pile-up forms one agent at a time, and `up` is the one moment the agent adding to
@@ -185,6 +203,19 @@ pub fn parse(text: &str) -> Result<Config> {
 
 impl Config {
     fn validate(&self) -> Result<()> {
+        if let Some(admission) = &self.admission {
+            if admission
+                .max_load
+                .is_some_and(|limit| !limit.is_finite() || limit <= 0.0)
+            {
+                anyhow::bail!("[admission] max_load must be positive and finite");
+            }
+            let timeout = crate::instance::parse_duration(&admission.timeout)
+                .context("[admission] timeout")?;
+            if timeout.is_zero() {
+                anyhow::bail!("[admission] timeout must be greater than zero");
+            }
+        }
         if let Some(idle) = &self.idle {
             crate::instance::parse_duration(&idle.stop_after)
                 .with_context(|| format!("[idle] stop_after = {:?}", idle.stop_after))?;

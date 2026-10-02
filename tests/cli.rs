@@ -4454,3 +4454,88 @@ fn up_logs_keep_the_newest_fifty_without_deleting_active_or_unrelated_files() {
     assert!(!dir.join("0-123.log").exists());
     assert_eq!(std::fs::read_dir(dir).unwrap().count(), 51);
 }
+
+#[test]
+fn heavy_run_admission_controls_child_start_and_preserves_its_exit_code() {
+    let cases = [
+        (true, "1", "", 7, true),
+        (true, "4", "", 1, false),
+        (true, "8", "", 1, false),
+        (true, "8", "max_load = 9\n", 7, true),
+        (false, "8", "", 7, true),
+        (true, "NaN", "", 1, false),
+    ];
+    for (heavy, load, threshold, code, started) in cases {
+        let cli = Cli::with_config(&format!(
+            "{CONFIG}\n[admission]\n{threshold}timeout = \"50ms\"\n"
+        ));
+        let wt = cli.worktree("admission");
+        let mut command = Command::cargo_bin("grove").unwrap();
+        command
+            .current_dir(&wt)
+            .env("GROVE_STATE_DIR", cli.state.path())
+            .env("GROVE_PORT_RANGE", cli.port_range())
+            .env("GROVE_LOAD", load)
+            .env("GROVE_CORES", "4")
+            .arg("run");
+        if heavy {
+            command.arg("--heavy");
+        }
+        let out = command
+            .args(["--", "sh", "-c", "echo $GROVE_SLUG > ran; exit 7"])
+            .assert()
+            .code(code)
+            .get_output()
+            .clone();
+        assert_eq!(
+            wt.join("ran").exists(),
+            started,
+            "heavy={heavy}, load={load}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if heavy && !started {
+            assert!(stderr.contains("admission"), "{stderr}");
+            if load != "NaN" {
+                assert!(stderr.contains("timed out"), "{stderr}");
+            }
+        }
+        if started {
+            assert_eq!(
+                std::fs::read_to_string(wt.join("ran")).unwrap().trim(),
+                "admission"
+            );
+        }
+        if !heavy {
+            assert!(!stderr.contains("admission:"), "{stderr}");
+        }
+    }
+}
+
+#[test]
+fn cancelling_heavy_admission_never_starts_the_child() {
+    use std::io::{BufRead, BufReader};
+    let cli = Cli::new();
+    let wt = cli.worktree("cancel_admission");
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin!("grove"))
+        .current_dir(&wt)
+        .env("GROVE_STATE_DIR", cli.state.path())
+        .env("GROVE_PORT_RANGE", cli.port_range())
+        .env("GROVE_LOAD", "100")
+        .env("GROVE_CORES", "4")
+        .args(["run", "--heavy", "--", "touch", "ran"])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut output = BufReader::new(child.stderr.take().unwrap());
+    let mut line = String::new();
+    output.read_line(&mut line).unwrap();
+    let waiting = line.contains("admission: waiting");
+    let _ = rustix::process::kill_process(
+        rustix::process::Pid::from_raw(child.id() as i32).unwrap(),
+        rustix::process::Signal::INT,
+    );
+    assert!(!child.wait().unwrap().success());
+    assert!(waiting, "expected admission wait, got {line}");
+    assert!(!wt.join("ran").exists());
+}

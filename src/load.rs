@@ -63,3 +63,96 @@ fn cores() -> usize {
         .map(|n| n.get())
         .unwrap_or(1)
 }
+
+/// Admission is a load check, not a concurrency reservation. Keep fleetlock's slot cap.
+pub fn wait_for_admission(config: &crate::config::Admission) -> anyhow::Result<()> {
+    wait_with_samples(config, sample)
+}
+
+fn wait_with_samples(
+    config: &crate::config::Admission,
+    mut sample: impl FnMut() -> Option<Load>,
+) -> anyhow::Result<()> {
+    use anyhow::{Context, bail};
+    use std::time::{Duration, Instant};
+
+    let timeout = crate::instance::parse_duration(&config.timeout)?;
+    let began = Instant::now();
+    let mut heartbeat = Duration::ZERO;
+    loop {
+        let elapsed = began.elapsed();
+        if elapsed >= timeout {
+            bail!(
+                "admission: timed out after {:.1}s; command was not started",
+                elapsed.as_secs_f64()
+            );
+        }
+        let load = sample()
+            .filter(|load| load.one.is_finite() && load.one >= 0.0)
+            .context("admission: cannot read a valid load average; command was not started")?;
+        let threshold = config.max_load.unwrap_or(load.cores as f64);
+        if load.one < threshold {
+            eprintln!(
+                "admission: admitted (load {:.2}, threshold {:.2}, waited {:.1}s)",
+                load.one,
+                threshold,
+                elapsed.as_secs_f64()
+            );
+            return Ok(());
+        }
+        if elapsed >= heartbeat {
+            eprintln!(
+                "admission: waiting (load {:.2}, threshold {:.2}, elapsed {:.1}s, timeout {})",
+                load.one,
+                threshold,
+                elapsed.as_secs_f64(),
+                config.timeout
+            );
+            heartbeat = elapsed + Duration::from_secs(15);
+        }
+        std::thread::sleep(
+            Duration::from_secs(2)
+                .min(timeout - elapsed)
+                .min(heartbeat - elapsed),
+        );
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::{Load, wait_with_samples};
+    use crate::config::Admission;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn admission_resamples_after_wait_and_rejects_a_lost_measurement() {
+        for readable in [true, false] {
+            let mut samples = [
+                Some(Load { one: 8.0, cores: 4 }),
+                readable.then_some(Load { one: 1.0, cores: 4 }),
+            ]
+            .into_iter();
+            let began = Instant::now();
+            let result = wait_with_samples(
+                &Admission {
+                    max_load: None,
+                    timeout: "5s".to_string(),
+                },
+                || {
+                    samples
+                        .next()
+                        .expect("admission must finish after the second sample")
+                },
+            );
+            assert_eq!(result.is_ok(), readable, "{result:?}");
+            assert!(began.elapsed() >= Duration::from_secs(2));
+            if let Err(error) = result {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("cannot read a valid load average")
+                );
+            }
+        }
+    }
+}

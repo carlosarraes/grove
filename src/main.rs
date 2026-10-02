@@ -1,3 +1,5 @@
+mod up_log;
+
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use grove::footprint::human_size;
@@ -105,6 +107,9 @@ struct Cli {
 enum Command {
     /// Render config, start missing shared containers with nofile=64000, start services
     Up {
+        /// Internal worker for the per-run log supervisor.
+        #[arg(long, hide = true)]
+        up_log_child: bool,
         /// Restart services that are already running
         #[arg(long)]
         fresh: bool,
@@ -211,6 +216,16 @@ fn main() -> Result<()> {
 
     let cwd = std::env::current_dir().context("reading the working directory")?;
 
+    if matches!(
+        cli.command,
+        Some(Command::Up {
+            up_log_child: false,
+            ..
+        })
+    ) {
+        std::process::exit(up_log::run(&cwd)?);
+    }
+
     match cli.command {
         None => {
             <Cli as clap::CommandFactory>::command().print_help()?;
@@ -218,6 +233,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Command::Up {
+            up_log_child: _,
             fresh,
             allow_main,
             expose,

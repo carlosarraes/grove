@@ -197,6 +197,24 @@ These separate lock waits, tree creation, inventory checks, replacement, cleanup
 and service readiness. Dependency setup totals include their nested cache phases.
 Do not add those totals to the individual phase durations.
 
+Each `grove up` in a Git worktree saves its stdout, stderr and exit code under
+`<instance-state>/up-logs/<timestamp>-<pid>.log`. The final stderr line names the file.
+These files have mode `0600`. A closed downstream pipe does not discard the saved output.
+The shell still decides the exit status of a pipeline. Read `grove up exit code:` in
+the log when a pipeline hides Grove's status.
+
+The log covers Grove's output. Services keep their separate logs. Invalid CLI arguments and worktree resolution failures occur
+before a run log can start. An abrupt termination can leave a partial log without a footer.
+Grove keeps logs until instance-state cleanup and does not rotate them automatically.
+
+On a readiness timeout, Grove prints the service log path and makes a TCP check with
+a one-second limit. An accepted connection means a listener accepted TCP, even though
+HTTP readiness failed. Refusal or an inconclusive check does not identify the root cause.
+The result describes the moment after the timeout, not the whole startup interval.
+
+`grove doctor` warns when a setup command has neither `setup_inputs` nor `cache`.
+A readiness probe without an explicit `timeout` remains a configuration error.
+
 ## Opt-in macOS clone trial
 
 On macOS, `GROVE_MACOS_CLONE=1 grove up` clones a warm cache entry into the staging directory.

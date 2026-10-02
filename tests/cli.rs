@@ -4102,3 +4102,138 @@ fn readiness_timeout_names_the_log_and_observes_tcp_acceptance() {
     }
 }
 
+fn saved_up_log(output: &std::process::Output) -> std::path::PathBuf {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    std::path::PathBuf::from(
+        stderr
+            .lines()
+            .last()
+            .unwrap()
+            .strip_prefix("up log: ")
+            .expect("last line names run log"),
+    )
+}
+
+#[test]
+fn up_logs_preserve_both_streams_errors_exit_codes_and_prior_runs() {
+    use std::os::unix::fs::PermissionsExt;
+    let cli = Cli::with_config(INPUT_SETUP_CONFIG);
+    let wt = input_setup_worktree(&cli);
+    let first = cli.run(&wt, &["up"]).success().get_output().clone();
+    let path = saved_up_log(&first);
+    let body = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        body.contains("timing: web: dependency setup: ok") && body.contains("instance  inputs"),
+        "{body}"
+    );
+    assert!(body.contains("grove up exit code: 0"), "{body}");
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    std::fs::write(wt.join("backend/fail"), "").unwrap();
+    let failed = cli
+        .run(&wt, &["up", "--no-cache"])
+        .failure()
+        .get_output()
+        .clone();
+    let failed_path = saved_up_log(&failed);
+    let failed_body = std::fs::read_to_string(&failed_path).unwrap();
+    assert!(
+        failed_body.contains("dependency setup failed"),
+        "{failed_body}"
+    );
+    assert!(
+        failed_body.contains("grove up exit code: 1"),
+        "{failed_body}"
+    );
+    assert_ne!(path, failed_path);
+    assert_eq!(std::fs::read_to_string(path).unwrap(), body);
+}
+
+#[test]
+fn up_logs_preserve_config_errors_before_instance_open() {
+    let cli = Cli::with_config(&CONFIG.replace(", timeout = \"30s\"", ""));
+    let wt = cli.worktree("bad_config");
+    let failed = cli.run(&wt, &["up"]).failure().get_output().clone();
+    let body = std::fs::read_to_string(saved_up_log(&failed)).unwrap();
+    assert!(
+        body.contains("missing field `timeout`") && body.contains("grove up exit code: 1"),
+        "{body}"
+    );
+}
+
+#[test]
+fn up_logs_finish_when_a_downstream_reader_closes_early() {
+    let cli = Cli::with_config(INPUT_SETUP_CONFIG);
+    let wt = input_setup_worktree(&cli);
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("grove"))
+        .arg("up")
+        .current_dir(&wt)
+        .env("GROVE_STATE_DIR", cli.state.path())
+        .env("GROVE_PORT_RANGE", cli.port_range())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = std::fs::read_to_string(saved_up_log(&output)).unwrap();
+    assert!(
+        body.contains("instance  inputs") && body.contains("grove up exit code: 0"),
+        "{body}"
+    );
+}
+
+#[test]
+fn up_logs_accept_the_argument_terminator() {
+    let cli = Cli::with_config(INPUT_SETUP_CONFIG);
+    let wt = input_setup_worktree(&cli);
+    cli.run(&wt, &["up", "--"]).success();
+}
+
+#[test]
+fn up_logs_cancel_the_worker_before_it_can_start_services() {
+    let config = INPUT_SETUP_CONFIG.replace(
+        "echo installed >> installs; test ! -f fail && if test -f mutate; then echo changed >> uv.lock; fi",
+        "touch started; sleep 3; touch finished",
+    );
+    let cli = Cli::with_config(&config);
+    let wt = input_setup_worktree(&cli);
+    let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("grove"))
+        .arg("up")
+        .current_dir(&wt)
+        .env("GROVE_STATE_DIR", cli.state.path())
+        .env("GROVE_PORT_RANGE", cli.port_range())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !wt.join("backend/started").exists() {
+        assert!(std::time::Instant::now() < deadline, "setup did not start");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // SAFETY: child.id() is the live process this test owns.
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(143));
+    // A signal to one PID, as before logging existed, does not recursively cancel
+    // setup subprocesses. The Grove worker must not start services after they finish.
+    std::thread::sleep(std::time::Duration::from_millis(3200));
+    assert!(
+        registry_of(&cli)
+            .get(&wt)
+            .unwrap()
+            .unwrap()
+            .services
+            .is_empty()
+    );
+    let body = std::fs::read_to_string(saved_up_log(&output)).unwrap();
+    assert!(body.contains("grove up exit code: 143"), "{body}");
+}

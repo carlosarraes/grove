@@ -81,6 +81,15 @@ pub fn check(instance: &Instance) -> Vec<Verdict> {
         verdicts.push(Verdict::Ok(format!("port {port} reserved for {name}")));
     }
 
+    for service in &instance.config.services {
+        if service.setup.is_some() && service.cache.is_none() && service.setup_inputs.is_none() {
+            verdicts.push(Verdict::Warn(format!(
+                "{}: setup tracks only its command; declare setup_inputs for local installs or cache.key for shared installs so dependency file changes rerun setup",
+                service.name
+            )));
+        }
+    }
+
     if instance.config.services.is_empty() {
         verdicts.push(Verdict::Warn(
             "this config declares no services, so `up` will start nothing".to_string(),

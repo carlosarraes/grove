@@ -4032,3 +4032,42 @@ fn setup_inputs_changed_during_setup_do_not_get_a_success_marker() {
     cli.run(&wt, &["up"]).success();
     assert_eq!(input_setup_runs(&wt), 2);
 }
+
+#[test]
+fn doctor_warns_when_setup_cannot_notice_changed_dependency_files() {
+    for (declaration, warned) in [
+        ("", true),
+        ("setup_inputs = ['uv.lock']", false),
+        ("cache = {path = 'deps', key = ['uv.lock']}", false),
+    ] {
+        let config = format!(
+            "version = 1\n[ports]\nnames = ['web']\n[[service]]\nname = 'web'\nsetup = 'echo setup'\ncommand = 'sleep 60'\n{declaration}\n"
+        );
+        let cli = Cli::with_config(&config);
+        let wt = cli.worktree("lint");
+        let output = cli
+            .run(&wt, &["doctor"])
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        assert_eq!(
+            String::from_utf8_lossy(&output).contains("web: setup tracks only its command"),
+            warned
+        );
+    }
+}
+
+#[test]
+fn doctor_rejects_a_readiness_probe_without_an_explicit_timeout() {
+    let cli = Cli::with_config(&CONFIG.replace(", timeout = \"30s\"", ""));
+    let wt = cli.worktree("missing_timeout");
+    let output = cli
+        .run(&wt, &["doctor"])
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    assert!(String::from_utf8_lossy(&output).contains("missing field `timeout`"));
+}
+

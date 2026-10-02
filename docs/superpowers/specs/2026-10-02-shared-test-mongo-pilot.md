@@ -56,9 +56,31 @@ The platform PR retains disposable containers in CI and adds missing currency pe
 The fixture also retains the explicit Northstar test URI. Partial Grove settings or allocation failure produce errors.
 On this Colima host, testcontainers needed the Docker endpoint and `TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock`.
 
-Deal Hub and Actions migrations remain later stages. Fleetlock settings and installed Grove binaries remain unchanged.
+The Deal Hub trial is complete. Its results and the decision below supersede the proposed rollout.
+Fleetlock settings and installed Grove binaries remain unchanged.
 
 The Mac full suite passed 243 tests. The Linux full suite passed 242 tests.
 Both machines passed formatting, Clippy with warnings denied, and packaging checks.
 Earlier Mac runs hit existing timing-sensitive supervision tests and a restart port race.
 Their focused reruns passed, followed by the successful full Mac run.
+
+## Closing decision after the Deal Hub trial
+
+PM parked this feature without a release. Keep the code and design on `feature-shared-test-mongo` for a future workload that justifies it.
+The [Deal Hub results](2026-10-02-shared-test-mongo-results.md) show that parallel containers match shared Mongo for elapsed time.
+Shared Mongo saved about 3% of combined process memory at concurrency two and three.
+
+| Concurrent runs | Container batch | Shared batch |
+|---:|---:|---:|
+| 1 | 78.4 s | 74.9 s |
+| 2 | 65.3 s | 66.3 s |
+| 3 | 88.9 s | 89.3 s |
+
+All 5,328 benchmark cases passed. The six shared runs had disjoint inventories, and cleanup left none of their 132 recorded database names.
+
+Close platform PR #6198 because its optional Grove path has no released provider. Keep MON-6501 in Backlog with the evidence.
+PR #6197 remains useful independently because its container fallback runs the Northstar currency suites locally instead of skipping them.
+That PR still awaits Carlos's merge decision.
+
+PM will pilot two heavy pytest slots with default core-count admission before fleetlock and measure queue waits.
+Three slots and the shared Mongo release remain outside that pilot. This decision changes neither installed Grove binaries nor fleetlock capacity.

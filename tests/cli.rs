@@ -97,17 +97,17 @@ command = "printf '%s' '{{ host.bind }}' > bind-host.txt; exec python3 -u -m htt
 ready = { http = "http://127.0.0.1:{{ port.web }}/", timeout = "30s" }
 "#;
 
-// Production uses 20000..30000. Sharing that range made health tests report live
-// lane servers as stray listeners. Keep fixture ranges separate, skip occupied
-// ranges, and hold a lease across setup and teardown for concurrent test processes.
+// Production uses 20000..30000; ephemeral listeners start at 32768 on Linux and
+// 49152 on macOS. Keep fixtures below both so unrelated test listeners cannot
+// appear inside a health scan. Skip occupied ranges and lease each test slice.
 static NEXT_SLICE: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
 
 fn claim_test_ports() -> (std::ops::Range<u16>, std::fs::File) {
     let locks = std::env::temp_dir().join("grove-cli-test-ports");
     std::fs::create_dir_all(&locks).expect("port lease directory");
-    for _ in 0..190 {
-        let slice = NEXT_SLICE.fetch_add(1, std::sync::atomic::Ordering::SeqCst) % 190;
-        let low = 30000 + slice * 100;
+    for _ in 0..90 {
+        let slice = NEXT_SLICE.fetch_add(1, std::sync::atomic::Ordering::SeqCst) % 90;
+        let low = 10000 + slice * 100;
         let range = low..low + 100;
         let lease = std::fs::OpenOptions::new()
             .create(true)

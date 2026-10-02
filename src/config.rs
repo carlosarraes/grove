@@ -25,6 +25,42 @@ pub struct Config {
     /// stops it. Opt-in: without it, `up` only warns about the pile-up.
     pub idle: Option<Idle>,
     pub admission: Option<Admission>,
+    pub test_mongo: Option<TestMongo>,
+}
+
+/// A dedicated Mongo resource used only by opted-in test commands.
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestMongo {
+    pub image: String,
+    #[serde(default = "test_mongo_port")]
+    pub port: u16,
+    #[serde(default = "test_mongo_name")]
+    pub name: String,
+}
+
+fn test_mongo_port() -> u16 {
+    27018
+}
+fn test_mongo_name() -> String {
+    "grove-test-mongo".to_string()
+}
+
+impl TestMongo {
+    pub fn version(&self) -> Result<&str> {
+        let version = self.image.strip_prefix("mongo:").unwrap_or_default();
+        let parts: Vec<_> = version.split('.').collect();
+        if parts.len() != 3
+            || parts
+                .iter()
+                .any(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()))
+        {
+            anyhow::bail!(
+                "[test_mongo] image must pin a complete Mongo version, for example mongo:8.0.20"
+            );
+        }
+        Ok(version)
+    }
 }
 
 /// Optional limits for `run --heavy`; ordinary commands do not wait.
@@ -203,6 +239,20 @@ pub fn parse(text: &str) -> Result<Config> {
 
 impl Config {
     fn validate(&self) -> Result<()> {
+        if let Some(mongo) = &self.test_mongo {
+            mongo.version()?;
+            if mongo.port == 0
+                || !mongo.name.starts_with("grove-test-")
+                || !mongo
+                    .name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+            {
+                anyhow::bail!(
+                    "[test_mongo] requires a nonzero port and a name beginning grove-test- with only letters, digits, dots, underscores or hyphens"
+                );
+            }
+        }
         if let Some(admission) = &self.admission {
             if admission
                 .max_load

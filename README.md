@@ -189,6 +189,47 @@ The order is admission, then the fleetlock slot, then the command. The admission
 stays outside fleetlock's hold cap. Load can change during the slot wait, so this remains
 a heuristic. This flag provides neither FIFO ordering nor a slot reservation.
 
+## Shared Mongo for test commands
+
+`grove run --test-mongo -- <command>` starts or reuses a dedicated test replica set.
+The flag requires an explicit image pin in the repository config:
+
+```toml
+[test_mongo]
+image = "mongo:8.0.20"
+# port = 27018
+# name = "grove-test-mongo"
+```
+
+The published port binds to `127.0.0.1`. Grove verifies the container ownership, image,
+server version and writable primary before the command starts. A conflicting container
+fails explicitly. Development resources retain their lifecycle and database settings.
+
+The child receives `GROVE_TEST_RUN_ID`, `GROVE_TEST_MONGODB_URI`, `GROVE_TEST_DB_NAME`,
+and `GROVE_TEST_ALLOCATOR`. The last variable names the current Grove binary.
+Fixtures call `"$GROVE_TEST_ALLOCATOR" test-db allocate` to obtain another database.
+Each allocation is unique within its run and recorded before use.
+
+Grove forwards cancellation to the command group and preserves its exit code.
+After the group exits, Grove drops only that run's recorded databases.
+Failed cleanup retains the record and prints a warning. A later test run retries cleanup
+only when the lease is free and the recorded process group is gone.
+Uncertain process ownership retains the record for inspection.
+
+These are trusted local tests. Unique names prevent accidental collisions, but do not
+restrict Mongo permissions. Commands must not detach processes from their owned group.
+An allocator outside that group fails. The container remains available for later runs.
+
+With external fleetlock, use:
+
+```sh
+grove run --heavy -- fleetlock run pytest <lane> <card> -- grove run --test-mongo -- <cmd>
+```
+
+This order admits load first, takes a slot, then provisions the test resource.
+Plain `grove run` keeps its current behavior. Existing fixtures require migration to
+consume the test variables and allocator before they can use this flag.
+
 ## Refresh dependencies
 
 After a lockfile change, run `grove up`. Existing worktrees check their cache inputs

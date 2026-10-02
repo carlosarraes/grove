@@ -17,3 +17,5 @@ pub mod supervise;
 mod timing;
 
 pub mod test_mongo;
+
+pub mod test_run;

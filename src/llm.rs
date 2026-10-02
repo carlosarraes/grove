@@ -173,6 +173,19 @@ needed data, then deliberately remove and recreate that container.
                      without a child. Plain run does not wait. Keep fleetlock's slot
                      limit: load averages lag and do not measure memory or reserve capacity.
 
+  [test_mongo]       optional; used only by `grove run --test-mongo -- <command>`
+    image            required full pin, e.g. "mongo:8.0.20"
+    port             loopback port, default 27018
+    name             owned container name, default "grove-test-mongo"
+                     Child-only GROVE_TEST_RUN_ID, GROVE_TEST_MONGODB_URI,
+                     GROVE_TEST_DB_NAME and GROVE_TEST_ALLOCATOR identify a run.
+                     Fixtures call `$GROVE_TEST_ALLOCATOR test-db allocate` for each
+                     independent database. Cleanup uses its recorded inventory only.
+                     Cancellation stops the command group. Failed cleanup is retained.
+                     Test commands must not detach from their process group.
+                     With fleetlock: run --heavy -- fleetlock run pytest <lane> <card>
+                     -- grove run --test-mongo -- <cmd>.
+
   [idle]             optional; opt in to stopping forgotten instances
   stop_after         e.g. "2h". Every `grove up` for this repo first stops its sibling
                      instances nobody has touched for this long, ports kept, and says

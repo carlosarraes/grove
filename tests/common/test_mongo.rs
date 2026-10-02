@@ -25,6 +25,8 @@ elif args[0] == 'exec':
     if mode == 'starting' and not (root / 'attempted').exists():
         (root / 'attempted').touch()
         print('MongoNetworkError: connect ECONNREFUSED 127.0.0.1:27017', file=sys.stderr); sys.exit(1)
+    if mode == 'drop-fail' and 'dropDatabase' in args[-1]:
+        print('cleanup unavailable', file=sys.stderr); sys.exit(1)
     if mode == 'init-error': print('replica init failed', file=sys.stderr); sys.exit(9)
     if mode == 'wrong-version': print(json.dumps({'version':'8.0.23', 'set_name':'rs0', 'primary': True})); sys.exit(0)
     print(json.dumps({'version': '8.0.20', 'set_name':'rs0', 'primary': True}))

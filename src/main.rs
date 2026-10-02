@@ -7,6 +7,11 @@ use grove::registry::{Entry, human_age};
 use grove::{instance::Instance, llm, load};
 use std::path::Path;
 
+#[derive(Subcommand)]
+enum TestDbAction {
+    Allocate,
+}
+
 /// The window the printed prescription proposes; `health` reads the same one.
 const IDLE_WINDOW: &str = grove::health::IDLE_WINDOW;
 
@@ -157,8 +162,16 @@ enum Command {
         /// Wait for load below the admission threshold before starting the command
         #[arg(long)]
         heavy: bool,
+        /// Use the dedicated shared test Mongo and clean this run's databases
+        #[arg(long)]
+        test_mongo: bool,
         #[arg(trailing_var_arg = true, required = true)]
         argv: Vec<String>,
+    },
+    /// Allocate a database within an active test run
+    TestDb {
+        #[command(subcommand)]
+        action: TestDbAction,
     },
     /// Tail a service's log
     Logs {
@@ -433,19 +446,31 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Some(Command::Run { argv, heavy }) => {
+        Some(Command::Run {
+            argv,
+            heavy,
+            test_mongo,
+        }) => {
             let instance = Instance::open(&cwd)?;
             instance.touch()?;
             if heavy {
                 load::wait_for_admission(&instance.config.admission.clone().unwrap_or_default())?;
                 instance.touch()?;
             }
-            let status = std::process::Command::new(&argv[0])
-                .args(&argv[1..])
-                .current_dir(&cwd)
-                .envs(instance.environment()?)
-                .status()
-                .with_context(|| format!("running `{}`", argv.join(" ")))?;
+            let status = if test_mongo {
+                let config =
+                    instance.config.test_mongo.as_ref().context(
+                        "run --test-mongo requires [test_mongo] with an explicit image pin",
+                    )?;
+                grove::test_run::run(config, &cwd, &argv, instance.environment()?)?
+            } else {
+                std::process::Command::new(&argv[0])
+                    .args(&argv[1..])
+                    .current_dir(&cwd)
+                    .envs(instance.environment()?)
+                    .status()
+                    .with_context(|| format!("running `{}`", argv.join(" ")))?
+            };
 
             // Sampled after the child, so the average includes the contention the run
             // actually experienced — and printed only on failure, because a note that
@@ -459,7 +484,20 @@ fn main() -> Result<()> {
                     );
                 }
             }
-            std::process::exit(status.code().unwrap_or(1));
+            use std::os::unix::process::ExitStatusExt;
+            std::process::exit(status.code().unwrap_or_else(|| {
+                if test_mongo {
+                    128 + status.signal().unwrap_or(1)
+                } else {
+                    1
+                }
+            }));
+        }
+        Some(Command::TestDb {
+            action: TestDbAction::Allocate,
+        }) => {
+            println!("{}", grove::test_run::allocate()?);
+            Ok(())
         }
         Some(Command::Logs {
             service,

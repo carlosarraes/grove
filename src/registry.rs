@@ -234,9 +234,9 @@ impl Registry {
                 return Ok(false);
             };
             if entry.services != candidate.services
-                || !entry
+                || entry
                     .idle_seconds(now())
-                    .is_some_and(|age| age >= window.as_secs())
+                    .is_none_or(|age| age < window.as_secs())
             {
                 return Ok(false);
             }

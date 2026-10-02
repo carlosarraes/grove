@@ -174,7 +174,10 @@ needed data, then deliberately remove and recreate that container.
   [[service]]        repeatable; a long-running process
   name               identifier, also the log file name
   cwd                working directory relative to the worktree root
-  setup              install before first start; repeat when the command or cache key changes
+  setup              install before first start; repeat when the command or declared inputs change
+  setup_inputs       optional nonempty file list for uncached setup, relative to cwd.
+                     Hashes names and contents; missing files or input changes during setup fail.
+                     Requires setup; cannot accompany cache. Use cache.key for shared installs.
   prepare            run on EVERY up, before this service starts and after the services
                      declared above it are answering -- for generated code that must
                      track what it was generated from, e.g. a typed client built from
@@ -196,8 +199,9 @@ Three fields run commands, and the difference between them is how often:
 `setup` when its inputs change, `[[seed]]` once per instance, `prepare` every `up`. Put a
 dependency install in `setup`, fixture data in `[[seed]]`, and code generation in
 `prepare` -- generated output is the one that goes stale when it is only made once.
-Give a `setup` that installs dependencies a `cache`, or every worktree carries its own
-gigabyte of them.
+Use `cache` for dependencies safe to share. For local installs such as Python venvs,
+use `setup_inputs = ["uv.lock", "pyproject.toml"]` with cwd = "backend". Without
+setup_inputs or cache, only a changed setup command invalidates the marker.
 
 ### Two rules that prevent silent cross-talk
 

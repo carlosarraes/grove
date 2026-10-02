@@ -266,3 +266,26 @@ command = "python3 -m http.server {{ port.web }}"
     let c = config::load(wt.path()).expect("load");
     assert_eq!(c.idle.as_ref().map(|i| i.stop_after.as_str()), Some("90m"));
 }
+
+#[test]
+fn setup_inputs_reject_ambiguous_or_invalid_declarations() {
+    for (setup, inputs, extra, expected) in [
+        ("", "[\"uv.lock\"]", "", "requires setup"),
+        (
+            "setup = 'uv sync'",
+            "[\"uv.lock\"]",
+            "cache = {path = '.venv', key = ['uv.lock']}",
+            "cannot combine",
+        ),
+        ("setup = 'uv sync'", "[]", "", "at least one"),
+        ("setup = 'uv sync'", "[\"../uv.lock\"]", "", "relative"),
+        ("setup = 'uv sync'", "[\"/uv.lock\"]", "", "relative"),
+        ("setup = 'uv sync'", "[\"\"]", "", "relative"),
+    ] {
+        let config = format!(
+            "version = 1\n[ports]\nnames = ['web']\n[[service]]\nname = 'web'\ncommand = 'sleep 60'\n{setup}\nsetup_inputs = {inputs}\n{extra}\n"
+        );
+        let error = format!("{:#}", config::parse(&config).unwrap_err());
+        assert!(error.contains(expected), "{error}");
+    }
+}

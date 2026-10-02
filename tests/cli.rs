@@ -3907,3 +3907,128 @@ fn clone_trial_flag_keeps_hardlinks_on_linux() {
         wt.join("node_modules/blob").metadata().unwrap().ino()
     );
 }
+
+const INPUT_SETUP_CONFIG: &str = r#"
+version = 1
+[ports]
+names = ["web"]
+[[service]]
+name = "web"
+cwd = "backend"
+setup = "echo installed >> installs; test ! -f fail && if test -f mutate; then echo changed >> uv.lock; fi"
+setup_inputs = ["uv.lock", "pyproject.toml"]
+command = "sleep 60"
+"#;
+
+fn input_setup_worktree(cli: &Cli) -> std::path::PathBuf {
+    let wt = cli.worktree("inputs");
+    std::fs::create_dir_all(wt.join("backend")).unwrap();
+    for file in ["uv.lock", "pyproject.toml"] {
+        std::fs::write(wt.join("backend").join(file), "initial").unwrap();
+    }
+    wt
+}
+
+fn input_setup_runs(wt: &Path) -> usize {
+    std::fs::read_to_string(wt.join("backend/installs"))
+        .unwrap()
+        .lines()
+        .count()
+}
+
+#[test]
+fn setup_inputs_rerun_only_when_declared_inputs_or_command_change() {
+    let cli = Cli::with_config(INPUT_SETUP_CONFIG);
+    let wt = input_setup_worktree(&cli);
+    cli.run(&wt, &["up"]).success();
+    cli.run(&wt, &["up"]).success();
+    assert_eq!(input_setup_runs(&wt), 1);
+    for (i, file) in ["uv.lock", "pyproject.toml"].iter().enumerate() {
+        std::fs::write(wt.join("backend").join(file), "changed").unwrap();
+        cli.run(&wt, &["up"]).success();
+        assert_eq!(input_setup_runs(&wt), i + 2);
+    }
+    std::fs::write(
+        wt.join(".grove.toml"),
+        INPUT_SETUP_CONFIG.replace("echo installed", "echo updated"),
+    )
+    .unwrap();
+    cli.run(&wt, &["up"]).success();
+    assert_eq!(input_setup_runs(&wt), 4);
+    std::fs::rename(wt.join("backend/uv.lock"), wt.join("backend/renamed.lock")).unwrap();
+    let config = std::fs::read_to_string(wt.join(".grove.toml")).unwrap();
+    std::fs::write(
+        wt.join(".grove.toml"),
+        config.replace(
+            "setup_inputs = [\"uv.lock\"",
+            "setup_inputs = [\"renamed.lock\"",
+        ),
+    )
+    .unwrap();
+    cli.run(&wt, &["up"]).success();
+    assert_eq!(input_setup_runs(&wt), 5);
+    cli.run(&wt, &["up", "--no-cache"]).success();
+    assert_eq!(input_setup_runs(&wt), 6);
+    assert!(!cli.state.path().join("store").exists());
+}
+
+#[test]
+fn setup_inputs_migrate_a_command_only_marker_once() {
+    let legacy = INPUT_SETUP_CONFIG.replace("setup_inputs = [\"uv.lock\", \"pyproject.toml\"]", "");
+    let cli = Cli::with_config(&legacy);
+    let wt = input_setup_worktree(&cli);
+    cli.run(&wt, &["up"]).success();
+    std::fs::write(wt.join(".grove.toml"), INPUT_SETUP_CONFIG).unwrap();
+    cli.run(&wt, &["up"]).success();
+    cli.run(&wt, &["up"]).success();
+    assert_eq!(input_setup_runs(&wt), 2);
+}
+
+#[test]
+fn setup_inputs_missing_or_unreadable_files_do_not_reuse_a_marker() {
+    for unreadable in [false, true] {
+        let cli = Cli::with_config(INPUT_SETUP_CONFIG);
+        let wt = input_setup_worktree(&cli);
+        cli.run(&wt, &["up"]).success();
+        let input = wt.join("backend/uv.lock");
+        std::fs::remove_file(&input).unwrap();
+        if unreadable {
+            std::fs::create_dir(&input).unwrap();
+        }
+        let output = cli.run(&wt, &["up"]).failure().get_output().stderr.clone();
+        let error = String::from_utf8_lossy(&output);
+        assert!(
+            error.contains("web") && error.contains("uv.lock"),
+            "{error}"
+        );
+        assert_eq!(input_setup_runs(&wt), 1);
+    }
+}
+
+#[test]
+fn setup_inputs_failed_setup_is_retried() {
+    let cli = Cli::with_config(INPUT_SETUP_CONFIG);
+    let wt = input_setup_worktree(&cli);
+    cli.run(&wt, &["up"]).success();
+    std::fs::write(wt.join("backend/uv.lock"), "changed").unwrap();
+    std::fs::write(wt.join("backend/fail"), "").unwrap();
+    cli.run(&wt, &["up"]).failure();
+    std::fs::remove_file(wt.join("backend/fail")).unwrap();
+    std::fs::write(wt.join("backend/uv.lock"), "initial").unwrap();
+    cli.run(&wt, &["up"]).success();
+    cli.run(&wt, &["up"]).success();
+    assert_eq!(input_setup_runs(&wt), 3);
+}
+
+#[test]
+fn setup_inputs_changed_during_setup_do_not_get_a_success_marker() {
+    let cli = Cli::with_config(INPUT_SETUP_CONFIG);
+    let wt = input_setup_worktree(&cli);
+    std::fs::write(wt.join("backend/mutate"), "").unwrap();
+    let output = cli.run(&wt, &["up"]).failure().get_output().stderr.clone();
+    assert!(String::from_utf8_lossy(&output).contains("setup changed its setup_inputs"));
+    std::fs::remove_file(wt.join("backend/mutate")).unwrap();
+    cli.run(&wt, &["up"]).success();
+    cli.run(&wt, &["up"]).success();
+    assert_eq!(input_setup_runs(&wt), 2);
+}

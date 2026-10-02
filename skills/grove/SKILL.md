@@ -149,7 +149,7 @@ name = "frontend"
 prepare = "npm run contracts:generate"
 ```
 
-Three config fields run commands: `setup` when its command or cache inputs change
+Three config fields run commands: `setup` when its command or declared inputs change
 (dependency installs), `[[seed]]` once per instance (fixture data), `prepare` on
 every `up` (generation). A failing `prepare` fails `up` and prints what it printed, rather
 than starting a service on top of half a file.
@@ -287,12 +287,18 @@ and commit it — it is checked in, so every later agent in every worktree only 
 uses the main checkout's and says so on stderr, so nothing needs copying into new
 worktrees.
 
-Give every `setup` that installs dependencies a `[service.cache]` block naming what it
-produces and the lockfile that decides it. Worktrees on the same lockfile then share one
-copy through grove's store, hardlinked in, and only the first pays for the install. Without
-it each worktree carries its own gigabyte, which is how a machine running many agents
-fills its disk.
+Use `[service.cache]` for dependency trees that are safe to share across worktrees.
+For local installs such as Python virtual environments, use `setup_inputs` without a cache:
 
+```toml
+# In the existing backend service, with cwd = "backend":
+setup_inputs = ["uv.lock", "pyproject.toml"]
+```
+
+Paths are relative to the service's `cwd`. Changed file names, contents or setup commands
+rerun setup. Missing inputs or inputs changed during setup fail without a success marker.
+Without `setup_inputs` or `cache`, Grove only tracks the setup command.
+Do not share Python virtual environments through the store.
 
 After a lockfile change, run plain `grove up`. Grove checks the cache inputs even in
 an existing worktree. Use `--no-cache` only to rebuild an entry you distrust.

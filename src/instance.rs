@@ -845,14 +845,22 @@ impl Instance {
             done: "dependencies installed",
         };
         let Some(cache) = &service.cache else {
-            if !no_cache && std::fs::read_to_string(&marker).ok().as_deref() == Some(setup) {
+            let identity = setup_identity(service, setup, cwd)?;
+            if !no_cache
+                && std::fs::read_to_string(&marker).ok().as_deref() == Some(identity.as_str())
+            {
                 return Ok(SetupOutcome::Skipped);
             }
             if marker.exists() {
                 std::fs::remove_file(&marker)?;
             }
             self.run_step(&step, setup, cwd, log)?;
-            std::fs::write(&marker, setup)?;
+            if setup_identity(service, setup, cwd)? != identity {
+                anyhow::bail!(
+                    "{name}: setup changed its setup_inputs; refusing to mark setup complete"
+                );
+            }
+            std::fs::write(&marker, identity)?;
             return Ok(SetupOutcome::Installed);
         };
 
@@ -1175,6 +1183,30 @@ pub fn parse_duration(text: &str) -> Result<std::time::Duration> {
         .parse()
         .with_context(|| format!("{text:?} is not a duration like \"180s\""))?;
     Ok(std::time::Duration::from_millis(amount * multiplier))
+}
+
+/// Keep uncached installs local while tracking the files that decide their contents.
+fn setup_identity(service: &crate::config::Service, setup: &str, cwd: &Path) -> Result<String> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    let Some(inputs) = &service.setup_inputs else {
+        return Ok(setup.to_owned());
+    };
+    let mut hash = DefaultHasher::new();
+    setup.hash(&mut hash);
+    for input in inputs {
+        let path = cwd.join(input);
+        let bytes = std::fs::read(&path).with_context(|| {
+            format!(
+                "{}: reading setup_inputs file {}",
+                service.name,
+                path.display()
+            )
+        })?;
+        input.hash(&mut hash);
+        bytes.hash(&mut hash);
+    }
+    Ok(format!("setup-inputs-v1:{:016x}", hash.finish()))
 }
 
 #[cfg(test)]

@@ -176,6 +176,22 @@ its declared cache key files unchanged. Include all installation inputs in `cach
 Grove runs the configured setup command and its lifecycle scripts. Those scripts can
 still modify other repository files.
 
+For dependencies that must stay local, declare `setup_inputs` without a cache:
+
+```toml
+# In the existing backend service, whose cwd is "backend":
+setup_inputs = ["uv.lock", "pyproject.toml"]
+```
+
+Paths are relative to the service's `cwd`. Grove reruns setup when the command,
+file names or file contents change. A command-only marker reruns once when inputs
+are first declared. Without `setup_inputs`, uncached setup still tracks only its command.
+
+Missing or unreadable inputs fail setup. A failed setup, or one that changes its inputs,
+does not receive a success marker. This check does not roll back an uncached install.
+`setup_inputs` requires `setup` and a nonempty list. It cannot accompany `cache`.
+Use `cache.key` for shared installs. Keep Python virtual environments local.
+
 Setup emits `timing:` lines on stderr with a phase name, outcome and duration in seconds.
 These separate lock waits, tree creation, inventory checks, replacement, cleanup, seeds
 and service readiness. Dependency setup totals include their nested cache phases.

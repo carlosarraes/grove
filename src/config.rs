@@ -107,6 +107,8 @@ pub struct Service {
     pub cwd: Option<String>,
     /// Run once per worktree before the first start, e.g. `uv sync`, `npm install`.
     pub setup: Option<String>,
+    /// Files relative to cwd that invalidate an uncached setup marker.
+    pub setup_inputs: Option<Vec<String>>,
     /// Run on **every** `up`, before this service starts and after the services declared
     /// above it are answering — e.g. generating a client from this worktree's own backend.
     /// Distinct from `setup` and `[[seed]]`, which run once: generated code has to track
@@ -188,6 +190,34 @@ impl Config {
                 .with_context(|| format!("[idle] stop_after = {:?}", idle.stop_after))?;
         }
         for service in &self.services {
+            if let Some(inputs) = &service.setup_inputs {
+                if service.setup.is_none() {
+                    anyhow::bail!("service {:?}: setup_inputs requires setup", service.name);
+                }
+                if service.cache.is_some() {
+                    anyhow::bail!(
+                        "service {:?}: cannot combine setup_inputs with cache; use cache.key",
+                        service.name
+                    );
+                }
+                if inputs.is_empty() {
+                    anyhow::bail!(
+                        "service {:?}: setup_inputs must name at least one file",
+                        service.name
+                    );
+                }
+                for relative in inputs {
+                    if relative.is_empty()
+                        || relative.starts_with('/')
+                        || relative.split('/').any(|part| part == "..")
+                    {
+                        anyhow::bail!(
+                            "service {:?}: setup_inputs path {relative:?} must be relative to the service's cwd and stay inside it",
+                            service.name
+                        );
+                    }
+                }
+            }
             let Some(cache) = &service.cache else {
                 continue;
             };

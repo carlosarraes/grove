@@ -179,9 +179,15 @@ Timeout or an unreadable load fails without a child process. Ctrl-C cancels the 
 The timeout applies to admission, not command execution.
 
 Load averages lag behind new work and do not measure free memory. Keep fleetlock's
-concurrency limit. Use the order `fleetlock slot -> grove admission -> command`.
-A fleetlock hold cap can include the admission wait. Account for both budgets before
-changing the number of slots. This flag provides neither FIFO ordering nor a slot reservation.
+concurrency limit. Run admission before the lock so the load wait does not occupy a slot:
+
+```sh
+grove run --heavy -- fleetlock run pytest <lane> <card> -- <cmd>
+```
+
+The order is admission, then the fleetlock slot, then the command. The admission wait
+stays outside fleetlock's hold cap. Load can change during the slot wait, so this remains
+a heuristic. This flag provides neither FIFO ordering nor a slot reservation.
 
 ## Refresh dependencies
 

@@ -237,6 +237,15 @@ are first declared. Without `setup_inputs`, uncached setup still tracks only its
 
 Missing or unreadable inputs fail setup. A failed setup, or one that changes its inputs,
 does not receive a success marker. This check does not roll back an uncached install.
+Uncached setup also records its absolute directory inside a local Python
+`.venv/.grove-setup-path`. A moved or previously unrecorded venv is rebuilt through
+the configured setup command, with the old install backed up outside the worktree
+and restored on failure. Grove stops its owned service during replacement. The
+first `up` after upgrading from an older Grove version rebuilds each existing
+venv once, so roll out during a quiet period. This applies to `.venv/pyvenv.cfg`
+in the service's setup directory; custom venv locations are not tracked. Symlinked
+venvs are refused rather than modified. Setups without a local venv are unchanged.
+
 `setup_inputs` requires `setup` and a nonempty list. It cannot accompany `cache`.
 Use `cache.key` for shared installs. Keep Python virtual environments local.
 

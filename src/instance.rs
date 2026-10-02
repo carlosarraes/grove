@@ -961,7 +961,20 @@ impl Instance {
         };
         let Some(cache) = &service.cache else {
             let identity = setup_identity(service, setup, cwd)?;
+            let venv = cwd.join(".venv");
+            let location = cwd.canonicalize()?;
+            let path_record = venv.join(".grove-setup-path");
+            let rebuild_venv = if local_venv_exists(&venv)? {
+                match std::fs::read(&path_record) {
+                    Ok(recorded) => recorded != location.as_os_str().as_encoded_bytes(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                    Err(error) => return Err(error).context("reading venv setup path"),
+                }
+            } else {
+                false
+            };
             if !no_cache
+                && !rebuild_venv
                 && std::fs::read_to_string(&marker).ok().as_deref() == Some(identity.as_str())
             {
                 return Ok(SetupOutcome::Skipped);
@@ -969,13 +982,29 @@ impl Instance {
             if marker.exists() {
                 std::fs::remove_file(&marker)?;
             }
-            self.run_step(&step, setup, cwd, log)?;
-            if setup_identity(service, setup, cwd)? != identity {
-                anyhow::bail!(
-                    "{name}: setup changed its setup_inputs; refusing to mark setup complete"
+            let install = |instance: &Self| -> Result<()> {
+                instance.run_step(&step, setup, cwd, log)?;
+                if setup_identity(service, setup, cwd)? != identity {
+                    bail!(
+                        "{name}: setup changed its setup_inputs; refusing to mark setup complete"
+                    );
+                }
+                if local_venv_exists(&venv)? {
+                    std::fs::write(&path_record, location.as_os_str().as_encoded_bytes())?;
+                } else if rebuild_venv {
+                    bail!("{name}: setup did not recreate .venv/pyvenv.cfg");
+                }
+                std::fs::write(&marker, &identity)?;
+                Ok(())
+            };
+            if rebuild_venv {
+                eprintln!(
+                    "{name}: rebuilding .venv for this setup path (moved or previously unrecorded)"
                 );
+                self.replace_install(service, &venv, stopped, install)?;
+            } else {
+                install(self)?;
             }
-            std::fs::write(&marker, identity)?;
             return Ok(SetupOutcome::Installed);
         };
 
@@ -1301,6 +1330,22 @@ pub fn parse_duration(text: &str) -> Result<std::time::Duration> {
         .checked_mul(multiplier)
         .with_context(|| format!("{text:?} is too large a duration"))?;
     Ok(std::time::Duration::from_millis(milliseconds))
+}
+
+/// Only local Python environments participate in relocation recovery.
+fn local_venv_exists(venv: &Path) -> Result<bool> {
+    let metadata = match venv.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("inspecting local venv"),
+    };
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "{} is a symlink; Grove requires a worktree-local .venv",
+            venv.display()
+        );
+    }
+    Ok(venv.join("pyvenv.cfg").try_exists()?)
 }
 
 /// Keep uncached installs local while tracking the files that decide their contents.

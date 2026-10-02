@@ -4678,58 +4678,6 @@ fn failed_resource_restart_does_not_create_a_replacement() {
 }
 
 #[test]
-fn resource_inspect_failure_never_creates_or_starts_a_container() {
-    let cli = stopped_resource_fixture(0, "mongo:8", serde_json::json!({}));
-    cli.docker.as_ref().unwrap().set_unreadable_inspect();
-    let wt = cli.worktree("inspect_failure");
-    cli.run(&wt, &["up"]).failure();
-    let calls = std::fs::read_to_string(cli.state.path().join("docker-calls")).unwrap();
-    assert!(
-        calls.lines().all(|line| line.starts_with("inspect ")),
-        "{calls}"
-    );
-}
-
-#[test]
-fn running_resource_waits_for_its_port_without_starting_it_again() {
-    let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = reservation.local_addr().unwrap().port();
-    let cli = stopped_resource_fixture(
-        port,
-        "mongo:8",
-        serde_json::json!({format!("{port}/tcp"): [{"HostIp":"127.0.0.1", "HostPort":port.to_string()}]}),
-    );
-    let docker = cli.docker.as_ref().unwrap();
-    let mut fixture: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&docker.inspect).unwrap()).unwrap();
-    fixture[0]["State"]["Running"] = true.into();
-    std::fs::write(&docker.inspect, fixture.to_string()).unwrap();
-    let root = cli.state.path().to_owned();
-    let (stop, stopped) = std::sync::mpsc::channel();
-    drop(reservation);
-    let server = std::thread::spawn(move || {
-        while !root.join("docker-calls").exists() {
-            match stopped.recv_timeout(std::time::Duration::from_millis(10)) {
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                _ => return,
-            }
-        }
-        let _listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
-        let _ = stopped.recv_timeout(std::time::Duration::from_secs(15));
-    });
-    let wt = cli.worktree("running_resource");
-    let result = cli.run(&wt, &["up"]);
-    let _ = stop.send(());
-    server.join().unwrap();
-    result.success();
-    let calls = std::fs::read_to_string(cli.state.path().join("docker-calls")).unwrap();
-    assert!(
-        calls.lines().all(|line| line.starts_with("inspect ")),
-        "{calls}"
-    );
-}
-
-#[test]
 fn long_database_names_are_bounded_stable_and_used_by_seed_env_and_registry() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("database listener");
     let port = listener.local_addr().expect("address").port();
@@ -4800,4 +4748,173 @@ command = "printf '%s' '{{{{ db.name }}}}' > seed-db.txt"
         names.len(),
         "long names share a truncated prefix but must differ"
     );
+}
+
+fn venv_worktree(cli: &Cli) -> std::path::PathBuf {
+    let wt = cli.worktree("venv_before");
+    std::fs::create_dir_all(wt.join("backend")).unwrap();
+    std::fs::write(wt.join("backend/install.py"), r#"
+import pathlib, sys, venv
+root = pathlib.Path('.venv')
+venv.EnvBuilder(with_pip=False).create(root)
+if pathlib.Path('fail').exists():
+    sys.exit(1)
+script = root / 'bin' / 'probe'
+if not script.exists():
+    script.write_text('#!' + str(root.resolve() / 'bin' / 'python') + '\nimport sys\nprint(sys.prefix)\n')
+    script.chmod(0o755)
+with open('installs', 'a') as log:
+    log.write('installed\n')
+"#).unwrap();
+    wt
+}
+
+const VENV_SETUP_CONFIG: &str = r#"
+version = 1
+[ports]
+names = ["backend"]
+[[service]]
+name = "backend"
+cwd = "backend"
+setup = "python3 install.py"
+command = "sleep 60"
+"#;
+
+#[test]
+fn moved_worktree_rebuilds_its_real_venv_and_console_script() {
+    for same_basename in [false, true] {
+        let cli = Cli::with_config(VENV_SETUP_CONFIG);
+        let wt = venv_worktree(&cli);
+        cli.run(&wt, &["up"]).success();
+        cli.run(&wt, &["down"]).success();
+        let parent = wt.parent().unwrap().join("relocated");
+        std::fs::create_dir_all(&parent).unwrap();
+        let moved = parent.join(if same_basename {
+            "venv_before"
+        } else {
+            "venv_after"
+        });
+        common::git(
+            &cli.fx.main,
+            &[
+                "worktree",
+                "move",
+                wt.to_str().unwrap(),
+                moved.to_str().unwrap(),
+            ],
+        );
+        cli.started.borrow_mut().push(moved.clone());
+        assert!(
+            std::process::Command::new(moved.join("backend/.venv/bin/probe"))
+                .output()
+                .is_err()
+        );
+        cli.run(&moved, &["up"]).success();
+        let output = std::process::Command::new(moved.join("backend/.venv/bin/probe"))
+            .output()
+            .expect("relocated console script");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            moved
+                .join("backend/.venv")
+                .canonicalize()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        );
+        cli.run(&moved, &["up"]).success();
+        assert_eq!(input_setup_runs(&moved), 2);
+    }
+}
+
+#[test]
+fn unrecorded_venv_rebuilds_once_and_failed_rebuild_restores_it() {
+    let cli = Cli::with_config(VENV_SETUP_CONFIG);
+    let wt = venv_worktree(&cli);
+    let backend = wt.join("backend");
+    assert!(
+        std::process::Command::new("python3")
+            .arg("install.py")
+            .current_dir(&backend)
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(backend.join(".venv/preserved"), "old install").unwrap();
+    std::fs::write(backend.join("fail"), "fail").unwrap();
+    cli.run(&wt, &["up"]).failure();
+    assert_eq!(
+        std::fs::read_to_string(backend.join(".venv/preserved")).unwrap(),
+        "old install"
+    );
+    assert!(!backend.join(".venv/.grove-setup-path").exists());
+    std::fs::remove_file(backend.join("fail")).unwrap();
+    cli.run(&wt, &["up"]).success();
+    assert!(!backend.join(".venv/preserved").exists());
+    cli.run(&wt, &["up"]).success();
+    assert_eq!(input_setup_runs(&wt), 2);
+}
+
+#[test]
+fn resource_inspect_failure_never_creates_or_starts_a_container() {
+    let cli = stopped_resource_fixture(0, "mongo:8", serde_json::json!({}));
+    cli.docker.as_ref().unwrap().set_unreadable_inspect();
+    let wt = cli.worktree("inspect_failure");
+    cli.run(&wt, &["up"]).failure();
+    let calls = std::fs::read_to_string(cli.state.path().join("docker-calls")).unwrap();
+    assert!(
+        calls.lines().all(|line| line.starts_with("inspect ")),
+        "{calls}"
+    );
+}
+
+#[test]
+fn running_resource_waits_for_its_port_without_starting_it_again() {
+    let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = reservation.local_addr().unwrap().port();
+    let cli = stopped_resource_fixture(
+        port,
+        "mongo:8",
+        serde_json::json!({format!("{port}/tcp"): [{"HostIp":"127.0.0.1", "HostPort":port.to_string()}]}),
+    );
+    let docker = cli.docker.as_ref().unwrap();
+    let mut fixture: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&docker.inspect).unwrap()).unwrap();
+    fixture[0]["State"]["Running"] = true.into();
+    std::fs::write(&docker.inspect, fixture.to_string()).unwrap();
+    let root = cli.state.path().to_owned();
+    let (stop, stopped) = std::sync::mpsc::channel();
+    drop(reservation);
+    let server = std::thread::spawn(move || {
+        while !root.join("docker-calls").exists() {
+            match stopped.recv_timeout(std::time::Duration::from_millis(10)) {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                _ => return,
+            }
+        }
+        let _listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let _ = stopped.recv_timeout(std::time::Duration::from_secs(15));
+    });
+    let wt = cli.worktree("running_resource");
+    let result = cli.run(&wt, &["up"]);
+    let _ = stop.send(());
+    server.join().unwrap();
+    result.success();
+    let calls = std::fs::read_to_string(cli.state.path().join("docker-calls")).unwrap();
+    assert!(
+        calls.lines().all(|line| line.starts_with("inspect ")),
+        "{calls}"
+    );
+}
+
+#[test]
+fn symlinked_empty_venv_is_refused_before_setup_can_modify_its_target() {
+    let cli = Cli::with_config(VENV_SETUP_CONFIG);
+    let wt = venv_worktree(&cli);
+    let external = TempDir::new().unwrap();
+    std::os::unix::fs::symlink(external.path(), wt.join("backend/.venv")).unwrap();
+    cli.run(&wt, &["up"]).failure();
+    assert_eq!(std::fs::read_dir(external.path()).unwrap().count(), 0);
+    assert!(!wt.join("backend/installs").exists());
 }

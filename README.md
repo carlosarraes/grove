@@ -325,3 +325,23 @@ An existing running container gets the normal readiness wait. A reachable extern
 Rendered database names longer than 63 bytes use a shortened prefix and a stable 16-digit hash of the full name.
 Names at or below the limit stay unchanged. Grove uses the same bounded name in generated environment files, seeds and the registry.
 The instance slug, service paths and port allocation stay unchanged.
+
+## Resource initialization failures
+
+Grove stops `up` when a managed resource's init command exits nonzero, before dependency setup, seeds, or services start.
+It saves a pending-init record under its state directory, tied to the container ID, before it runs the command.
+The next `up` retries that command even if the port already answers. Only a successful command clears the record.
+
+A resource lock serializes startup and initialization across worktrees that share the resource name.
+Existing reachable resources without a pending record keep their current behavior. Grove does not initialize external databases.
+
+Init commands must be safe to retry after partial completion. For a Mongo replica set, this example accepts success or only `AlreadyInitialized`:
+
+```toml
+init = "try { const r = rs.initiate(); if (r.ok !== 1) throw r; } catch (e) { if (e.code !== 23) { printjson(e); quit(1); } }"
+```
+
+MongoDB defines [error 23 as AlreadyInitialized](https://www.mongodb.com/docs/manual/reference/error-codes/).
+Other errors and unexpected results exit nonzero. Grove does not suppress them.
+Init runs through `mongosh --eval`; a custom script must report failure with a nonzero exit, rather than print an error and exit successfully.
+Grove leaves the container intact after failure so a retry can finish initialization without data loss.

@@ -50,7 +50,7 @@ kind = "docker-shared"
 image = "mongo:8.0.23"
 args = ["--replSet", "rs0"]
 port = 27017
-init = "rs.initiate()"
+init = "try { const r = rs.initiate(); if (r.ok !== 1) throw r; } catch (e) { if (e.code !== 23) { printjson(e); quit(1); } }"
 db_name = "app_{{ slug }}"
 
 [[service]]

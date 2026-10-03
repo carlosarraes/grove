@@ -103,7 +103,7 @@ pub struct Resource {
     #[serde(default)]
     pub args: Vec<String>,
     pub port: u16,
-    /// Command run once against a freshly started resource, e.g. `rs.initiate()`.
+    /// Mongo shell command after resource startup; must be safe to retry after failure.
     pub init: Option<String>,
     /// Per-instance database name. A template.
     pub db_name: Option<String>,

@@ -4918,3 +4918,252 @@ fn symlinked_empty_venv_is_refused_before_setup_can_modify_its_target() {
     assert_eq!(std::fs::read_dir(external.path()).unwrap().count(), 0);
     assert!(!wt.join("backend/installs").exists());
 }
+
+/// Docker is the external boundary; the real CLI, state files, TCP port and
+/// child-process ordering stay under test.
+struct InitResourceRig {
+    cli: Cli,
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    server: Option<std::thread::JoinHandle<()>>,
+}
+
+impl InitResourceRig {
+    fn new() -> Self {
+        Self::with_delayed_port(false)
+    }
+
+    fn with_delayed_port(delayed: bool) -> Self {
+        let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        let config = format!(
+            "{}\n[[service]]\nname = 'worker'\nsetup = 'touch setup-ran'\ncommand = 'touch service-ran; sleep 60'\n",
+            resource_seed_config(port, "touch seed-ran").replace(
+                &format!("port = {port}"),
+                &format!("port = {port}\ninit = 'initialize()'")
+            )
+        );
+        let cli = Cli::with_fake_docker(&config, "init-container");
+        let docker = cli.docker.as_ref().unwrap();
+        let inspect = serde_json::json!([{
+            "Id": "init-container", "State": {"Running": false, "ExitCode": 0},
+            "Config": {"Image": "mongo:8"},
+            "HostConfig": {"PortBindings": {format!("{port}/tcp"): [
+                {"HostIp": "127.0.0.1", "HostPort": port.to_string()}
+            ]}}
+        }]);
+        std::fs::write(&docker.inspect, inspect.to_string()).unwrap();
+        std::fs::write(
+            &docker.program,
+            r#"#!/bin/sh
+root=$(dirname "$GROVE_DOCKER_INSPECT")
+case "$1" in
+ inspect) cat "$GROVE_DOCKER_INSPECT" ;;
+ start|run)
+  if [ "$1" = run ]; then echo init-container; fi
+  touch "$root/start-requested"
+  if [ -f "$root/delay-port" ]; then exit 0; fi
+  i=0
+  while [ ! -f "$root/port-ready" ] && [ "$i" -lt 500 ]; do
+   sleep 0.01; i=$((i + 1))
+  done
+  test -f "$root/port-ready" ;;
+ exec)
+  echo attempt >> "$root/init-attempts"
+  if [ -f "$root/fail-init" ]; then echo 'initialization deliberately failed' >&2; exit 42; fi
+  if ! mkdir "$root/init-active"; then echo overlap >&2; exit 43; fi
+  sleep 0.2
+  rmdir "$root/init-active"
+  touch "$root/init-succeeded" ;;
+ *) exit 91 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::write(cli.state.path().join("fail-init"), "").unwrap();
+        let root = cli.state.path().to_path_buf();
+        if delayed {
+            std::fs::write(root.join("delay-port"), "").unwrap();
+        } else {
+            std::fs::write(root.join("allow-listen"), "").unwrap();
+        }
+        let (stop, stopped) = std::sync::mpsc::channel();
+        drop(reservation);
+        let server = std::thread::spawn(move || {
+            while !root.join("start-requested").exists() || !root.join("allow-listen").exists() {
+                if stopped
+                    .recv_timeout(std::time::Duration::from_millis(10))
+                    .is_ok()
+                {
+                    return;
+                }
+            }
+            let _listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+            let mut running = inspect;
+            running[0]["State"]["Running"] = true.into();
+            std::fs::write(root.join("docker-inspect.json"), running.to_string()).unwrap();
+            std::fs::write(root.join("port-ready"), "").unwrap();
+            let _ = stopped.recv();
+        });
+        Self {
+            cli,
+            stop: Some(stop),
+            server: Some(server),
+        }
+    }
+}
+
+impl Drop for InitResourceRig {
+    fn drop(&mut self) {
+        let _ = self.stop.take().unwrap().send(());
+        self.server.take().unwrap().join().unwrap();
+    }
+}
+
+#[test]
+fn failed_resource_init_blocks_work_and_retries_after_the_port_opens() {
+    let rig = InitResourceRig::new();
+    let wt = rig.cli.worktree("init_retry");
+    for _ in 0..2 {
+        let output = rig.cli.run(&wt, &["up"]).failure().get_output().clone();
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("initialization deliberately failed")
+        );
+        for path in ["setup-ran", "seed-ran", "service-ran"] {
+            assert!(!wt.join(path).exists(), "{path} ran before init succeeded");
+        }
+    }
+    std::fs::remove_file(rig.cli.state.path().join("fail-init")).unwrap();
+    rig.cli.run(&wt, &["up"]).success();
+    assert!(wt.join("setup-ran").exists());
+    assert!(wt.join("seed-ran").exists());
+    rig.cli.run(&wt, &["up"]).success();
+    assert_eq!(
+        std::fs::read_to_string(rig.cli.state.path().join("init-attempts"))
+            .unwrap()
+            .lines()
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn pending_resource_init_does_not_follow_a_replaced_container_or_external_port() {
+    for replacement in ["different-container", "external"] {
+        let rig = InitResourceRig::new();
+        let wt = rig.cli.worktree("init_identity");
+        rig.cli.run(&wt, &["up"]).failure();
+        let docker = rig.cli.docker.as_ref().unwrap();
+        if replacement == "external" {
+            std::fs::write(&docker.inspect, "[]").unwrap();
+        } else {
+            docker.set_container(replacement, true, 0, None);
+        }
+        // fail-init remains present: any accidental exec would fail this up.
+        rig.cli.run(&wt, &["up"]).success();
+        assert_eq!(
+            std::fs::read_to_string(rig.cli.state.path().join("init-attempts"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn pending_resource_init_fails_closed_when_docker_cannot_confirm_ownership() {
+    let rig = InitResourceRig::new();
+    let wt = rig.cli.worktree("init_unknown");
+    rig.cli.run(&wt, &["up"]).failure();
+    rig.cli.docker.as_ref().unwrap().set_unreadable_inspect();
+    rig.cli.run(&wt, &["up"]).failure();
+    assert!(!wt.join("setup-ran").exists());
+    assert_eq!(
+        std::fs::read_to_string(rig.cli.state.path().join("init-attempts"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn concurrent_worktrees_complete_pending_resource_init_only_once() {
+    let rig = InitResourceRig::new();
+    let first = rig.cli.worktree("init_first");
+    let second = rig.cli.worktree("init_second");
+    rig.cli.run(&first, &["up"]).failure();
+    std::fs::remove_file(rig.cli.state.path().join("fail-init")).unwrap();
+    let docker = rig.cli.docker.as_ref().unwrap();
+    let mut children = Vec::new();
+    for wt in [&first, &second] {
+        children.push(
+            std::process::Command::new(assert_cmd::cargo::cargo_bin!("grove"))
+                .current_dir(wt)
+                .env("GROVE_STATE_DIR", rig.cli.state.path())
+                .env("GROVE_PORT_RANGE", rig.cli.port_range())
+                .env("GROVE_DOCKER", &docker.program)
+                .env("GROVE_DOCKER_INSPECT", &docker.inspect)
+                .args(["up"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+    }
+    for child in children {
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(first.join("seed-ran").exists());
+    assert!(second.join("seed-ran").exists());
+    assert_eq!(
+        std::fs::read_to_string(rig.cli.state.path().join("init-attempts"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn resource_init_retries_after_startup_readiness_timed_out() {
+    let rig = InitResourceRig::with_delayed_port(true);
+    let wt = rig.cli.worktree("init_late_port");
+    let output = rig.cli.run(&wt, &["up"]).failure().get_output().clone();
+    assert!(String::from_utf8_lossy(&output.stderr).contains("never answered on port"));
+    std::fs::write(rig.cli.state.path().join("allow-listen"), "").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !rig.cli.state.path().join("port-ready").exists() {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    rig.cli.run(&wt, &["up"]).failure();
+    assert!(!wt.join("seed-ran").exists());
+    std::fs::remove_file(rig.cli.state.path().join("fail-init")).unwrap();
+    rig.cli.run(&wt, &["up"]).success();
+    assert!(wt.join("seed-ran").exists());
+}
+
+#[test]
+fn newly_created_resource_keeps_init_pending_until_success() {
+    let rig = InitResourceRig::new();
+    std::fs::write(&rig.cli.docker.as_ref().unwrap().inspect, "[]").unwrap();
+    let wt = rig.cli.worktree("init_created");
+    rig.cli.run(&wt, &["up"]).failure();
+    assert!(!wt.join("setup-ran").exists());
+    std::fs::remove_file(rig.cli.state.path().join("fail-init")).unwrap();
+    rig.cli.run(&wt, &["up"]).success();
+    assert!(wt.join("seed-ran").exists());
+    assert_eq!(
+        std::fs::read_to_string(rig.cli.state.path().join("init-attempts"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+}

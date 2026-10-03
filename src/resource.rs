@@ -135,9 +135,100 @@ pub fn observe(resource: &Resource) -> Observation {
     }
 }
 
-/// Start the datastore if nothing is answering, then run its one-time init. Returns
-/// whether anything was started, so callers can report it.
+/// Serialize startup and finish any initialization left pending by an earlier up.
+/// A reachable external datastore remains usable without Docker initialization.
 pub fn ensure(resource: &Resource) -> Result<EnsureResult> {
+    let key: String = resource
+        .name
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let directory = crate::instance::state_dir()?.join("resources").join(key);
+    std::fs::create_dir_all(&directory)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(directory.join("init.lock"))?;
+    crate::timing::measure(
+        &format!("resource {}: init lock wait", resource.name),
+        || Ok(lock.lock()?),
+    )?;
+    let pending_path = directory.join("pending-init.json");
+    let result = ensure_started(resource, &pending_path)?;
+    let pending: Option<String> = match std::fs::read(&pending_path) {
+        Ok(bytes) => Some(
+            serde_json::from_slice(&bytes).context("reading pending resource initialization")?,
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("reading pending resource initialization"),
+    };
+    let container = result.observation.container.as_ref();
+    let retry = pending
+        .as_ref()
+        .is_some_and(|id| container.is_some_and(|c| &c.id == id));
+    if pending.is_some() && result.observation.docker_error.is_some() {
+        bail!(
+            "cannot verify pending initialization for resource {}: {}",
+            resource.name,
+            result
+                .observation
+                .docker_error
+                .as_deref()
+                .unwrap_or_default()
+        );
+    }
+    if retry || ((result.started || result.created) && resource.init.is_some()) {
+        let init = resource.init.as_ref().with_context(|| {
+            format!(
+                "resource {} has pending initialization but no init command",
+                resource.name
+            )
+        })?;
+        let container = container.with_context(|| {
+            format!(
+                "cannot identify managed container for initialization of {}",
+                resource.name
+            )
+        })?;
+        validate_existing(resource, container)?;
+        if !container.running {
+            bail!(
+                "managed container for {} is not running; refusing initialization against an external listener",
+                resource.name
+            );
+        }
+        docker(&[
+            "exec".to_string(),
+            container.id.clone(),
+            "mongosh".to_string(),
+            "--quiet".to_string(),
+            "--eval".to_string(),
+            init.clone(),
+        ])
+        .with_context(|| {
+            format!(
+                "initializing resource {}; initialization remains pending for the next up",
+                resource.name
+            )
+        })?;
+        std::fs::remove_file(&pending_path)
+            .context("clearing completed resource initialization")?;
+    }
+    Ok(result)
+}
+
+fn record_pending(path: &std::path::Path, id: &str) -> Result<()> {
+    use std::io::Write;
+    let temporary = path.with_extension("tmp");
+    let mut record = std::fs::File::create(&temporary)?;
+    record.write_all(&serde_json::to_vec(id)?)?;
+    record.sync_all()?;
+    std::fs::rename(&temporary, path).context("publishing pending resource initialization")
+}
+
+fn ensure_started(resource: &Resource, pending: &std::path::Path) -> Result<EnsureResult> {
     match decide(resource) {
         Decision::Reuse { .. } => Ok(EnsureResult {
             started: false,
@@ -178,30 +269,30 @@ pub fn ensure(resource: &Resource) -> Result<EnsureResult> {
                 }
                 None => Some(argv),
             };
+            // A stopped container's identity is already known. Record the work
+            // before start so even a failed start or readiness wait remains retryable.
+            if resource.init.is_some()
+                && let Some(container) = &existing.container
+            {
+                record_pending(pending, &container.id)?;
+            }
             if let Some(command) = &command {
-                docker(command).with_context(|| {
+                let output = docker(command).with_context(|| {
                     format!(
                         "starting `{}` on port {}. If you provide {} yourself, start it and \
                      run `grove up` again.",
                         resource.name, resource.port, resource.name
                     )
                 })?;
+                if resource.init.is_some() && existing.container.is_none() {
+                    if output.is_empty() {
+                        bail!("Docker returned no container ID for {}", resource.name);
+                    }
+                    record_pending(pending, &output)?;
+                }
             }
             wait_reachable(resource)?;
 
-            if let Some(init) = &resource.init {
-                // Best effort: on a container that was already initialised this fails
-                // harmlessly, and there is no cheap way to distinguish that from a real
-                // problem without knowing the datastore.
-                let _ = docker(&[
-                    "exec".to_string(),
-                    container_name(resource),
-                    "mongosh".to_string(),
-                    "--quiet".to_string(),
-                    "--eval".to_string(),
-                    init.clone(),
-                ]);
-            }
             Ok(EnsureResult {
                 started: command.is_some(),
                 created: existing.container.is_none(),

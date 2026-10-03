@@ -5167,3 +5167,292 @@ fn newly_created_resource_keeps_init_pending_until_success() {
         2
     );
 }
+
+// Startup admission is exercised through real workers and OS locks. Removing the
+// gate, moving it after setup, or leaking a slot to a service breaks these tests.
+#[test]
+fn startup_admission_is_opt_in_and_checks_load_before_setup() {
+    for (heavy, load, threshold, succeeds) in [
+        (true, "1", "", true),
+        (true, "4", "", false),
+        (true, "8", "max_load = 9\n", true),
+        (false, "8", "", true),
+        (true, "NaN", "", false),
+    ] {
+        let config = format!(
+            "{}\n[admission]\n{threshold}timeout = \"100ms\"\n",
+            CONFIG.replace(
+                "name = \"web\"",
+                "name = \"web\"\nsetup = \"touch setup-ran\""
+            )
+        );
+        let cli = Cli::with_config(&config);
+        let wt = cli.worktree("startup");
+        let mut command = Command::cargo_bin("grove").unwrap();
+        command
+            .current_dir(&wt)
+            .env("GROVE_STATE_DIR", cli.state.path())
+            .env("GROVE_PORT_RANGE", cli.port_range())
+            .env("GROVE_LOAD", load)
+            .env("GROVE_CORES", "4")
+            .arg("up");
+        if heavy {
+            command.arg("--heavy");
+        }
+        let output = command.output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.success(), succeeds, "{stderr}");
+        assert_eq!(wt.join("setup-ran").exists(), succeeds, "{stderr}");
+        if heavy {
+            assert!(stderr.contains("timing: startup queue:"), "{stderr}");
+            if !succeeds {
+                assert!(
+                    stderr.contains(if load == "NaN" {
+                        "valid load"
+                    } else {
+                        "timed out"
+                    }),
+                    "{stderr}"
+                );
+            }
+        } else {
+            assert!(!stderr.contains("startup queue"), "{stderr}");
+        }
+    }
+}
+
+struct StartupChild(std::process::Child, std::path::PathBuf, std::path::PathBuf);
+impl Drop for StartupChild {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            // SAFETY: this unreaped worker and process group belong to the test.
+            unsafe {
+                libc::kill(-(self.0.id() as i32), libc::SIGKILL);
+            }
+            let _ = self.0.wait();
+        }
+        let _ = Command::cargo_bin("grove")
+            .unwrap()
+            .current_dir(&self.1)
+            .env("GROVE_STATE_DIR", &self.2)
+            .arg("down")
+            .output();
+    }
+}
+
+fn startup_worker(cli: &Cli, wt: &Path, state: &Path, load: &str) -> StartupChild {
+    use std::os::unix::process::CommandExt;
+    let log = std::fs::File::create(wt.join("startup-test.log")).unwrap();
+    StartupChild(
+        std::process::Command::new(assert_cmd::cargo::cargo_bin("grove"))
+            .current_dir(wt)
+            .env("GROVE_STATE_DIR", state)
+            .env("GROVE_PORT_RANGE", cli.port_range())
+            .env("GROVE_LOAD", load)
+            .env("GROVE_CORES", "4")
+            .args(["up", "--heavy", "--up-log-child"])
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .process_group(0)
+            .spawn()
+            .unwrap(),
+        wt.to_path_buf(),
+        state.to_path_buf(),
+    )
+}
+
+fn startup_wait(wt: &Path, marker: &str, child: &mut StartupChild) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !wt.join(marker).exists() {
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "worker exited: {}",
+            std::fs::read_to_string(wt.join("startup-test.log")).unwrap()
+        );
+        assert!(std::time::Instant::now() < deadline, "waiting for {marker}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn startup_admission_limits_separate_repos_and_releases_slots_before_service_exit() {
+    let config = format!("{}\n[admission]\ntimeout = \"200ms\"\n", CONFIG.replace(
+        "name = \"web\"", "name = \"web\"\nsetup = \"touch entered; while ! test -f release; do sleep 0.05; done\""));
+    let a = Cli::with_config(&config);
+    let b = Cli::with_config(&config);
+    let aw = a.worktree("first");
+    let bw = b.worktree("second");
+    let cw = a.worktree("third");
+    let mut first = startup_worker(&a, &aw, a.state.path(), "0");
+    startup_wait(&aw, "entered", &mut first);
+    let mut second = startup_worker(&b, &bw, a.state.path(), "0");
+    startup_wait(&bw, "entered", &mut second);
+    let mut third = startup_worker(&a, &cw, a.state.path(), "0");
+    assert!(!third.0.wait().unwrap().success());
+    assert!(!cw.join("entered").exists());
+    assert!(
+        std::fs::read_to_string(cw.join("startup-test.log"))
+            .unwrap()
+            .contains("timed out")
+    );
+    std::fs::write(aw.join("release"), "").unwrap();
+    assert!(first.0.wait().unwrap().success());
+    std::fs::write(cw.join("release"), "").unwrap();
+    let mut next = startup_worker(&a, &cw, a.state.path(), "0");
+    assert!(
+        next.0.wait().unwrap().success(),
+        "slot inherited by running service"
+    );
+    std::fs::write(bw.join("release"), "").unwrap();
+    assert!(second.0.wait().unwrap().success());
+    Command::cargo_bin("grove")
+        .unwrap()
+        .current_dir(&bw)
+        .env("GROVE_STATE_DIR", a.state.path())
+        .arg("down")
+        .assert()
+        .success();
+}
+
+#[test]
+fn startup_admission_does_not_reserve_capacity_while_waiting_for_load() {
+    let cli = Cli::with_config(&format!("{CONFIG}\n[admission]\ntimeout = \"60s\"\n"));
+    let waiting = cli.worktree("loaded");
+    let mut loaded = startup_worker(&cli, &waiting, cli.state.path(), "8");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let log = std::fs::read_to_string(waiting.join("startup-test.log")).unwrap();
+        if log.contains("startup admission: waiting") {
+            break;
+        }
+        assert!(loaded.0.try_wait().unwrap().is_none(), "{log}");
+        assert!(std::time::Instant::now() < deadline, "{log}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // Both slots must remain available to low-load attempts. Block at readiness,
+    // after setup, to also prove the reservation lasts until health passes.
+    let config = format!("{}\n[admission]\ntimeout = \"200ms\"\n", CONFIG.replace(
+        "python3 -u -m http.server {{ port.web }}",
+        "touch service-started; while ! test -f ready; do sleep 0.05; done; exec python3 -u -m http.server {{ port.web }}"));
+    let other = Cli::with_config(&config);
+    let aw = other.worktree("ready_a");
+    let bw = other.worktree("ready_b");
+    let cw = other.worktree("ready_c");
+    let mut a = startup_worker(&other, &aw, cli.state.path(), "0");
+    startup_wait(&aw, "service-started", &mut a);
+    let mut b = startup_worker(&other, &bw, cli.state.path(), "0");
+    startup_wait(&bw, "service-started", &mut b);
+    assert!(
+        loaded.0.try_wait().unwrap().is_none(),
+        "load waiter ended before capacity proof"
+    );
+    let mut c = startup_worker(&other, &cw, cli.state.path(), "0");
+    assert!(!c.0.wait().unwrap().success());
+    assert!(!cw.join("service-started").exists());
+    for wt in [&aw, &bw] {
+        std::fs::write(wt.join("ready"), "").unwrap();
+    }
+    assert!(a.0.wait().unwrap().success());
+    assert!(b.0.wait().unwrap().success());
+    for wt in [&aw, &bw] {
+        Command::cargo_bin("grove")
+            .unwrap()
+            .current_dir(wt)
+            .env("GROVE_STATE_DIR", cli.state.path())
+            .arg("down")
+            .assert()
+            .success();
+    }
+}
+
+#[test]
+fn startup_admission_releases_slots_on_setup_failure_and_worker_death() {
+    let config = format!(
+        "{}\n[admission]\ntimeout = \"200ms\"\n",
+        CONFIG.replace(
+            "name = \"web\"",
+            "name = \"web\"\nsetup = \"touch entered; test ! -f fail; exit 19\""
+        )
+    );
+    let cli = Cli::with_config(&config);
+    for index in 0..3 {
+        let wt = cli.worktree(&format!("failure_{index}"));
+        let mut worker = startup_worker(&cli, &wt, cli.state.path(), "0");
+        assert!(!worker.0.wait().unwrap().success());
+        assert!(
+            wt.join("entered").exists(),
+            "earlier failure leaked its slot"
+        );
+    }
+    let config = format!("{}\n[admission]\ntimeout = \"200ms\"\n", CONFIG.replace(
+        "name = \"web\"", "name = \"web\"\nsetup = \"touch entered; while ! test -f release; do sleep 0.05; done\""));
+    let other = Cli::with_config(&config);
+    for (index, signal) in [libc::SIGTERM, libc::SIGINT, libc::SIGKILL]
+        .into_iter()
+        .enumerate()
+    {
+        let wt = other.worktree(&format!("cancel_{index}"));
+        let mut worker = startup_worker(&other, &wt, cli.state.path(), "0");
+        startup_wait(&wt, "entered", &mut worker);
+        // Signal only the worker, as the log supervisor does. Its children must not
+        // inherit the lock. Keep them alive until two successors have reached setup.
+        unsafe {
+            libc::kill(worker.0.id() as i32, signal);
+        }
+        assert!(!worker.0.wait().unwrap().success());
+        let a = other.worktree(&format!("next_a_{index}"));
+        let b = other.worktree(&format!("next_b_{index}"));
+        let mut aw = startup_worker(&other, &a, cli.state.path(), "0");
+        startup_wait(&a, "entered", &mut aw);
+        let mut bw = startup_worker(&other, &b, cli.state.path(), "0");
+        startup_wait(&b, "entered", &mut bw);
+        // Clean the setup left alive by PID-directed cancellation, before its group
+        // leader can be reused. This is existing up cancellation behavior.
+        unsafe {
+            libc::kill(-(worker.0.id() as i32), libc::SIGKILL);
+        }
+    }
+}
+
+#[test]
+fn startup_admission_cancellation_while_queued_never_reaches_setup() {
+    let config = format!(
+        "{}\n[admission]\ntimeout = \"30s\"\n",
+        CONFIG.replace(
+            "name = \"web\"",
+            "name = \"web\"\nsetup = \"touch setup-ran\""
+        )
+    );
+    let cli = Cli::with_config(&config);
+    let wt = cli.worktree("cancel_queue");
+    use std::os::unix::process::CommandExt;
+    let log = std::fs::File::create(wt.join("startup-test.log")).unwrap();
+    let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("grove"))
+        .current_dir(&wt)
+        .env("GROVE_STATE_DIR", cli.state.path())
+        .env("GROVE_PORT_RANGE", cli.port_range())
+        .env("GROVE_LOAD", "100")
+        .args(["up", "--heavy"])
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let mut child = StartupChild(child, wt.clone(), cli.state.path().to_path_buf());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let log = std::fs::read_to_string(wt.join("startup-test.log")).unwrap();
+        if log.contains("startup admission: waiting") {
+            break;
+        }
+        assert!(child.0.try_wait().unwrap().is_none(), "{log}");
+        assert!(std::time::Instant::now() < deadline, "{log}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // SAFETY: the logged up supervisor is the unreaped child owned by this test.
+    unsafe {
+        libc::kill(child.0.id() as i32, libc::SIGTERM);
+    }
+    assert_eq!(child.0.wait().unwrap().code(), Some(143));
+    assert!(!wt.join("setup-ran").exists());
+}

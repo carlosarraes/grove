@@ -165,13 +165,18 @@ needed data, then deliberately remove and recreate that container.
   if_exists          skip unless this path exists, relative to cwd -- for a fixture
                      that may not have been fetched
 
-  [admission]        optional; used only by `grove run --heavy -- <command>`
+  [admission]        optional; used by `grove run --heavy -- <command>` and `grove up --heavy`
     max_load         positive finite number; omit to use available core count
     timeout          positive duration, default "10m"; covers admission only
-                     Waits for one-minute load strictly below max_load. Samples every
-                     2s, prints wait status every 15s. Timeout or unreadable load fails
-                     without a child. Plain run does not wait. Keep fleetlock's slot
-                     limit: load averages lag and do not measure memory or reserve capacity.
+                     Both wait for one-minute load strictly below max_load and report
+                     waiting every 15s. Plain run and up do not wait. Timeout or invalid
+                     load fails before starting work.
+                     run --heavy polls every 2s. It reserves no capacity; keep fleetlock.
+                     up --heavy polls every 200ms, reserving one of two startup slots
+                     under the shared state root before rechecking load. It releases
+                     the slot while overloaded, and holds it through setup, seeds and
+                     readiness once admitted. Queue time is separate from readiness.
+                     Load averages lag and do not measure free memory.
 
   [idle]             optional; opt in to stopping forgotten instances
   stop_after         e.g. "2h". Every `grove up` for this repo first stops its sibling

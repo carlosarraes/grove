@@ -118,6 +118,80 @@ fn wait_with_samples(
     }
 }
 
+/// Reserve one of two startup slots across repositories sharing this user's state
+/// root. The returned file owns the OS lock; it is closed on exec and process exit.
+pub fn wait_for_startup(config: &crate::config::Admission) -> anyhow::Result<std::fs::File> {
+    crate::timing::measure("startup queue", || {
+        use anyhow::{Context, bail};
+        use std::fs::{OpenOptions, TryLockError};
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::time::{Duration, Instant};
+
+        let timeout = crate::instance::parse_duration(&config.timeout)?;
+        let began = Instant::now();
+        let directory = crate::instance::state_dir()?.join("startup-slots");
+        std::fs::create_dir_all(&directory).context("creating startup slot directory")?;
+        // Never unlink these files: replacing an inode could admit a third startup.
+        let slots = (1..=2)
+            .map(|number| {
+                OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .mode(0o600)
+                    .open(directory.join(format!("{number}.lock")))
+                    .context("opening startup slot")
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut heartbeat = Duration::ZERO;
+        loop {
+            let elapsed = began.elapsed();
+            if elapsed >= timeout {
+                bail!(
+                    "startup admission: timed out after {:.1}s; startup was not started",
+                    elapsed.as_secs_f64()
+                );
+            }
+            let mut reason = "both startup slots occupied".to_string();
+            for (index, slot) in slots.iter().enumerate() {
+                match slot.try_lock() {
+                    Ok(()) => {}
+                    Err(TryLockError::WouldBlock) => continue,
+                    Err(error) => return Err(error).context("locking startup slot"),
+                }
+                // Sample only after reserving capacity. A load wait never holds it.
+                let load = sample()
+                    .filter(|load| load.one.is_finite() && load.one >= 0.0)
+                    .context("startup admission: cannot read a valid load average; startup was not started")?;
+                let threshold = config.max_load.unwrap_or(load.cores as f64);
+                if load.one < threshold {
+                    eprintln!(
+                        "startup admission: admitted (load {:.2}, threshold {:.2})",
+                        load.one, threshold
+                    );
+                    // Move the locked file out of the collection without duplicating it.
+                    return Ok(slots.into_iter().nth(index).unwrap());
+                }
+                slot.unlock()
+                    .context("releasing startup slot while waiting for load")?;
+                reason = format!("load {:.2}, threshold {:.2}", load.one, threshold);
+                break;
+            }
+            let elapsed = began.elapsed();
+            if elapsed >= heartbeat {
+                eprintln!(
+                    "startup admission: waiting ({reason}, elapsed {:.1}s, timeout {})",
+                    elapsed.as_secs_f64(),
+                    config.timeout
+                );
+                heartbeat = elapsed + Duration::from_secs(15);
+            }
+            std::thread::sleep(Duration::from_millis(200).min(timeout.saturating_sub(elapsed)));
+        }
+    })
+}
+
 #[cfg(test)]
 mod admission_tests {
     use super::{Load, wait_with_samples};

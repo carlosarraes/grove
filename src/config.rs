@@ -27,7 +27,7 @@ pub struct Config {
     pub admission: Option<Admission>,
 }
 
-/// Optional limits for `run --heavy`; ordinary commands do not wait.
+/// Optional limits for `run --heavy` and `up --heavy`; ordinary commands do not wait.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Admission {

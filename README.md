@@ -144,7 +144,7 @@ repo's own fixture or settings constructor.
 
 | | |
 |---|---|
-| `up [--expose] [--expose-host HOST]` | render config, optionally expose opted-in services to the local network, start shared resources and services |
+| `up [--heavy] [--expose] [--expose-host HOST]` | render config, optionally expose opted-in services to the local network, start shared resources and services |
 | `down [--purge]` | stop services; `--purge` also drops the database |
 | `down --idle 2h` \| `--all-but-this` | stop instances across the machine, keeping their ports; `--dry-run` names them first |
 | `restart [service]` | replace one service without touching the others |
@@ -188,6 +188,30 @@ grove run --heavy -- fleetlock run pytest <lane> <card> -- <cmd>
 The order is admission, then the fleetlock slot, then the command. The admission wait
 stays outside fleetlock's hold cap. Load can change during the slot wait, so this remains
 a heuristic. This flag provides neither FIFO ordering nor a slot reservation.
+
+## Limit concurrent startup
+
+`grove up --heavy` opts into two startup slots shared across repositories using the
+same user's Grove state root. Plain `grove up` does not join this gate. All cooperating
+lanes must opt in for the limit to cover their startups.
+
+Grove first takes the instance's existing up lock, then reserves a startup slot and
+checks the same `[admission]` load threshold used by `run --heavy`. If load is at or
+above the threshold, Grove releases the slot before waiting. One admission timeout
+covers both slot and load waits. It does not include the preceding instance-lock wait.
+The log reports `timing: startup queue` separately from setup, seeds and readiness.
+Instance/log bookkeeping can happen before admission. Resources and services cannot.
+
+The slot stays held through resource initialization, dependency setup, seeds and
+service readiness. The gate does not change readiness timeouts. It polls every 200 ms,
+reports waiting every 15 seconds, and has no FIFO guarantee. Load can rise after
+admission. This gate does not limit the number of running stacks.
+
+OS locks release when startup returns or the worker exits, including failure and
+cancellation. Setup commands and service daemons do not inherit a slot. Existing
+cancellation still signals only the Grove worker through the log supervisor.
+An already-running setup subprocess can continue after Grove releases the slot.
+Do not remove the `startup-slots/*.lock` files under the state root while Grove runs.
 
 ## Refresh dependencies
 

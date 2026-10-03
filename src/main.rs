@@ -110,6 +110,9 @@ enum Command {
         /// Internal worker for the per-run log supervisor.
         #[arg(long, hide = true)]
         up_log_child: bool,
+        /// Wait for a machine-wide startup slot and load admission
+        #[arg(long)]
+        heavy: bool,
         /// Restart services that are already running
         #[arg(long)]
         fresh: bool,
@@ -237,6 +240,7 @@ fn main() -> Result<()> {
         }
         Some(Command::Up {
             up_log_child: _,
+            heavy,
             fresh,
             allow_main,
             expose,
@@ -253,6 +257,13 @@ fn main() -> Result<()> {
             if !allow_main {
                 instance.refuse_in_main()?;
             }
+            let _startup_slot = if heavy {
+                Some(grove::load::wait_for_startup(
+                    &instance.config.admission.clone().unwrap_or_default(),
+                )?)
+            } else {
+                None
+            };
             instance.touch()?;
             if let Some(idle) = &instance.config.idle {
                 enforce_idle(&instance, &idle.stop_after)?;

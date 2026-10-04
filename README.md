@@ -150,6 +150,7 @@ repo's own fixture or settings constructor.
 | `restart [service]` | replace one service without touching the others |
 | `status [--json]` | ports, pids, and whether each service's `ready.http` answers — plus a warning if a service predates your last edit |
 | `ls [--json]` | every instance on the machine, most neglected first, with the machine's load and what each holds on disk |
+| `test-containers [--remove-stale]` | report stale Mongo testcontainers; recheck and remove only with the explicit flag |
 | `health [--json]` | everything on the machine that is costing someone — stray listeners, orphans, idle instances, disk — each with the command that ends it |
 | `run -- <cmd>` | run a command with this instance's environment overlaid |
 | `logs [service] [--since-restart] [-n N]` | what a service printed |
@@ -399,3 +400,23 @@ MongoDB defines [error 23 as AlreadyInitialized](https://www.mongodb.com/docs/ma
 Other errors and unexpected results exit nonzero. Grove does not suppress them.
 Init runs through `mongosh --eval`; a custom script must report failure with a nonzero exit, rather than print an error and exit successfully.
 Grove leaves the container intact after failure so a retry can finish initialization without data loss.
+
+## Stale Mongo testcontainers
+
+`grove test-containers` reports candidates without removing them. It queries the
+current Docker context and never restarts Docker or Colima. Use
+`grove test-containers --remove-stale` only when you intend to remove idle test databases.
+
+A candidate must have `org.testcontainers=true`, use a recognized official Mongo
+image, and have run for more than 45 minutes since its latest start. Grove excludes
+containers named `grove-*`, including the shared application database.
+
+Grove checks both IPv4 and IPv6 socket tables inside the container for established
+connections on Mongo port 27017. It also checks established host connections on
+every published Mongo port through `lsof`. Missing ports, failed commands, malformed
+metadata or incomplete socket evidence mean keep. Probes have a ten-second deadline.
+
+Removal repeats the checks, confirms that the container identity and start time
+have not changed, and removes that exact full ID. It never uses a broad prune.
+A connection can appear after the last check. Idle does not prove that the owner
+process is gone, so this remains an explicit operator action, not an automatic job.

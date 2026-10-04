@@ -199,6 +199,12 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Report stale Mongo testcontainers without changing them
+    TestContainers {
+        /// Recheck and remove eligible containers by exact ID
+        #[arg(long)]
+        remove_stale: bool,
+    },
     /// Manage the agent-facing skill
     Skill {
         #[command(subcommand)]
@@ -665,6 +671,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Some(Command::TestContainers { remove_stale }) => grove::test_containers::run(remove_stale),
         Some(Command::Health { json }) => {
             let verdicts = grove::health::check(&cwd)?;
             let healthy = if json {

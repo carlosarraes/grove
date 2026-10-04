@@ -3249,6 +3249,7 @@ fn health_is_quiet_on_a_clean_machine() {
     assert!(!stdout.contains("FAIL"), "{stdout}");
     assert!(stdout.contains("ok"), "{stdout}");
     assert!(stdout.contains("instances running"), "{stdout}");
+    assert!(stdout.contains("store size not measured"), "{stdout}");
 
     cli.run(&wt, &["down"]).success();
 }

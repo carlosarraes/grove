@@ -180,19 +180,12 @@ fn disk(cwd: &Path, entries: &[Entry]) -> Verdict {
         ));
     };
     let percent = (free * 100).checked_div(total).unwrap_or(100);
-    let store = store::dir()
-        .ok()
-        .filter(|d| d.exists())
-        .map(|d| crate::footprint::tree_size(&d));
     let what = format!(
-        "{} free of {} ({percent}%) on the volume holding {}; instances hold {} in private dependencies, the store {}",
+        "{} free of {} ({percent}%) on the volume holding {}; instances hold {} in private dependencies; store size not measured",
         human_size(free),
         human_size(total),
         cwd.display(),
-        human_size(held),
-        store
-            .map(human_size)
-            .unwrap_or_else(|| "nothing".to_string())
+        human_size(held)
     );
     if percent < 10 {
         Verdict::Fail {

@@ -360,6 +360,10 @@ Rendered database names longer than 63 bytes use a shortened prefix and a stable
 Names at or below the limit stay unchanged. Grove uses the same bounded name in generated environment files, seeds and the registry.
 The instance slug, service paths and port allocation stay unchanged.
 
+Ordinary `grove health` reports available disk space and recorded instance usage,
+but labels the store size as unmeasured. It does not recursively scan the store
+before it reports health findings.
+
 ## Resource initialization failures
 
 Grove stops `up` when a managed resource's init command exits nonzero, before dependency setup, seeds, or services start.

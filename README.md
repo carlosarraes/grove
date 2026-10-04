@@ -360,6 +360,22 @@ Rendered database names longer than 63 bytes use a shortened prefix and a stable
 Names at or below the limit stay unchanged. Grove uses the same bounded name in generated environment files, seeds and the registry.
 The instance slug, service paths and port allocation stay unchanged.
 
+## Mongo readiness before seeds
+
+Before each seed that needs to run, Grove requires Mongo to answer `hello` with
+`isWritablePrimary=true` through `127.0.0.1:<published port>` and `directConnection=true`.
+This applies to resources named `mongo`, resources with the `mongo` image, and
+resources with `db_name`, which Grove already treats as Mongo databases.
+
+Grove uses `.venv/bin/python` and PyMongo in the seed's working directory when that
+interpreter exists. Otherwise it uses host `mongosh`. A missing client or missing
+PyMongo stops the seed with an error. The probe never uses `docker exec`.
+
+The readiness deadline is 180 seconds per resource before each seed, with attempts
+bounded to five seconds. The log reports readiness time separately from seed time.
+Skipped seeds need no probe. Grove does not replay a failed seed automatically.
+An OOM or disconnect after the probe can still fail a seed.
+
 Ordinary `grove health` reports available disk space and recorded instance usage,
 but labels the store size as unmeasured. It does not recursively scan the store
 before it reports health findings.

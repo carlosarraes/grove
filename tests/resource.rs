@@ -119,3 +119,23 @@ fn dropping_a_database_reaches_the_datastore_by_port() {
         "a `docker exec` only reaches a container grove started: {command}"
     );
 }
+
+#[test]
+fn mongo_readiness_bounds_failed_and_hung_clients() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+    for body in ["#!/bin/sh\nexit 1\n", "#!/bin/sh\nexec sleep 60\n"] {
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cwd.path().join(".venv/bin")).unwrap();
+        let python = cwd.path().join(".venv/bin/python");
+        std::fs::write(&python, body).unwrap();
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let began = Instant::now();
+        let result = grove::mongo::wait_ready(27017, cwd.path(), Duration::from_millis(250));
+        assert!(result.is_err(), "unready client must not pass");
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "hung probe exceeded the total deadline"
+        );
+    }
+}

@@ -229,8 +229,15 @@ impl Cli {
         common::git(&fx.main, &["commit", "-m", "add grove config"]);
 
         let (ports, port_lease) = claim_test_ports();
+        let state = TempDir::new().expect("tempdir");
+        // Existing resource fixtures isolate Docker and TCP. Supply their host client
+        // at the same external boundary; readiness-specific tests use a real Python script.
+        use std::os::unix::fs::PermissionsExt;
+        let client = state.path().join("mongosh");
+        std::fs::write(&client, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755)).unwrap();
         Cli {
-            state: TempDir::new().expect("tempdir"),
+            state,
             ports,
             _port_lease: port_lease,
             fx,
@@ -256,17 +263,27 @@ impl Cli {
         format!("{}-{}", self.ports.start, self.ports.end)
     }
 
+    fn client_path(&self) -> std::ffi::OsString {
+        let mut paths = vec![self.state.path().to_path_buf()];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        std::env::join_paths(paths).unwrap()
+    }
+
     fn run(&self, cwd: &Path, args: &[&str]) -> assert_cmd::assert::Assert {
         let mut command = Command::cargo_bin("grove").expect("binary");
         command
             .current_dir(cwd)
             .env("GROVE_STATE_DIR", self.state.path())
             .env("GROVE_CACHE_DIR", self.state.path().join("store"))
+            .env("PATH", self.client_path())
             .env("GROVE_PORT_RANGE", self.port_range())
             .env_remove("GROVE_MACOS_CLONE");
         if let Some(docker) = &self.docker {
             command
                 .env("GROVE_DOCKER", &docker.program)
+                .env("PATH", self.client_path())
                 .env("GROVE_DOCKER_INSPECT", &docker.inspect)
                 .env("GROVE_DOCKER_LOGS", self.state.path().join("docker.log"));
         }
@@ -1739,6 +1756,7 @@ impl Cli {
             .current_dir(cwd)
             .env("GROVE_STATE_DIR", self.state.path())
             .env("GROVE_CACHE_DIR", self.state.path().join("store"))
+            .env("PATH", self.client_path())
             .env("GROVE_PORT_RANGE", self.port_range())
             .env("GROVE_LOAD", load)
             .env("GROVE_CORES", cores)
@@ -5104,6 +5122,7 @@ fn concurrent_worktrees_complete_pending_resource_init_only_once() {
                 .env("GROVE_STATE_DIR", rig.cli.state.path())
                 .env("GROVE_PORT_RANGE", rig.cli.port_range())
                 .env("GROVE_DOCKER", &docker.program)
+                .env("PATH", rig.cli.client_path())
                 .env("GROVE_DOCKER_INSPECT", &docker.inspect)
                 .args(["up"])
                 .stdout(std::process::Stdio::piped())
@@ -5579,4 +5598,89 @@ fn setup_receipt_rejects_a_successful_repair_that_does_not_restore_the_expected_
     );
     cli.run(&wt, &["up"]).success();
     assert_eq!(input_setup_runs(&wt), 2);
+}
+
+#[test]
+fn mongo_readiness_waits_for_the_seed_interpreter_before_running_seed_once() {
+    use std::os::unix::fs::PermissionsExt;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("TCP-only listener");
+    let port = listener.local_addr().unwrap().port();
+    let cli = Cli::with_fake_docker(
+        &resource_seed_config(
+            port,
+            "test -f mongo-ready && echo seeded >> seed-count && test ! -f fail-seed",
+        ),
+        "existing-mongo",
+    );
+    let wt = cli.worktree("mongo_recovery");
+    std::fs::create_dir_all(wt.join(".venv/bin")).unwrap();
+    let python = wt.join(".venv/bin/python");
+    std::fs::write(&python, "#!/bin/sh\nexec python3 \"$@\"\n").unwrap();
+    std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        wt.join("pymongo.py"),
+        format!(
+            r#"
+from pathlib import Path
+class errors:
+    PyMongoError = OSError
+class MongoClient:
+    def __init__(self, uri, **kwargs):
+        assert uri.startswith('mongodb://127.0.0.1:{port}/')
+        assert 'directConnection=true' in uri
+        self.admin = self
+    def __enter__(self): return self
+    def __exit__(self, *args): pass
+    def command(self, name):
+        assert name == 'hello'
+        path = Path('probe-count')
+        count = int(path.read_text()) + 1 if path.exists() else 1
+        path.write_text(str(count))
+        if count < 3: return {{'ok': 1, 'isWritablePrimary': False}}
+        Path('mongo-ready').touch()
+        return {{'ok': 1, 'isWritablePrimary': True}}
+"#
+        ),
+    )
+    .unwrap();
+    cli.run(&wt, &["up"]).success();
+    assert_eq!(
+        std::fs::read_to_string(wt.join("seed-count")).unwrap(),
+        "seeded\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("probe-count")).unwrap(),
+        "3"
+    );
+    cli.run(&wt, &["up"]).success();
+    assert_eq!(
+        std::fs::read_to_string(wt.join("seed-count")).unwrap(),
+        "seeded\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("probe-count")).unwrap(),
+        "3"
+    );
+    std::fs::write(wt.join("fail-seed"), "").unwrap();
+    cli.run(&wt, &["seed", "--force"]).failure();
+    assert_eq!(
+        std::fs::read_to_string(wt.join("seed-count")).unwrap(),
+        "seeded\nseeded\n"
+    );
+}
+
+#[test]
+fn mongo_readiness_client_error_stops_before_the_seed() {
+    use std::os::unix::fs::PermissionsExt;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let cli = Cli::with_fake_docker(&resource_seed_config(port, "touch seed-ran"), "mongo");
+    let wt = cli.worktree("missing_client");
+    std::fs::create_dir_all(wt.join(".venv/bin")).unwrap();
+    let python = wt.join(".venv/bin/python");
+    std::fs::write(&python, "#!/bin/sh\nexit 2\n").unwrap();
+    std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = cli.run(&wt, &["up"]).failure().get_output().clone();
+    assert!(String::from_utf8_lossy(&output.stderr).contains("PyMongo"));
+    assert!(!wt.join("seed-ran").exists());
 }

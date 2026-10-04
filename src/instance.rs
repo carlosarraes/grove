@@ -646,6 +646,31 @@ impl Instance {
                 continue;
             }
 
+            for resource in &self.config.resources {
+                if resource.name == "mongo"
+                    || resource.db_name.is_some()
+                    || resource.image.as_deref().is_some_and(|image| {
+                        image
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(image)
+                            .split([':', '@'])
+                            .next()
+                            == Some("mongo")
+                    })
+                {
+                    crate::timing::measure(
+                        &format!("seed {}: Mongo readiness", seed.name),
+                        || {
+                            crate::mongo::wait_ready(
+                                resource.port,
+                                &cwd,
+                                std::time::Duration::from_secs(180),
+                            )
+                        },
+                    )?;
+                }
+            }
             std::fs::create_dir_all(self.instance_dir())?;
             let log = self.instance_dir().join(format!("seed-{}.log", seed.name));
             let sink = std::fs::OpenOptions::new()

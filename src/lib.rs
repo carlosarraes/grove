@@ -6,6 +6,7 @@ pub mod health;
 pub mod instance;
 pub mod llm;
 pub mod load;
+pub mod mongo;
 pub mod ports;
 pub mod registry;
 pub mod render;

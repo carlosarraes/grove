@@ -75,6 +75,35 @@ struct SeedMarker {
     resources: BTreeMap<String, String>,
 }
 
+/// An incomplete receipt keeps the expected output across failed repair attempts.
+#[derive(Deserialize, Serialize)]
+struct SetupReceipt {
+    version: u8,
+    identity: String,
+    venv: bool,
+    complete: bool,
+}
+
+impl SetupReceipt {
+    fn read(path: &Path) -> Result<Option<Self>> {
+        let body = match std::fs::read(path) {
+            Ok(body) => body,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("reading setup receipt"),
+        };
+        // Legacy and unknown receipts lack a usable output contract. Run setup once.
+        Ok(serde_json::from_slice::<Self>(&body)
+            .ok()
+            .filter(|receipt| receipt.version == 1))
+    }
+
+    fn write(&self, path: &Path) -> Result<()> {
+        let temporary = path.with_extension("pending");
+        std::fs::write(&temporary, serde_json::to_vec(self)?)?;
+        std::fs::rename(&temporary, path).context("saving setup receipt")
+    }
+}
+
 enum StoredSeedMarker {
     Structured(SeedMarker),
     Legacy(String),
@@ -961,27 +990,34 @@ impl Instance {
         };
         let Some(cache) = &service.cache else {
             let identity = setup_identity(service, setup, cwd)?;
+            let previous = SetupReceipt::read(&marker)?;
             let venv = cwd.join(".venv");
             let location = cwd.canonicalize()?;
             let path_record = venv.join(".grove-setup-path");
-            let rebuild_venv = if local_venv_exists(&venv)? {
-                match std::fs::read(&path_record) {
-                    Ok(recorded) => recorded != location.as_os_str().as_encoded_bytes(),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-                    Err(error) => return Err(error).context("reading venv setup path"),
-                }
-            } else {
-                false
+            let usable = local_venv_usable(&venv)?;
+            let expects_venv =
+                previous.as_ref().is_some_and(|receipt| receipt.venv) || venv.try_exists()?;
+            let path_matches = match std::fs::read(&path_record) {
+                Ok(recorded) => recorded == location.as_os_str().as_encoded_bytes(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error).context("reading venv setup path"),
             };
+            let rebuild_venv = expects_venv && (!usable || !path_matches);
             if !no_cache
                 && !rebuild_venv
-                && std::fs::read_to_string(&marker).ok().as_deref() == Some(identity.as_str())
+                && previous
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.complete && receipt.identity == identity)
             {
                 return Ok(SetupOutcome::Skipped);
             }
-            if marker.exists() {
-                std::fs::remove_file(&marker)?;
+            SetupReceipt {
+                version: 1,
+                identity: identity.clone(),
+                venv: expects_venv,
+                complete: false,
             }
+            .write(&marker)?;
             let install = |instance: &Self| -> Result<()> {
                 instance.run_step(&step, setup, cwd, log)?;
                 if setup_identity(service, setup, cwd)? != identity {
@@ -989,18 +1025,26 @@ impl Instance {
                         "{name}: setup changed its setup_inputs; refusing to mark setup complete"
                     );
                 }
-                if local_venv_exists(&venv)? {
-                    std::fs::write(&path_record, location.as_os_str().as_encoded_bytes())?;
-                } else if rebuild_venv {
-                    bail!("{name}: setup did not recreate .venv/pyvenv.cfg");
+                let produced_venv = local_venv_usable(&venv)?;
+                if (expects_venv || venv.try_exists()?) && !produced_venv {
+                    bail!(
+                        "{name}: setup did not restore a usable .venv with pyvenv.cfg and an executable bin/python"
+                    );
                 }
-                std::fs::write(&marker, &identity)?;
+                if produced_venv {
+                    std::fs::write(&path_record, location.as_os_str().as_encoded_bytes())?;
+                }
+                SetupReceipt {
+                    version: 1,
+                    identity: identity.clone(),
+                    venv: produced_venv,
+                    complete: true,
+                }
+                .write(&marker)?;
                 Ok(())
             };
             if rebuild_venv {
-                eprintln!(
-                    "{name}: rebuilding .venv for this setup path (moved or previously unrecorded)"
-                );
+                eprintln!("{name}: rebuilding missing, incomplete or relocated .venv");
                 self.replace_install(service, &venv, stopped, install)?;
             } else {
                 install(self)?;
@@ -1346,6 +1390,18 @@ fn local_venv_exists(venv: &Path) -> Result<bool> {
         );
     }
     Ok(venv.join("pyvenv.cfg").try_exists()?)
+}
+
+fn local_venv_usable(venv: &Path) -> Result<bool> {
+    use std::os::unix::fs::PermissionsExt;
+    if !local_venv_exists(venv)? {
+        return Ok(false);
+    }
+    match std::fs::metadata(venv.join("bin/python")) {
+        Ok(metadata) => Ok(metadata.is_file() && metadata.permissions().mode() & 0o111 != 0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).context("inspecting venv Python entry point"),
+    }
 }
 
 /// Keep uncached installs local while tracking the files that decide their contents.

@@ -5456,3 +5456,126 @@ fn startup_admission_cancellation_while_queued_never_reaches_setup() {
     assert_eq!(child.0.wait().unwrap().code(), Some(143));
     assert!(!wt.join("setup-ran").exists());
 }
+
+#[test]
+fn setup_receipt_reinstalls_a_venv_after_recreating_the_identical_worktree_path() {
+    let cli = Cli::with_config(VENV_SETUP_CONFIG);
+    let wt = venv_worktree(&cli);
+    let ignore = wt.join(".gitignore");
+    let mut contents = std::fs::read_to_string(&ignore).unwrap();
+    contents.push_str("backend/.venv/\nbackend/installs\n");
+    std::fs::write(ignore, contents).unwrap();
+    common::git(&wt, &["add", ".gitignore", "backend/install.py"]);
+    common::git(&wt, &["commit", "-m", "record venv fixture"]);
+    cli.run(&wt, &["up"]).success();
+    cli.run(&wt, &["down"]).success();
+    common::git(&cli.fx.main, &["worktree", "remove", wt.to_str().unwrap()]);
+    common::git(
+        &cli.fx.main,
+        &["worktree", "add", wt.to_str().unwrap(), "venv_before"],
+    );
+    assert!(!wt.join("backend/.venv").exists());
+    cli.run(&wt, &["up"]).success();
+    assert_eq!(input_setup_runs(&wt), 1);
+    let output = std::process::Command::new(wt.join("backend/.venv/bin/probe"))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        wt.join("backend/.venv")
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap()
+    );
+    cli.run(&wt, &["up"]).success();
+    assert_eq!(input_setup_runs(&wt), 1);
+}
+
+#[test]
+fn setup_receipt_repairs_deleted_and_partial_venvs() {
+    for removed in [".venv", ".venv/pyvenv.cfg", ".venv/bin/python"] {
+        let cli = Cli::with_config(VENV_SETUP_CONFIG);
+        let wt = venv_worktree(&cli);
+        cli.run(&wt, &["up"]).success();
+        let path = wt.join("backend").join(removed);
+        if removed == ".venv" {
+            std::fs::remove_dir_all(path).unwrap();
+        } else {
+            std::fs::remove_file(path).unwrap();
+        }
+        cli.run(&wt, &["up"]).success();
+        assert_eq!(input_setup_runs(&wt), 2, "must repair {removed}");
+        assert!(
+            std::process::Command::new(wt.join("backend/.venv/bin/probe"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        cli.run(&wt, &["up"]).success();
+        assert_eq!(input_setup_runs(&wt), 2);
+    }
+}
+
+#[test]
+fn setup_receipt_migrates_legacy_receipts_once_with_or_without_a_venv() {
+    for has_venv in [true, false] {
+        let plain =
+            INPUT_SETUP_CONFIG.replace("setup_inputs = [\"uv.lock\", \"pyproject.toml\"]", "");
+        let cli = Cli::with_config(if has_venv { VENV_SETUP_CONFIG } else { &plain });
+        let wt = if has_venv {
+            venv_worktree(&cli)
+        } else {
+            input_setup_worktree(&cli)
+        };
+        cli.run(&wt, &["up"]).success();
+        let dir = registry_of(&cli)
+            .get(&wt)
+            .unwrap()
+            .unwrap()
+            .instance_dir
+            .unwrap();
+        let marker = dir.join(if has_venv {
+            ".setup-backend"
+        } else {
+            ".setup-web"
+        });
+        // These are the exact pre-receipt formats, not values derived from the new writer.
+        let legacy = if has_venv {
+            "python3 install.py"
+        } else {
+            "echo installed >> installs; test ! -f fail && if test -f mutate; then echo changed >> uv.lock; fi"
+        };
+        std::fs::write(marker, legacy).unwrap();
+        cli.run(&wt, &["up"]).success();
+        assert_eq!(input_setup_runs(&wt), 2);
+        cli.run(&wt, &["up"]).success();
+        assert_eq!(input_setup_runs(&wt), 2);
+    }
+}
+
+#[test]
+fn setup_receipt_rejects_a_successful_repair_that_does_not_restore_the_expected_venv() {
+    let cli = Cli::with_config(VENV_SETUP_CONFIG);
+    let wt = venv_worktree(&cli);
+    cli.run(&wt, &["up"]).success();
+    let backend = wt.join("backend");
+    let script = std::fs::read_to_string(backend.join("install.py")).unwrap();
+    std::fs::remove_dir_all(backend.join(".venv")).unwrap();
+    std::fs::write(backend.join("install.py"), "pass\n").unwrap();
+    let output = cli.run(&wt, &["up"]).failure().get_output().clone();
+    assert!(String::from_utf8_lossy(&output.stderr).contains("venv"));
+    cli.run(&wt, &["up"]).failure();
+    std::fs::write(backend.join("install.py"), script).unwrap();
+    cli.run(&wt, &["up"]).success();
+    assert_eq!(input_setup_runs(&wt), 2);
+    assert!(
+        std::process::Command::new(backend.join(".venv/bin/probe"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    cli.run(&wt, &["up"]).success();
+    assert_eq!(input_setup_runs(&wt), 2);
+}

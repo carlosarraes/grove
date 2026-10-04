@@ -256,19 +256,29 @@ setup_inputs = ["uv.lock", "pyproject.toml"]
 ```
 
 Paths are relative to the service's `cwd`. Grove reruns setup when the command,
-file names or file contents change. A command-only marker reruns once when inputs
-are first declared. Without `setup_inputs`, uncached setup still tracks only its command.
+file names or file contents change. Without `setup_inputs`, the command supplies
+its identity. Missing or unreadable inputs fail setup. Setup that fails or changes
+its inputs does not receive a completed receipt.
 
-Missing or unreadable inputs fail setup. A failed setup, or one that changes its inputs,
-does not receive a success marker. This check does not roll back an uncached install.
-Uncached setup also records its absolute directory inside a local Python
-`.venv/.grove-setup-path`. A moved or previously unrecorded venv is rebuilt through
-the configured setup command, with the old install backed up outside the worktree
-and restored on failure. Grove stops its owned service during replacement. The
-first `up` after upgrading from an older Grove version rebuilds each existing
-venv once, so roll out during a quiet period. This applies to `.venv/pyvenv.cfg`
-in the service's setup directory; custom venv locations are not tracked. Symlinked
-venvs are refused rather than modified. Setups without a local venv are unchanged.
+Uncached setup records whether it produced a local Python venv. Grove requires
+`.venv/pyvenv.cfg`, an executable `.venv/bin/python`, and a matching directory in
+`.venv/.grove-setup-path` before it reuses that setup receipt. If a worktree disappears
+and returns at the same path, the external receipt cannot stand in for its missing venv.
+
+Grove repairs missing, partial, relocated or unrecorded venvs through the configured
+setup command. It stops its owned service during replacement and keeps the prior
+install outside the worktree for rollback. Setup must restore the expected venv
+before Grove marks it complete. An incomplete receipt preserves that requirement
+across failed retries. Ordinary uncached setup has no general rollback transaction.
+
+Old markers do not record expected output. The first `up` with versioned receipts
+reruns each legacy uncached setup once, including setups that produce no venv.
+Install this upgrade during a quiet window. Healthy venvs with valid path records
+can reuse their files during that one-time setup run. Later unchanged runs skip setup.
+
+Venv checks apply only to `.venv` in the service's setup directory. Grove refuses
+symlinked venv directories. It does not inventory installed packages or check arbitrary
+outputs from setups that produce no venv. Custom venv locations remain outside this check.
 
 `setup_inputs` requires `setup` and a nonempty list. It cannot accompany `cache`.
 Use `cache.key` for shared installs. Keep Python virtual environments local.

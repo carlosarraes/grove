@@ -487,8 +487,10 @@ fn parse_inspect(json: &str) -> Result<Option<ContainerObservation>> {
     }))
 }
 
+/// Docker CLIs before 29 say "Error: No such object"; 29+ say "error: no such object".
 fn is_missing_container(error: &str) -> bool {
-    error.contains("No such object") || error.contains("No such container")
+    let error = error.to_ascii_lowercase();
+    error.contains("no such object") || error.contains("no such container")
 }
 
 fn docker_program() -> OsString {

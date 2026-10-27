@@ -954,6 +954,42 @@ fn doctor_fails_when_an_absent_resource_needs_unavailable_docker() {
     );
 }
 
+/// A fresh machine has no grove container yet. Docker 29+ reports that in lowercase,
+/// and grove must still read it as "missing, will create" rather than "Docker broken".
+#[test]
+fn doctor_treats_a_missing_managed_container_as_startable_across_docker_versions() {
+    use std::os::unix::fs::PermissionsExt;
+    let port = TcpListener::bind("127.0.0.1:0")
+        .expect("find port")
+        .local_addr()
+        .expect("address")
+        .port();
+    for message in [
+        "Error: No such object: grove-mongo",
+        "error: no such object: grove-mongo",
+    ] {
+        let cli = Cli::with_fake_docker(&resource_seed_config(port, "true"), "unused");
+        let docker = cli.docker.as_ref().expect("fake docker");
+        std::fs::write(
+            &docker.program,
+            format!("#!/bin/sh\ncase \"$1\" in\n  inspect) echo '{message}' >&2; echo '[]'; exit 1 ;;\n  *) exit 0 ;;\nesac\n"),
+        )
+        .expect("write fake docker");
+        std::fs::set_permissions(&docker.program, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake docker");
+        let wt = cli.worktree("feat_search");
+
+        let output = cli.run(&wt, &["doctor"]).success();
+        let stdout = String::from_utf8_lossy(&output.get_output().stdout);
+
+        assert!(
+            stdout.contains("`grove up` will start"),
+            "{message}: {stdout}"
+        );
+        assert!(!stdout.contains("cannot inspect"), "{message}: {stdout}");
+    }
+}
+
 #[test]
 fn ls_lists_every_running_instance() {
     let cli = Cli::new();

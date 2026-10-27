@@ -5024,6 +5024,10 @@ case "$1" in
   test -f "$root/port-ready" ;;
  exec)
   echo attempt >> "$root/init-attempts"
+  if [ -f "$root/refuse-init" ] && [ "$(cat "$root/refuse-init")" -gt 0 ]; then
+   echo $(($(cat "$root/refuse-init") - 1)) > "$root/refuse-init"
+   echo 'MongoNetworkError: connect ECONNREFUSED 127.0.0.1:27017' >&2; exit 1
+  fi
   if [ -f "$root/fail-init" ]; then echo 'initialization deliberately failed' >&2; exit 42; fi
   if ! mkdir "$root/init-active"; then echo overlap >&2; exit 43; fi
   sleep 0.2
@@ -5222,6 +5226,113 @@ fn newly_created_resource_keeps_init_pending_until_success() {
             .count(),
         2
     );
+}
+
+/// Docker's port forwarder answers on the host before mongod listens inside the
+/// container, so the first init can be refused. That is "not ready yet", not failure.
+#[test]
+fn resource_init_waits_out_a_server_that_is_not_listening_yet() {
+    let rig = InitResourceRig::new();
+    std::fs::write(&rig.cli.docker.as_ref().unwrap().inspect, "[]").unwrap();
+    std::fs::remove_file(rig.cli.state.path().join("fail-init")).unwrap();
+    std::fs::write(rig.cli.state.path().join("refuse-init"), "2").unwrap();
+    let wt = rig.cli.worktree("init_not_listening");
+
+    rig.cli.run(&wt, &["up"]).success();
+
+    assert!(wt.join("seed-ran").exists());
+    assert_eq!(
+        std::fs::read_to_string(rig.cli.state.path().join("init-attempts"))
+            .unwrap()
+            .lines()
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn a_real_resource_init_error_fails_without_waiting() {
+    let rig = InitResourceRig::new();
+    let wt = rig.cli.worktree("init_real_error");
+    let began = std::time::Instant::now();
+
+    let output = rig.cli.run(&wt, &["up"]).failure().get_output().clone();
+
+    assert!(String::from_utf8_lossy(&output.stderr).contains("initialization deliberately failed"));
+    assert!(began.elapsed() < std::time::Duration::from_secs(10));
+    assert_eq!(
+        std::fs::read_to_string(rig.cli.state.path().join("init-attempts"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+}
+
+fn args_drift_fixture(listener: &TcpListener, args: &str, cmd: serde_json::Value) -> Cli {
+    let port = listener.local_addr().expect("address").port();
+    let config = resource_seed_config(port, "true")
+        .replace(&format!("port = {port}"), &format!("{args}port = {port}"));
+    let cli = Cli::with_fake_docker(&config, "drift-container-abcdef");
+    let inspect = serde_json::json!([{
+        "Id": "drift-container-abcdef",
+        "State": {"Running": true, "ExitCode": 0},
+        "Config": {"Image": "mongo:8", "Cmd": cmd},
+        "HostConfig": {
+            "Ulimits": [{"Name": "nofile", "Soft": 64000, "Hard": 64000}],
+            "PortBindings": {format!("{port}/tcp"): [{"HostIp": "", "HostPort": port.to_string()}]}
+        }
+    }]);
+    std::fs::write(&cli.docker.as_ref().unwrap().inspect, inspect.to_string()).unwrap();
+    cli
+}
+
+#[test]
+fn doctor_and_up_warn_when_a_managed_container_runs_other_args() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listen");
+    let cli = args_drift_fixture(
+        &listener,
+        "args = [\"--replSet\", \"rs0\"]\n",
+        serde_json::json!(["mongod"]),
+    );
+    let wt = cli.worktree("args_drift");
+
+    let output = cli.run(&wt, &["doctor"]).success();
+    let stdout = String::from_utf8_lossy(&output.get_output().stdout);
+    assert!(stdout.contains("warn"), "{stdout}");
+    assert!(
+        stdout.contains("runs with args `mongod`, expected `--replSet rs0`"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Preserve needed data"), "{stdout}");
+
+    let output = cli.run(&wt, &["up"]).success();
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    assert!(
+        stderr.contains("runs with args `mongod`, expected `--replSet rs0`"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn matching_args_and_an_image_default_command_are_not_drift() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listen");
+    for (args, cmd) in [
+        (
+            "args = [\"--replSet\", \"rs0\"]\n",
+            serde_json::json!(["--replSet", "rs0"]),
+        ),
+        ("", serde_json::json!(["mongod"])),
+    ] {
+        let cli = args_drift_fixture(&listener, args, cmd);
+        let wt = cli.worktree("args_ok");
+
+        let output = cli.run(&wt, &["doctor"]).success();
+        let stdout = String::from_utf8_lossy(&output.get_output().stdout);
+
+        assert!(!stdout.contains("runs with args"), "{stdout}");
+        assert!(stdout.contains("nofile=64000:64000"), "{stdout}");
+    }
 }
 
 // Startup admission is exercised through real workers and OS locks. Removing the

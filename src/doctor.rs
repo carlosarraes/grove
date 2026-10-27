@@ -102,6 +102,15 @@ pub fn check(instance: &Instance) -> Vec<Verdict> {
 fn check_resource(declared: &crate::config::Resource, observed: Observation) -> Verdict {
     let expected = format!("{NOFILE_LIMIT}:{NOFILE_LIMIT}");
     if observed.reachable {
+        if let Some(container) = observed.container.as_ref().filter(|c| c.running)
+            && let Some(drift) = resource::args_drift(declared, container)
+        {
+            return Verdict::Warn(format!(
+                "{} answering on {}, but {drift}. \
+                 Preserve needed data, then deliberately remove and recreate it to adopt the args.",
+                declared.name, declared.port
+            ));
+        }
         return match observed.container {
             Some(container)
                 if container.running && container.nofile == Some((NOFILE_LIMIT, NOFILE_LIMIT)) =>

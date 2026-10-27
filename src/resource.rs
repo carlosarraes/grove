@@ -22,6 +22,7 @@ pub struct ContainerObservation {
     pub exit_code: i64,
     pub nofile: Option<(u64, u64)>,
     pub image: Option<String>,
+    pub cmd: Option<Vec<String>>,
     pub port_bindings: BTreeMap<String, Option<Vec<PortBinding>>>,
 }
 
@@ -157,6 +158,14 @@ pub fn ensure(resource: &Resource) -> Result<EnsureResult> {
     )?;
     let pending_path = directory.join("pending-init.json");
     let result = ensure_started(resource, &pending_path)?;
+    if let Some(container) = &result.observation.container
+        && let Some(drift) = args_drift(resource, container)
+    {
+        eprintln!(
+            "warning: {}: {drift}. Preserve needed data, then deliberately remove and recreate it to adopt the args.",
+            resource.name
+        );
+    }
     let pending: Option<String> = match std::fs::read(&pending_path) {
         Ok(bytes) => Some(
             serde_json::from_slice(&bytes).context("reading pending resource initialization")?,
@@ -199,15 +208,7 @@ pub fn ensure(resource: &Resource) -> Result<EnsureResult> {
                 resource.name
             );
         }
-        docker(&[
-            "exec".to_string(),
-            container.id.clone(),
-            "mongosh".to_string(),
-            "--quiet".to_string(),
-            "--eval".to_string(),
-            init.clone(),
-        ])
-        .with_context(|| {
+        run_init(resource, &container.id, init).with_context(|| {
             format!(
                 "initializing resource {}; initialization remains pending for the next up",
                 resource.name
@@ -217,6 +218,63 @@ pub fn ensure(resource: &Resource) -> Result<EnsureResult> {
             .context("clearing completed resource initialization")?;
     }
     Ok(result)
+}
+
+/// How long init may keep meeting a server that is not listening yet. Docker's
+/// port forwarder answers on the host before the process inside the container does.
+const INIT_READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn run_init(resource: &Resource, id: &str, init: &str) -> Result<()> {
+    let argv = [
+        "exec".to_string(),
+        id.to_string(),
+        "mongosh".to_string(),
+        "--quiet".to_string(),
+        "--eval".to_string(),
+        init.to_string(),
+    ];
+    let began = std::time::Instant::now();
+    loop {
+        match docker(&argv) {
+            Ok(_) => return Ok(()),
+            Err(error) if is_not_listening(&format!("{error:#}")) => {
+                if began.elapsed() >= INIT_READY_TIMEOUT {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "`{}` was still refusing connections inside its container after {}s",
+                            resource.name,
+                            INIT_READY_TIMEOUT.as_secs()
+                        )
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn is_not_listening(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("econnrefused") || error.contains("connection refused")
+}
+
+/// Configured args the managed container is not running with. No configured args
+/// means the image's default command, which is never drift.
+pub fn args_drift(resource: &Resource, container: &ContainerObservation) -> Option<String> {
+    if resource.args.is_empty() || container.cmd.as_deref() == Some(resource.args.as_slice()) {
+        return None;
+    }
+    let actual = container
+        .cmd
+        .as_ref()
+        .map(|cmd| cmd.join(" "))
+        .unwrap_or_else(|| "the image default".to_string());
+    Some(format!(
+        "container {} runs with args `{actual}`, expected `{}`",
+        container.id.chars().take(12).collect::<String>(),
+        resource.args.join(" ")
+    ))
 }
 
 fn record_pending(path: &std::path::Path, id: &str) -> Result<()> {
@@ -306,6 +364,12 @@ fn validate_existing(resource: &Resource, container: &ContainerObservation) -> R
     if container.image.as_deref() != resource.image.as_deref() {
         bail!(
             "existing container `{}` image does not match configured image; preserve its data and reconcile the resource configuration",
+            container_name(resource)
+        );
+    }
+    if let Some(drift) = args_drift(resource, container) {
+        bail!(
+            "existing container `{}` {drift}; preserve its data and reconcile the resource configuration",
             container_name(resource)
         );
     }
@@ -437,6 +501,8 @@ struct DockerInspect {
 struct DockerConfig {
     #[serde(rename = "Image")]
     image: String,
+    #[serde(rename = "Cmd", default)]
+    cmd: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -482,6 +548,10 @@ fn parse_inspect(json: &str) -> Result<Option<ContainerObservation>> {
         running: inspected.state.running,
         exit_code: inspected.state.exit_code,
         nofile,
+        cmd: inspected
+            .config
+            .as_ref()
+            .and_then(|config| config.cmd.clone()),
         image: inspected.config.map(|config| config.image),
         port_bindings: inspected.host_config.port_bindings.unwrap_or_default(),
     }))

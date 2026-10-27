@@ -225,14 +225,17 @@ pub fn ensure(resource: &Resource) -> Result<EnsureResult> {
 const INIT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn run_init(resource: &Resource, id: &str, init: &str) -> Result<()> {
-    let argv = [
+    let mut argv = vec![
         "exec".to_string(),
         id.to_string(),
         "mongosh".to_string(),
         "--quiet".to_string(),
-        "--eval".to_string(),
-        init.to_string(),
     ];
+    // Init runs inside the container, so it must reach mongod where `args` moved it.
+    if let Some(port) = mongod_port(&resource.args) {
+        argv.extend(["--port".to_string(), port]);
+    }
+    argv.extend(["--eval".to_string(), init.to_string()]);
     let began = std::time::Instant::now();
     loop {
         match docker(&argv) {
@@ -252,6 +255,17 @@ fn run_init(resource: &Resource, id: &str, init: &str) -> Result<()> {
             Err(error) => return Err(error),
         }
     }
+}
+
+/// The `--port N` or `--port=N` mongod is given in `args`; mongosh's default otherwise.
+fn mongod_port(args: &[String]) -> Option<String> {
+    args.iter()
+        .enumerate()
+        .find_map(|(i, arg)| match arg.strip_prefix("--port") {
+            Some("") => args.get(i + 1).cloned(),
+            Some(rest) => rest.strip_prefix('=').map(str::to_string),
+            None => None,
+        })
 }
 
 fn is_not_listening(error: &str) -> bool {

@@ -4988,20 +4988,33 @@ impl InitResourceRig {
     }
 
     fn with_delayed_port(delayed: bool) -> Self {
+        Self::build(delayed, &[])
+    }
+
+    fn with_args(args: &[&str]) -> Self {
+        Self::build(false, args)
+    }
+
+    fn build(delayed: bool, args: &[&str]) -> Self {
+        let toml_args = if args.is_empty() {
+            String::new()
+        } else {
+            format!("args = {}\n", serde_json::json!(args))
+        };
         let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = reservation.local_addr().unwrap().port();
         let config = format!(
             "{}\n[[service]]\nname = 'worker'\nsetup = 'touch setup-ran'\ncommand = 'touch service-ran; sleep 60'\n",
             resource_seed_config(port, "touch seed-ran").replace(
                 &format!("port = {port}"),
-                &format!("port = {port}\ninit = 'initialize()'")
+                &format!("{toml_args}port = {port}\ninit = 'initialize()'")
             )
         );
         let cli = Cli::with_fake_docker(&config, "init-container");
         let docker = cli.docker.as_ref().unwrap();
         let inspect = serde_json::json!([{
             "Id": "init-container", "State": {"Running": false, "ExitCode": 0},
-            "Config": {"Image": "mongo:8"},
+            "Config": {"Image": "mongo:8", "Cmd": if args.is_empty() { serde_json::Value::Null } else { serde_json::json!(args) }},
             "HostConfig": {"PortBindings": {format!("{port}/tcp"): [
                 {"HostIp": "127.0.0.1", "HostPort": port.to_string()}
             ]}}
@@ -5024,6 +5037,7 @@ case "$1" in
   test -f "$root/port-ready" ;;
  exec)
   echo attempt >> "$root/init-attempts"
+  echo "$*" >> "$root/init-argv"
   if [ -f "$root/refuse-init" ] && [ "$(cat "$root/refuse-init")" -gt 0 ]; then
    echo $(($(cat "$root/refuse-init") - 1)) > "$root/refuse-init"
    echo 'MongoNetworkError: connect ECONNREFUSED 127.0.0.1:27017' >&2; exit 1
@@ -5267,6 +5281,33 @@ fn a_real_resource_init_error_fails_without_waiting() {
             .count(),
         1
     );
+}
+
+/// mongosh runs inside the container, so it must target the port `args` gave mongod,
+/// not mongosh's default 27017.
+#[test]
+fn resource_init_targets_the_port_mongod_was_given_in_args() {
+    for (args, expected) in [
+        (&["--port", "27117", "--replSet", "rs0"][..], Some("27117")),
+        (&["--replSet", "rs0", "--port=27118"][..], Some("27118")),
+        (&["--replSet", "rs0"][..], None),
+    ] {
+        let rig = InitResourceRig::with_args(args);
+        std::fs::write(&rig.cli.docker.as_ref().unwrap().inspect, "[]").unwrap();
+        std::fs::remove_file(rig.cli.state.path().join("fail-init")).unwrap();
+        let wt = rig.cli.worktree("init_port");
+
+        rig.cli.run(&wt, &["up"]).success();
+
+        let argv = std::fs::read_to_string(rig.cli.state.path().join("init-argv")).unwrap();
+        match expected {
+            Some(port) => assert!(
+                argv.contains(&format!("mongosh --quiet --port {port} --eval")),
+                "{argv}"
+            ),
+            None => assert!(!argv.contains("--port"), "{argv}"),
+        }
+    }
 }
 
 fn args_drift_fixture(listener: &TcpListener, args: &str, cmd: serde_json::Value) -> Cli {

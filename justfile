@@ -12,6 +12,41 @@ build:
     install -m 0755 target/release/{{binary}} {{install_dir}}/{{binary}}
     @echo "Installed {{install_dir}}/{{binary}}"
 
+# Install on mac and mact (defaults to mac) without a release. The Mac is under
+# heavy load and never compiles: mact has the same Apple chip, builds in its
+# ~/projs/grove clone, and the binary is copied over.
+[positional-arguments]
+sync host="mac":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    sync_host="$1"
+    if [[ "$sync_host" != mac && "$sync_host" != mact ]]; then
+      echo "error: sync supports mac and mact" >&2
+      exit 1
+    fi
+    install_on() {
+      ssh -o BatchMode=yes "$1" "bash -s -- $2" <<'SH'
+    set -euo pipefail
+    mkdir -p "$HOME/.local/bin"
+    pending=$(mktemp "$HOME/.local/bin/.grove-sync.XXXXXX")
+    trap 'rm -f "$pending"' EXIT
+    install -m 0755 "$HOME/$1" "$pending"
+    "$pending" --version
+    mv -f "$pending" "$HOME/.local/bin/grove"
+    echo "Installed $HOME/.local/bin/grove"
+    SH
+    }
+    rsync -az --delete \
+      --include='/Cargo.toml' --include='/Cargo.lock' --include='/src/***' --include='/skills/***' \
+      --exclude='*' -e 'ssh -o BatchMode=yes' ./ mact:projs/grove/
+    ssh -o BatchMode=yes mact 'export PATH="$HOME/.cargo/bin:$PATH"; cd ~/projs/grove && cargo build --release --locked'
+    install_on mact projs/grove/target/release/grove
+    if [[ "$sync_host" == mac ]]; then
+      ssh -o BatchMode=yes mac 'mkdir -p ~/.cache/grove-src'
+      scp -3 -q -o BatchMode=yes mact:projs/grove/target/release/grove mac:.cache/grove-src/grove-sync-binary
+      install_on mac .cache/grove-src/grove-sync-binary
+    fi
+
 # Run the same checks expected by CI.
 check:
     cargo fmt --check

@@ -220,13 +220,24 @@ pub fn ensure(resource: &Resource) -> Result<EnsureResult> {
     Ok(result)
 }
 
-/// How long init may keep meeting a server that is not listening yet. Docker's
-/// port forwarder answers on the host before the process inside the container does.
-const INIT_READY_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long init may keep meeting a mongod that is not listening yet while its container
+/// stays up. Docker's port forwarder answers on the host before the process inside does,
+/// and a mongod recovering from an unclean shutdown (an OOM kill, a host that slept
+/// through it) replays its journal before it listens: 90s on a 10G dataset, observed.
+/// A container that exits ends the wait at once, so the ceiling only bounds a hang.
+const INIT_READY_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How often a long wait says it is still waiting, so it never looks hung.
+const INIT_PROGRESS_EVERY: Duration = Duration::from_secs(15);
 
 fn run_init(resource: &Resource, id: &str, init: &str) -> Result<()> {
     let mut argv = vec![
         "exec".to_string(),
+        // The mongo image sets HOME=/data/db, so mongosh would write and rotate its logs
+        // under the data directory while the entrypoint, starting as root, chowns that
+        // directory recursively. A file vanishing mid-chown exits the entrypoint 1.
+        "-e".to_string(),
+        "HOME=/tmp".to_string(),
         id.to_string(),
         "mongosh".to_string(),
         "--quiet".to_string(),
@@ -237,11 +248,22 @@ fn run_init(resource: &Resource, id: &str, init: &str) -> Result<()> {
     }
     argv.extend(["--eval".to_string(), init.to_string()]);
     let began = std::time::Instant::now();
+    let mut reported = Duration::ZERO;
     loop {
         match docker(&argv) {
             Ok(_) => return Ok(()),
             Err(error) if is_not_listening(&format!("{error:#}")) => {
-                if began.elapsed() >= INIT_READY_TIMEOUT {
+                if let Some(code) = exited(id) {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "`{}` exited with code {code} before it accepted connections;                              `docker logs --tail 50 {}` shows why",
+                            resource.name,
+                            container_name(resource)
+                        )
+                    });
+                }
+                let waited = began.elapsed();
+                if waited >= INIT_READY_TIMEOUT {
                     return Err(error).with_context(|| {
                         format!(
                             "`{}` was still refusing connections inside its container after {}s",
@@ -250,11 +272,31 @@ fn run_init(resource: &Resource, id: &str, init: &str) -> Result<()> {
                         )
                     });
                 }
+                if waited >= reported + INIT_PROGRESS_EVERY {
+                    reported = waited;
+                    eprintln!(
+                        "{}: still starting inside its container ({}s); after an unclean \
+                         shutdown mongod recovers its journal before it listens",
+                        resource.name,
+                        waited.as_secs()
+                    );
+                }
                 std::thread::sleep(Duration::from_millis(500));
             }
             Err(error) => return Err(error),
         }
     }
+}
+
+/// The exit code of a container Docker reports as stopped. Anything short of that
+/// answer, including Docker failing to say, keeps the wait going.
+fn exited(id: &str) -> Option<i64> {
+    let out = docker_output(&["inspect".to_string(), id.to_string()]).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let container = parse_inspect(&String::from_utf8_lossy(&out.stdout)).ok()??;
+    (!container.running).then_some(container.exit_code)
 }
 
 /// The `--port N` or `--port=N` mongod is given in `args`; mongosh's default otherwise.
@@ -336,6 +378,16 @@ fn ensure_started(resource: &Resource, pending: &std::path::Path) -> Result<Ensu
                         // Another up can have started it before the port becomes ready.
                         None
                     } else {
+                        eprintln!(
+                            "{}: its container had stopped (exit code {}{}); starting it",
+                            resource.name,
+                            container.exit_code,
+                            if container.exit_code == 137 {
+                                ", killed: often out of memory"
+                            } else {
+                                ""
+                            }
+                        );
                         Some(vec!["start".to_string(), container.id.clone()])
                     }
                 }

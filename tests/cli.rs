@@ -3145,6 +3145,56 @@ fn installs(cli: &Cli) -> usize {
         .unwrap_or(0)
 }
 
+/// `ls` reports the store from the size each entry recorded at publication and never
+/// walks it: on a 10G store under load the walk kept `ls` silent for 89s.
+#[test]
+fn ls_reports_the_store_from_recorded_entry_sizes() {
+    let cli = Cli::with_config(CACHE_CONFIG);
+    with_lockfile(&cli, "lockfile A\n");
+    let a = cli.worktree("feat_search");
+    let b = cli.worktree("fix_login");
+    cli.run(&a, &["up"]).success();
+
+    let store = cli.state.path().join("store");
+    let entries: Vec<_> = std::fs::read_dir(&store)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.join("tree").is_dir())
+        .collect();
+    assert_eq!(entries.len(), 1);
+    let bytes = entries[0].join("bytes");
+    assert!(
+        std::fs::read_to_string(&bytes)
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .is_ok()
+    );
+
+    // A figure no walk could produce proves `ls` read the record.
+    std::fs::write(&bytes, "5368709120").unwrap();
+    let ls = |cli: &Cli| {
+        String::from_utf8_lossy(&cli.run(&a, &["ls"]).success().get_output().stdout).into_owned()
+    };
+    let out = ls(&cli);
+    assert!(out.contains(", store 5.0G"), "{out}");
+
+    // An entry from before sizes were recorded is named, not walked, until up links it.
+    std::fs::remove_file(&bytes).unwrap();
+    let out = ls(&cli);
+    assert!(
+        out.contains("1 store entry unmeasured until next linked"),
+        "{out}"
+    );
+    assert!(!out.contains(", store "), "{out}");
+
+    cli.run(&b, &["up"]).success();
+    assert!(bytes.exists(), "linking did not record the entry's size");
+    let out = ls(&cli);
+    assert!(out.contains(", store "), "{out}");
+    assert!(!out.contains("unmeasured until"), "{out}");
+}
+
 /// The whole point: the second worktree on a lockfile pays nothing for its dependencies.
 /// Names are private per worktree, blocks are shared — the inode says which.
 #[test]
@@ -5306,6 +5356,44 @@ fn resource_init_waits_out_a_server_that_is_not_listening_yet() {
     );
 }
 
+/// A mongod that dies while init waits for it (the entrypoint exiting 1, an OOM kill)
+/// ends the wait at once, with the exit code, instead of waiting out the ceiling.
+#[test]
+fn resource_init_stops_waiting_when_the_container_exits() {
+    let rig = InitResourceRig::new();
+    std::fs::write(&rig.cli.docker.as_ref().unwrap().inspect, "[]").unwrap();
+    std::fs::remove_file(rig.cli.state.path().join("fail-init")).unwrap();
+    std::fs::write(rig.cli.state.path().join("refuse-init"), "100000").unwrap();
+    let root = rig.cli.state.path().to_path_buf();
+    let killer = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !root.join("init-attempts").exists() {
+            assert!(std::time::Instant::now() < deadline, "init never ran");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let path = root.join("docker-inspect.json");
+        let mut inspect: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        inspect[0]["State"]["Running"] = false.into();
+        inspect[0]["State"]["ExitCode"] = 1.into();
+        std::fs::write(&path, inspect.to_string()).unwrap();
+    });
+    let wt = rig.cli.worktree("init_container_exits");
+    let began = std::time::Instant::now();
+
+    let output = rig.cli.run(&wt, &["up"]).failure().get_output().clone();
+    killer.join().unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("exited with code 1 before it accepted connections"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("docker logs --tail 50"), "{stderr}");
+    assert!(began.elapsed() < std::time::Duration::from_secs(20));
+    assert!(!wt.join("seed-ran").exists());
+}
+
 #[test]
 fn a_real_resource_init_error_fails_without_waiting() {
     let rig = InitResourceRig::new();
@@ -5342,6 +5430,12 @@ fn resource_init_targets_the_port_mongod_was_given_in_args() {
         rig.cli.run(&wt, &["up"]).success();
 
         let argv = std::fs::read_to_string(rig.cli.state.path().join("init-argv")).unwrap();
+        // mongosh keeps its logs under HOME, and the image's HOME is the data directory
+        // the entrypoint chowns as it starts.
+        assert!(
+            argv.contains("exec -e HOME=/tmp init-container mongosh"),
+            "{argv}"
+        );
         match expected {
             Some(port) => assert!(
                 argv.contains(&format!("mongosh --quiet --port {port} --eval")),

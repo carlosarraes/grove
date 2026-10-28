@@ -1139,6 +1139,9 @@ impl Instance {
                 let _ = std::fs::remove_dir_all(&staged);
             }
             let linked: crate::store::Linked = result?;
+            crate::timing::measure(&format!("{name}: store entry size"), || {
+                crate::store::record_bytes(&store, &hash)
+            })?;
             eprintln!(
                 "{name}: dependencies {} from the store ({hash}, {}s)",
                 match linked.method {

@@ -144,6 +144,10 @@ pub fn promote(built: &Path, store: &Path, hash: &str) -> Result<Promoted> {
     let result = (|| {
         let linked = link_tree(built, &staging.join("tree"))?;
         std::fs::write(staging.join("files"), linked.files.to_string())?;
+        std::fs::write(
+            staging.join("bytes"),
+            crate::footprint::tree_size(&staging.join("tree")).to_string(),
+        )?;
         std::fs::rename(&staging, target.parent().expect("entry parent"))?;
         Ok(Promoted {
             shared: linked.method == LinkMethod::Hardlink,
@@ -246,6 +250,60 @@ fn count_files(path: &Path) -> Result<u64> {
         }
     }
     Ok(files)
+}
+
+/// Measure an entry published before entries recorded their size, once. The caller
+/// holds a lease on it, and an entry never changes after publication, so the figure
+/// stays true; two ups racing here write the same number.
+pub fn record_bytes(store: &Path, hash: &str) -> Result<()> {
+    let path = store.join(hash).join("bytes");
+    if path.exists() {
+        return Ok(());
+    }
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(
+        &temporary,
+        crate::footprint::tree_size(&entry(store, hash)).to_string(),
+    )?;
+    std::fs::rename(&temporary, &path).context("recording store entry size")
+}
+
+pub struct Size {
+    pub bytes: u64,
+    pub entries: usize,
+    /// Entries published before entries recorded their size and not linked since.
+    pub unmeasured: usize,
+}
+
+/// The store's size from what each entry recorded when it was published, without
+/// walking a tree: `grove ls` reads this, and walking a 10G store under load took 89s.
+/// Blocks two entries share through a package manager's own cache count in each.
+pub fn size(store: &Path) -> Result<Size> {
+    let mut size = Size {
+        bytes: 0,
+        entries: 0,
+        unmeasured: 0,
+    };
+    let items = match std::fs::read_dir(store) {
+        Ok(items) => items,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(size),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", store.display())),
+    };
+    for item in items {
+        let name = item?.file_name().to_string_lossy().into_owned();
+        if name.len() != 16 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        size.entries += 1;
+        match std::fs::read_to_string(store.join(&name).join("bytes"))
+            .ok()
+            .and_then(|bytes| bytes.trim().parse::<u64>().ok())
+        {
+            Some(bytes) => size.bytes += bytes,
+            None => size.unmeasured += 1,
+        }
+    }
+    Ok(size)
 }
 
 /// Forget one entry. Worktrees that linked from it keep their blocks; only the store's

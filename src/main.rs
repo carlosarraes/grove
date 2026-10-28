@@ -908,14 +908,26 @@ fn disk_footer(entries: &[Entry]) -> Option<String> {
         line.push_str(&format!(", {unmeasured} unmeasured"));
     }
     // The shared trees once, whatever the number of worktrees linking them — the point of
-    // the store is that this number stops growing with the fleet.
+    // the store is that this number stops growing with the fleet. Read from what each
+    // entry recorded, never walked: `ls` is a glance, and the walk took 89s on a 10G store.
     if let Ok(store) = grove::store::dir()
-        && store.exists()
+        && let Ok(size) = grove::store::size(&store)
+        && size.entries > 0
     {
-        line.push_str(&format!(
-            ", store {}",
-            human_size(grove::footprint::tree_size(&store))
-        ));
+        if size.unmeasured < size.entries {
+            line.push_str(&format!(", store {}", human_size(size.bytes)));
+        }
+        if size.unmeasured > 0 {
+            line.push_str(&format!(
+                ", {} store {} unmeasured until next linked",
+                size.unmeasured,
+                if size.unmeasured == 1 {
+                    "entry"
+                } else {
+                    "entries"
+                }
+            ));
+        }
     }
     Some(line)
 }

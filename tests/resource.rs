@@ -1,6 +1,7 @@
 use grove::config;
 use grove::resource::{self, Decision};
-use std::net::TcpListener;
+use std::net::{Ipv4Addr, TcpListener};
+use std::os::fd::{FromRawFd, OwnedFd};
 
 fn mongo(port: u16) -> config::Resource {
     let toml = format!(
@@ -24,9 +25,25 @@ db_name = "app_{{{{ slug }}}}"
         .expect("one resource")
 }
 
-fn a_free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    listener.local_addr().expect("addr").port()
+/// A port held but never listened on: connections are refused, and while the socket lives
+/// no parallel test can be handed the same port. A released "free" port can be reused by
+/// the next test that binds port 0, which then answers and turns Start into Reuse.
+fn an_unreachable_port() -> (OwnedFd, u16) {
+    let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    addr.sin_family = libc::AF_INET as libc::sa_family_t;
+    addr.sin_addr.s_addr = u32::from(Ipv4Addr::LOCALHOST).to_be();
+    let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    assert!(raw >= 0, "socket");
+    let socket = unsafe { OwnedFd::from_raw_fd(raw) };
+    let addr_ptr = &mut addr as *mut libc::sockaddr_in as *mut libc::sockaddr;
+    assert_eq!(unsafe { libc::bind(raw, addr_ptr, len) }, 0, "bind");
+    assert_eq!(
+        unsafe { libc::getsockname(raw, addr_ptr, &mut len) },
+        0,
+        "getsockname"
+    );
+    (socket, u16::from_be(addr.sin_port))
 }
 
 /// The arch box runs rootful Docker; the mac runs Docker under lima and forwards 27017
@@ -45,7 +62,7 @@ fn a_reachable_datastore_is_reused_rather_than_started() {
 
 #[test]
 fn an_absent_datastore_is_started_from_its_declared_image() {
-    let port = a_free_port();
+    let (_held, port) = an_unreachable_port();
 
     let Decision::Start(argv) = resource::decide(&mongo(port)) else {
         panic!("should have decided to start a container");
@@ -72,7 +89,8 @@ fn an_absent_datastore_is_started_from_its_declared_image() {
 /// backwards makes docker treat `--replSet` as its own flag and fail obscurely.
 #[test]
 fn docker_flags_precede_the_image_and_container_arguments_follow_it() {
-    let Decision::Start(argv) = resource::decide(&mongo(a_free_port())) else {
+    let (_held, port) = an_unreachable_port();
+    let Decision::Start(argv) = resource::decide(&mongo(port)) else {
         panic!("should start");
     };
 

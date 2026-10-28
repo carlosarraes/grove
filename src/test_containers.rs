@@ -324,7 +324,8 @@ pub fn run(remove: bool) -> Result<()> {
                 println!("keep {name}: {error:#}");
                 continue;
             }
-            let out = output(Command::new(docker()).args(["rm", "-f", &container.id]))?;
+            // -v: a mongo image declares anonymous volumes, which `rm` alone leaves behind.
+            let out = output(Command::new(docker()).args(["rm", "-f", "-v", &container.id]))?;
             if !out.status.success() {
                 bail!("failed to remove {name} ({})", container.id);
             }

@@ -64,8 +64,8 @@ elif args[0]=='exec':
     if not source.exists(): source=root/'sockets'
     print(source.read_text(),end='')
 elif args[0]=='rm':
-    assert args[1]=='-f' and len(args)==3
-    with (root/'removed').open('a') as out: out.write(args[2]+'\n')
+    with (root/'rm-calls').open('a') as out: out.write(' '.join(args)+'\n')
+    with (root/'removed').open('a') as out: out.write(args[-1]+'\n')
 else: sys.exit(91)
 "#,
             ),
@@ -129,6 +129,18 @@ fn test_container_cleanup_reports_by_default_without_removing_anything() {
     let output = rig.run(false).success().get_output().clone();
     assert!(String::from_utf8_lossy(&output.stdout).contains("candidate old"));
     assert!(!rig.0.path().join("removed").exists());
+}
+
+/// The mongo image declares anonymous volumes; removing the container without -v
+/// leaves one dangling volume behind per test run.
+#[test]
+fn test_container_cleanup_removes_the_container_with_its_anonymous_volumes() {
+    let rig = Rig::new(vec![container("old")]);
+    rig.run(true).success();
+    assert_eq!(
+        std::fs::read_to_string(rig.0.path().join("rm-calls")).unwrap(),
+        format!("rm -f -v {}\n", id("old"))
+    );
 }
 
 #[test]

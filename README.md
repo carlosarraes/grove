@@ -64,6 +64,19 @@ grove logs backend --since-restart
 grove down
 ```
 
+Commands act on the worktree you run them in. To look at another instance without
+leaving yours, give `status`, `doctor` or `down` its name as `grove ls` prints it, or
+its worktree path:
+
+```sh
+grove status mon_10033          # read-only, from anywhere
+grove doctor ../other-worktree
+grove down mon_10033
+```
+
+An unknown name fails and points at `grove ls`. `logs`, `restart`, `run` and `seed` already
+take a service or a command as their argument, so run those inside the worktree.
+
 ## Configure
 
 ```toml

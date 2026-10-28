@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use grove::footprint::human_size;
 use grove::registry::{Entry, human_age};
 use grove::{instance::Instance, llm, load};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The window the printed prescription proposes; `health` reads the same one.
 const IDLE_WINDOW: &str = grove::health::IDLE_WINDOW;
@@ -93,7 +93,15 @@ impl Machine {
 
 /// Per-worktree dev instances: each git worktree gets its own ports, env, and database.
 #[derive(Parser)]
-#[command(name = "grove", version, about, disable_help_subcommand = true)]
+#[command(
+    name = "grove",
+    version,
+    about,
+    disable_help_subcommand = true,
+    after_help = "Commands act on the worktree you run them in. `status`, `doctor` and `down` \
+                  also take an instance name as `grove ls` shows it, or a worktree path: \
+                  `grove status mon_10033`."
+)]
 struct Cli {
     /// Emit the .grove.toml schema and worked examples, then exit
     #[arg(long, global = true)]
@@ -129,8 +137,11 @@ enum Command {
         #[arg(long)]
         no_cache: bool,
     },
-    /// Stop this instance's services
+    /// Stop this instance's services, or the named one's
     Down {
+        /// Instance name as `grove ls` shows it, or a worktree path [default: the worktree you are in]
+        #[arg(conflicts_with_all = ["idle", "all_but_this"])]
+        name: Option<String>,
         /// Also forget this instance's port reservation
         #[arg(long)]
         purge: bool,
@@ -146,6 +157,8 @@ enum Command {
     },
     /// Ports, pids, and whether each service's endpoint actually answers
     Status {
+        /// Instance name as `grove ls` shows it, or a worktree path [default: the worktree you are in]
+        name: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -193,7 +206,10 @@ enum Command {
         force: bool,
     },
     /// Check that this worktree can start: env, resources, ports, config
-    Doctor,
+    Doctor {
+        /// Instance name as `grove ls` shows it, or a worktree path [default: the worktree you are in]
+        name: Option<String>,
+    },
     /// Everything on this machine that is costing someone, and what ends it
     Health {
         #[arg(long)]
@@ -300,10 +316,11 @@ fn main() -> Result<()> {
             for outcome in instance.up(fresh, no_cache)? {
                 eprintln!("{outcome}");
             }
-            print_summary(&instance);
+            print_summary(&instance, None);
             Ok(())
         }
         Some(Command::Down {
+            name,
             purge,
             idle,
             all_but_this,
@@ -321,7 +338,7 @@ fn main() -> Result<()> {
                 return sweep(&instance.resolved.worktree, idle.as_deref(), dry_run);
             }
 
-            let mut instance = Instance::open(&cwd)?;
+            let mut instance = Instance::open(&target(name.as_deref(), &cwd)?)?;
             instance.down()?;
             if purge {
                 // Report a failed drop without failing `down` — the services really did
@@ -338,12 +355,12 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Some(Command::Status { json }) => {
-            let instance = Instance::open(&cwd)?;
+        Some(Command::Status { name, json }) => {
+            let instance = Instance::open(&target(name.as_deref(), &cwd)?)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&status_json(&instance))?);
             } else {
-                print_summary(&instance);
+                print_summary(&instance, elsewhere(&instance, &cwd));
                 print_services(&instance);
                 warn_if_stale(&instance);
             }
@@ -544,7 +561,7 @@ fn main() -> Result<()> {
             // `up` only starts what is not already running, so stopping first is what
             // makes this a restart rather than a no-op.
             instance.up(false, false)?;
-            print_summary(&instance);
+            print_summary(&instance, None);
             Ok(())
         }
         Some(Command::Prune { purge, dry_run }) => {
@@ -691,8 +708,8 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
-        Some(Command::Doctor) => {
-            let instance = Instance::open(&cwd)?;
+        Some(Command::Doctor { name }) => {
+            let instance = Instance::open(&target(name.as_deref(), &cwd)?)?;
             let verdicts = grove::doctor::check(&instance);
             if grove::doctor::report(&verdicts)? {
                 Ok(())
@@ -711,6 +728,44 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// The worktree a command acts on: the one it runs in, or the one named by an instance
+/// name as `grove ls` prints it, or by a path. A name is looked up before a path, so
+/// `grove status backend` inside a repo means the instance, not the `backend/` folder.
+fn target(name: Option<&str>, cwd: &Path) -> Result<PathBuf> {
+    let Some(name) = name else {
+        return Ok(cwd.to_path_buf());
+    };
+    let matches: Vec<Entry> = grove::instance::registry()?
+        .list()?
+        .into_iter()
+        .filter(|e| e.slug == name)
+        .collect();
+    match matches.as_slice() {
+        [entry] if entry.worktree.exists() => return Ok(entry.worktree.clone()),
+        [entry] => bail!(
+            "instance `{name}` was at {}, which no longer exists; `grove prune` forgets it",
+            entry.worktree.display()
+        ),
+        [] => {}
+        several => bail!(
+            "{} instances are named `{name}`; pass the worktree path instead:\n{}",
+            several.len(),
+            several
+                .iter()
+                .map(|e| format!("  {}", e.worktree.display()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+    }
+    let path = cwd.join(name);
+    if path.is_dir() {
+        return Ok(path);
+    }
+    bail!(
+        "no instance named `{name}` on this machine, and no directory by that name; `grove ls` lists instances"
+    )
 }
 
 /// A service older than the newest edit is serving code you have already changed. Without
@@ -1042,7 +1097,16 @@ fn status_json(instance: &Instance) -> serde_json::Value {
 }
 
 /// The only thing an agent should need to read after `up`.
-fn print_summary(instance: &Instance) {
+/// The worktree to `cd` into when status was asked about an instance from outside it.
+/// The hints that follow act on the current worktree, so without this they would act
+/// on the wrong one, or fail.
+fn elsewhere<'a>(instance: &'a Instance, cwd: &Path) -> Option<&'a Path> {
+    let worktree = &instance.resolved.worktree;
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    (!canon(cwd).starts_with(canon(worktree))).then_some(worktree.as_path())
+}
+
+fn print_summary(instance: &Instance, cd: Option<&Path>) {
     println!("instance  {}", instance.resolved.slug);
     for (name, port) in &instance.entry.ports {
         println!(
@@ -1063,6 +1127,9 @@ fn print_summary(instance: &Instance) {
         .first()
         .map(|s| s.name.as_str())
         .unwrap_or("<service>");
+    if let Some(worktree) = cd {
+        println!("  cd {}", worktree.display());
+    }
     println!("  grove run -- <your test command>");
     println!("  grove logs {first} -f");
 }

@@ -74,7 +74,10 @@ defaults must disable dotenv loading and clear the relevant process variables in
 repo's own fixture or settings constructor.
 
 `grove status` shows what is running and, for every service with a `ready.http`, whether
-that endpoint actually answers. `--json` makes it parseable.
+that endpoint actually answers. `--json` makes it parseable. To check another instance
+from where you are, name it as `grove ls` prints it, or pass its worktree path:
+`grove status mon_10033`. `doctor` and `down` take the same argument; `logs`, `restart`,
+`run` and `seed` act only on the worktree you run them in.
 
 After editing a service that does not reload itself, replace just that one:
 

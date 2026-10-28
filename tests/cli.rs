@@ -728,6 +728,76 @@ fn status_reports_the_ports_as_json_for_agents() {
     cli.run(&wt, &["down"]).success();
 }
 
+/// An agent outside a worktree asks about it by the name `grove ls` prints, or by path,
+/// and gets that instance, not the one it happens to stand in.
+#[test]
+fn status_doctor_and_down_target_an_instance_by_name_or_path() {
+    let cli = Cli::new();
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+    let elsewhere = cli.state.path().to_path_buf(); // not a git repo
+    let status = |target: &str| -> serde_json::Value {
+        let out = cli
+            .run(&elsewhere, &["status", target, "--json"])
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice(&out).unwrap()
+    };
+
+    for target in ["feat_search", wt.to_str().unwrap()] {
+        let parsed = status(target);
+        assert_eq!(parsed["slug"], "feat_search", "{target}: {parsed}");
+        assert_eq!(parsed["services"]["web"]["running"], true, "{parsed}");
+    }
+    // The hints act on the current worktree, so from elsewhere they start with a cd.
+    let text = |cwd: &std::path::Path| {
+        let out = cli.run(cwd, &["status", "feat_search"]).success();
+        String::from_utf8_lossy(&out.get_output().stdout).into_owned()
+    };
+    let outside = text(&elsewhere);
+    assert!(outside.contains("instance  feat_search"), "{outside}");
+    assert!(
+        outside.contains(&format!("  cd {}", wt.display())),
+        "{outside}"
+    );
+    let inside = text(&wt);
+    assert!(!inside.contains("  cd "), "{inside}");
+
+    let doctor = cli.run(&elsewhere, &["doctor", "feat_search"]);
+    let out = String::from_utf8_lossy(&doctor.get_output().stdout).into_owned();
+    assert!(out.contains("worktree feat_search"), "{out}");
+
+    cli.run(&elsewhere, &["down", "feat_search"])
+        .success()
+        .stdout(predicates::str::contains("stopped feat_search"));
+    assert_eq!(status("feat_search")["services"]["web"]["running"], false);
+}
+
+#[test]
+fn an_unknown_instance_name_points_at_grove_ls() {
+    let cli = Cli::new();
+    let wt = cli.worktree("feat_search");
+    for command in ["status", "doctor", "down"] {
+        let out = cli
+            .run(&wt, &[command, "mon_nope"])
+            .failure()
+            .get_output()
+            .stderr
+            .clone();
+        let err = String::from_utf8_lossy(&out);
+        assert!(
+            err.contains("no instance named `mon_nope`")
+                && err.contains("`grove ls` lists instances"),
+            "{command}: {err}"
+        );
+    }
+    // A sweep and a named target contradict each other.
+    cli.run(&wt, &["down", "feat_search", "--idle", "2h"])
+        .failure();
+}
+
 #[test]
 fn logs_show_what_the_service_printed() {
     let cli = Cli::new();

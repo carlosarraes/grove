@@ -831,6 +831,9 @@ impl Instance {
             })?;
         }
 
+        let Some(command) = &service.command else {
+            return Ok(());
+        };
         let already = self.entry.services.get(&service.name).copied();
         if let Some(handle) = already {
             if fresh {
@@ -858,7 +861,7 @@ impl Instance {
             }
         }
 
-        let command = render::value(&service.command, &context)
+        let command = render::value(command, &context)
             .with_context(|| format!("rendering the command for {}", service.name))?;
         let environment = self.environment()?;
         let handle = crate::timing::measure(&format!("{}: process start", service.name), || {
@@ -1323,6 +1326,7 @@ impl Instance {
         self.config
             .services
             .iter()
+            .filter(|s| s.command.is_some())
             .map(|s| {
                 let running = self
                     .entry

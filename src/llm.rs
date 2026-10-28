@@ -196,7 +196,9 @@ needed data, then deliberately remove and recreate that container.
                      track what it was generated from, e.g. a typed client built from
                      this worktree's own backend. It runs even when the service is
                      already up, which is the case where stale output survives unnoticed.
-  command            the process to run; must accept its port, usually via a flag
+  command            the process to run; must accept its port, usually via a flag.
+                     Omit it for a setup-only service: a repo that needs its .venv
+                     but serves nothing gets setup and setup_inputs, and no ready
   ready.http         URL polled until it answers
   ready.timeout      how long to wait, e.g. "180s"
   cache.path         what setup leaves behind, relative to cwd (node_modules)

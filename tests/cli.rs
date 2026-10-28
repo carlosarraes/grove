@@ -4212,6 +4212,48 @@ fn setup_inputs_rerun_only_when_declared_inputs_or_command_change() {
     assert!(!cli.state.path().join("store").exists());
 }
 
+/// A repo with dependencies and nothing to serve (Pulumi, tooling) still needs `up` to
+/// give each worktree its install, without inventing a process to supervise.
+#[test]
+fn a_setup_only_service_installs_dependencies_and_starts_nothing() {
+    let cli = Cli::with_config(
+        "version = 1\n[[service]]\nname = \"venv\"\nsetup = \"echo installed >> installs\"\n\
+         setup_inputs = [\"uv.lock\"]\n",
+    );
+    let wt = cli.worktree("infra");
+    std::fs::write(wt.join("uv.lock"), "initial").unwrap();
+
+    cli.run(&wt, &["doctor"]).success();
+    cli.run(&wt, &["up"]).success();
+    cli.run(&wt, &["up"]).success();
+    assert_eq!(
+        std::fs::read_to_string(wt.join("installs")).unwrap(),
+        "installed\n"
+    );
+    std::fs::write(wt.join("uv.lock"), "changed").unwrap();
+    cli.run(&wt, &["up"]).success();
+    assert_eq!(
+        std::fs::read_to_string(wt.join("installs"))
+            .unwrap()
+            .lines()
+            .count(),
+        2,
+        "a changed input reruns setup"
+    );
+
+    let out = cli
+        .run(&wt, &["status"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status = String::from_utf8_lossy(&out);
+    assert!(
+        !status.contains("stopped"),
+        "nothing to run is not a stopped service: {status}"
+    );
+}
+
 #[test]
 fn setup_inputs_migrate_a_command_only_marker_once() {
     let legacy = INPUT_SETUP_CONFIG.replace("setup_inputs = [\"uv.lock\", \"pyproject.toml\"]", "");

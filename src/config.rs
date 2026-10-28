@@ -132,7 +132,10 @@ pub struct Service {
     /// Distinct from `setup` and `[[seed]]`, which run once: generated code has to track
     /// what it was generated from, so "once" is the wrong contract for it.
     pub prepare: Option<String>,
-    pub command: String,
+    /// The process to run. Omitted, the service is setup-only: its dependencies are
+    /// installed and kept current, and nothing is started — a Pulumi or tooling repo
+    /// needs its `.venv` but serves nothing.
+    pub command: Option<String>,
     pub ready: Option<Ready>,
     /// What `setup` produces and what decides it, so worktrees on the same inputs share
     /// one copy instead of each installing their own.
@@ -168,7 +171,10 @@ pub fn load(worktree: &Path) -> Result<Config> {
             "no {FILENAME} in {}\n\
              This repo has not been set up for grove yet. \
              Run `grove --llm` for the schema and worked examples, \
-             then write {FILENAME} at the worktree root and commit it.",
+             then write {FILENAME} at the main checkout's root: worktrees without \
+             their own copy use that one, so it can stay untracked. For a repo that \
+             only needs dependencies, such as a .venv, a [[service]] with setup and \
+             no command is enough.",
             worktree.display()
         ),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
@@ -221,6 +227,12 @@ impl Config {
                 .with_context(|| format!("[idle] stop_after = {:?}", idle.stop_after))?;
         }
         for service in &self.services {
+            if service.command.is_none() && service.ready.is_some() {
+                anyhow::bail!(
+                    "service {:?}: ready needs a command; a setup-only service starts nothing",
+                    service.name
+                );
+            }
             if let Some(inputs) = &service.setup_inputs {
                 if service.setup.is_none() {
                     anyhow::bail!("service {:?}: setup_inputs requires setup", service.name);

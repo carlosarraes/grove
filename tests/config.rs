@@ -41,6 +41,23 @@ fn missing_config_routes_the_agent_to_the_schema() {
         msg.contains("grove --llm"),
         "should point at the schema so an agent can author one: {msg}"
     );
+    assert!(
+        msg.contains("main checkout") && !msg.contains("commit it"),
+        "an untracked copy in the main checkout serves every worktree: {msg}"
+    );
+}
+
+#[test]
+fn a_readiness_probe_without_a_command_is_rejected() {
+    let err = config::parse(
+        "version = 1\n[[service]]\nname = \"venv\"\nsetup = \"uv sync\"\n\
+         ready.http = \"http://localhost:1/\"\nready.timeout = \"5s\"\n",
+    )
+    .expect_err("nothing would ever answer");
+    assert!(
+        format!("{err:#}").contains("ready needs a command"),
+        "{err:#}"
+    );
 }
 
 /// `grove --llm` hands this example to agents to copy. If it stops parsing, every agent

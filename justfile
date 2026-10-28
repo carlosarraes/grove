@@ -5,50 +5,120 @@ install_dir := env_var("HOME") / ".local/bin"
 
 default: build
 
+# Carlos's Mac is an install-only host for this tool.
+[private]
+assert-build-host:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "$(hostname -s)" in
+        Carloss-MacBook-Air|Carloss-MacBook-Air.*)
+            echo "error: do not compile grove on mac; run just sync mac mact" >&2
+            exit 1;;
+    esac
+    if [[ -e "$HOME/.config/grove/no-build" ]]; then
+        echo "error: compilation disabled on this host; run just sync mac mact" >&2
+        exit 1
+    fi
+
 # Build an optimized binary and install it for the current user.
-build:
+build: assert-build-host
     cargo build --release --locked
     mkdir -p {{install_dir}}
     install -m 0755 target/release/{{binary}} {{install_dir}}/{{binary}}
     @echo "Installed {{install_dir}}/{{binary}}"
 
-# Install on mac and mact (defaults to mac) without a release. The Mac is under
-# heavy load and never compiles: mact has the same Apple chip, builds in its
-# ~/projs/grove clone, and the binary is copied over.
+# Build on a separate host, then atomically install on the destination.
 [positional-arguments]
-sync host="mac":
+sync host="mac" builder="mact":
     #!/usr/bin/env bash
     set -euo pipefail
     sync_host="$1"
-    if [[ "$sync_host" != mac && "$sync_host" != mact ]]; then
-      echo "error: sync supports mac and mact" >&2
-      exit 1
+    build_host="$2"
+    for host in "$sync_host" "$build_host"; do
+        if [[ ! "$host" =~ ^[a-zA-Z0-9][a-zA-Z0-9._@-]*$ ]]; then
+            echo "error: use an SSH host alias, hostname, or user@host" >&2
+            exit 1
+        fi
+    done
+    if [[ "$build_host" == mac ]]; then
+        echo "error: mac is an install-only host; use mact as the builder" >&2
+        exit 1
     fi
-    install_on() {
-      ssh -o BatchMode=yes "$1" "bash -s -- $2" <<'SH'
+    ssh_options=(-o BatchMode=yes -o ControlPath=none -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=2)
+    builder_name=$(ssh "${ssh_options[@]}" "$build_host" 'hostname -s')
+    case "$builder_name" in
+        Carloss-MacBook-Air|Carloss-MacBook-Air.*)
+            echo "error: Carlos's Mac is an install-only host; use mact as the builder" >&2
+            exit 1;;
+    esac
+    builder_platform=$(ssh "${ssh_options[@]}" "$build_host" 'uname -sm')
+    destination_platform=$(ssh "${ssh_options[@]}" "$sync_host" 'uname -sm')
+    if [[ "$builder_platform" != "$destination_platform" ]]; then
+        echo "error: builder $build_host is $builder_platform, destination $sync_host is $destination_platform; choose a matching builder" >&2
+        exit 1
+    fi
+    stage=$(mktemp -d "${TMPDIR:-/tmp}/grove-sync.XXXXXX")
+    pending=""
+    builder_stage=""
+    cleanup() {
+        rm -rf "$stage"
+        if [[ -n "$builder_stage" ]]; then
+            ssh "${ssh_options[@]}" "$build_host" "rm -rf -- '$builder_stage'" || true
+        fi
+        if [[ -n "$pending" ]]; then
+            ssh "${ssh_options[@]}" "$sync_host" "rm -f -- '$pending'" || true
+        fi
+    }
+    trap cleanup EXIT
+    candidate=$(ssh "${ssh_options[@]}" "$build_host" 'test ! -e "$HOME/.config/grove/no-build" || { echo "error: compilation disabled on this host" >&2; exit 1; }; mkdir -p ~/.cache/grove-build; mktemp -d "$HOME/.cache/grove-build/source.XXXXXX"')
+    if [[ ! "$candidate" =~ ^/[a-zA-Z0-9_./-]+/\.cache/grove-build/source\.[a-zA-Z0-9]+$ ]]; then
+        echo "error: invalid builder staging path" >&2
+        exit 1
+    fi
+    builder_stage="$candidate"
+    echo "Building grove on $build_host ($builder_platform); installing on $sync_host"
+    rsync -az \
+        --include='/Cargo.toml' --include='/Cargo.lock' --include='/build.rs' \
+        --include='/rust-toolchain.toml' --include='/src/***' --include='/skills/***' \
+        --exclude='*' -e 'ssh -o BatchMode=yes -o ControlPath=none -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=2' ./ "$build_host:$builder_stage/"
+    ssh "${ssh_options[@]}" "$build_host" "bash -s -- '$builder_stage'" <<'BUILD'
     set -euo pipefail
-    mkdir -p "$HOME/.local/bin"
-    pending=$(mktemp "$HOME/.local/bin/.grove-sync.XXXXXX")
+    test ! -e "$HOME/.config/grove/no-build" || { echo "error: compilation disabled on this host" >&2; exit 1; }
+    export PATH="$HOME/.cargo/bin:$PATH"
+    python3 - "$1" <<'PYBUILD'
+    import fcntl, os, pathlib, shutil, subprocess, sys
+    source = pathlib.Path(sys.argv[1])
+    cache = pathlib.Path.home() / ".cache/grove-build"
+    with (cache / "build.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        env = dict(os.environ, CARGO_TARGET_DIR=str(cache / "target"))
+        result = subprocess.run(["cargo", "build", "--locked", "--release"], cwd=source, env=env)
+        if result.returncode:
+            sys.exit(result.returncode)
+        shutil.copy2(cache / "target/release/grove", source / "grove")
+    PYBUILD
+    BUILD
+    scp -q "${ssh_options[@]}" "$build_host:$builder_stage/grove" "$stage/grove"
+    candidate=$(ssh "${ssh_options[@]}" "$sync_host" 'mkdir -p ~/.local/bin; mktemp "$HOME/.local/bin/.grove-sync.XXXXXX"')
+    if [[ ! "$candidate" =~ ^/[a-zA-Z0-9_./-]+$ ]]; then
+        echo "error: invalid destination staging path" >&2
+        exit 1
+    fi
+    pending="$candidate"
+    scp -q "${ssh_options[@]}" "$stage/grove" "$sync_host:$pending"
+    ssh "${ssh_options[@]}" "$sync_host" "bash -s -- '$pending'" <<'SH'
+    set -euo pipefail
+    pending="$1"
     trap 'rm -f "$pending"' EXIT
-    install -m 0755 "$HOME/$1" "$pending"
+    chmod 755 "$pending"
     "$pending" --version
     mv -f "$pending" "$HOME/.local/bin/grove"
     echo "Installed $HOME/.local/bin/grove"
     SH
-    }
-    rsync -az --delete \
-      --include='/Cargo.toml' --include='/Cargo.lock' --include='/src/***' --include='/skills/***' \
-      --exclude='*' -e 'ssh -o BatchMode=yes' ./ mact:projs/grove/
-    ssh -o BatchMode=yes mact 'export PATH="$HOME/.cargo/bin:$PATH"; cd ~/projs/grove && cargo build --release --locked'
-    install_on mact projs/grove/target/release/grove
-    if [[ "$sync_host" == mac ]]; then
-      ssh -o BatchMode=yes mac 'mkdir -p ~/.cache/grove-src'
-      scp -3 -q -o BatchMode=yes mact:projs/grove/target/release/grove mac:.cache/grove-src/grove-sync-binary
-      install_on mac .cache/grove-src/grove-sync-binary
-    fi
+    pending=""
 
 # Run the same checks expected by CI.
-check:
+check: assert-build-host
     cargo fmt --check
     cargo clippy --all-targets --all-features -- -D warnings
     cargo test --all-targets --all-features
@@ -56,7 +126,7 @@ check:
 
 # Cut a release: update Cargo's version, commit, tag, and push.
 # Usage: just release 0.1.0
-release version:
+release version: assert-build-host
     #!/usr/bin/env bash
     set -euo pipefail
 

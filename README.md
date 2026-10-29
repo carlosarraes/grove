@@ -157,7 +157,8 @@ repo's own fixture or settings constructor.
 
 | | |
 |---|---|
-| `up [--heavy] [--expose] [--expose-host HOST]` | render config, optionally expose opted-in services to the local network, start shared resources and services |
+| `gate [--no-cache]` | whether `up` here would link or build dependencies, and whether load admits it; exits 0 or 3 |
+| `up [--heavy] [--gate] [--expose] [--expose-host HOST]` | render config, optionally expose opted-in services to the local network, start shared resources and services |
 | `down [--purge]` | stop services; `--purge` also drops the database |
 | `down --idle 2h` \| `--all-but-this` | stop instances across the machine, keeping their ports; `--dry-run` names them first |
 | `restart [service]` | replace one service without touching the others |
@@ -202,6 +203,21 @@ grove run --heavy -- fleetlock run pytest <lane> <card> -- <cmd>
 The order is admission, then the fleetlock slot, then the command. The admission wait
 stays outside fleetlock's hold cap. Load can change during the slot wait, so this remains
 a heuristic. This flag provides neither FIFO ordering nor a slot reservation.
+
+## Gate installs by load
+
+`grove gate` decides, from the same cache key `up` uses, whether `up` would only link
+dependency trees the store already holds or would have to build one, and judges the
+1- and 15-minute load against that kind's limits:
+
+```
+load gate: link-only (lockfile matches store), limits 60/60, load 48.0/52.0 ok
+load gate: full install (frontend lockfile not in store, 1a2b…), limits 25/35, load 30.1/33.0 over, holding
+```
+
+It exits 0 when admitted and 3 when holding. `grove up --gate` prints the same line
+and waits for admission (up to `[admission] timeout`) before installing anything.
+Limits are `[admission] full_install = [25, 35]` and `link_only = [60, 60]` by default.
 
 ## Limit concurrent startup
 

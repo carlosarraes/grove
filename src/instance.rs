@@ -523,6 +523,54 @@ impl Instance {
             .collect()
     }
 
+    /// Whether `up` would only link dependency trees or build one, by the same test
+    /// `run_setup` makes: the cache key from the service's lockfiles, then whether the
+    /// worktree already holds that tree or the store has a published entry for it. Read
+    /// only — it takes no cache lock, so a concurrent publish can only turn a full
+    /// install into a link, never the reverse.
+    pub fn install_plan(&self, no_cache: bool) -> crate::load::Install {
+        use crate::load::Install;
+        let store = match crate::store::dir() {
+            Ok(store) => store,
+            Err(e) => return Install::Full(format!("cannot locate the store: {e}")),
+        };
+        let mut linking = Vec::new();
+        let mut cached = 0;
+        for service in &self.config.services {
+            let (Some(setup), Some(cache)) = (&service.setup, &service.cache) else {
+                continue;
+            };
+            cached += 1;
+            let name = &service.name;
+            if no_cache {
+                return Install::Full(format!("--no-cache rebuilds {name}"));
+            }
+            let cwd = match &service.cwd {
+                Some(dir) => self.resolved.worktree.join(dir),
+                None => self.resolved.worktree.clone(),
+            };
+            let hash = match crate::store::key(&cwd, cache, setup) {
+                Ok(hash) => hash,
+                Err(_) => return Install::Full(format!("{name} lockfile unreadable")),
+            };
+            let marker = self.instance_dir().join(format!(".setup-{name}"));
+            if cwd.join(&cache.path).is_dir()
+                && std::fs::read_to_string(&marker).ok().as_deref() == Some(hash.as_str())
+            {
+                continue;
+            }
+            if !crate::store::entry(&store, &hash).is_dir() {
+                return Install::Full(format!("{name} lockfile not in store, {hash}"));
+            }
+            linking.push(name.clone());
+        }
+        match (cached, linking.is_empty()) {
+            (0, _) => Install::Full("no cached dependencies to link".to_string()),
+            (_, true) => Install::LinkOnly("dependencies already in place".to_string()),
+            (_, false) => Install::LinkOnly("lockfile matches store".to_string()),
+        }
+    }
+
     pub fn db_name(&self) -> Option<String> {
         self.entry.db_name.clone()
     }

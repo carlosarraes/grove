@@ -51,11 +51,133 @@ fn override_value(name: &str) -> Option<f64> {
 }
 
 fn machine_load() -> Option<f64> {
+    machine_averages().map(|[one, _]| one)
+}
+
+/// The 1- and 15-minute load averages.
+fn machine_averages() -> Option<[f64; 2]> {
     let mut averages = [0f64; 3];
     // SAFETY: getloadavg writes at most the requested number of elements, and it is
     // handed the length of the array it is writing into.
     let filled = unsafe { libc::getloadavg(averages.as_mut_ptr(), 3) };
-    (filled > 0).then_some(averages[0])
+    (filled >= 3).then_some([averages[0], averages[2]])
+}
+
+/// What `up` would do for dependencies: only link trees the store already holds, or
+/// build one. Linking is file-system work; a build fetches and compiles, and that is what
+/// a loaded machine cannot absorb.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Install {
+    LinkOnly(String),
+    Full(String),
+}
+
+impl Install {
+    fn name(&self) -> &'static str {
+        match self {
+            Install::LinkOnly(_) => "link-only",
+            Install::Full(_) => "full install",
+        }
+    }
+    fn reason(&self) -> &str {
+        match self {
+            Install::LinkOnly(reason) | Install::Full(reason) => reason,
+        }
+    }
+    pub fn limits(&self, config: &crate::config::Admission) -> [f64; 2] {
+        match self {
+            Install::LinkOnly(_) => config.link_only,
+            Install::Full(_) => config.full_install,
+        }
+    }
+}
+
+/// One reading of the install gate, ready to print.
+pub struct Verdict {
+    pub admitted: bool,
+    pub line: String,
+}
+
+/// The 1- and 15-minute load, `GROVE_LOAD` and `GROVE_LOAD15` forced for tests (the
+/// 15-minute figure follows `GROVE_LOAD` when only that is set).
+pub fn averages() -> Option<[f64; 2]> {
+    let forced = override_value("GROVE_LOAD");
+    let machine = || machine_averages();
+    let one = forced.or_else(|| machine().map(|[one, _]| one))?;
+    let fifteen = override_value("GROVE_LOAD15")
+        .or(forced)
+        .or_else(|| machine().map(|[_, fifteen]| fifteen))?;
+    Some([one, fifteen])
+}
+
+/// Both averages must be under their limits: the 1-minute one says what is running now,
+/// the 15-minute one whether that is a spike or the afternoon.
+pub fn judge(
+    install: &Install,
+    config: &crate::config::Admission,
+    load: Option<[f64; 2]>,
+) -> Verdict {
+    let [max_one, max_fifteen] = install.limits(config);
+    let head = format!(
+        "load gate: {} ({}), limits {}/{}",
+        install.name(),
+        install.reason(),
+        max_one,
+        max_fifteen
+    );
+    match load.filter(|l| l.iter().all(|v| v.is_finite() && *v >= 0.0)) {
+        None => Verdict {
+            admitted: false,
+            line: format!("{head}, load unreadable, holding"),
+        },
+        Some([one, fifteen]) => {
+            let admitted = one < max_one && fifteen < max_fifteen;
+            Verdict {
+                admitted,
+                line: format!(
+                    "{head}, load {one:.1}/{fifteen:.1} {}",
+                    if admitted { "ok" } else { "over, holding" }
+                ),
+            }
+        }
+    }
+}
+
+/// Hold `up` until the gate for `install` admits it, printing the gate on entry and every
+/// 15s while it holds.
+pub fn wait_for_install_gate(
+    install: &Install,
+    config: &crate::config::Admission,
+) -> anyhow::Result<()> {
+    use std::time::{Duration, Instant};
+    let timeout = crate::instance::parse_duration(&config.timeout)?;
+    let began = Instant::now();
+    let mut heartbeat = Duration::ZERO;
+    loop {
+        let verdict = judge(install, config, averages());
+        let elapsed = began.elapsed();
+        if verdict.admitted {
+            eprintln!("{}", verdict.line);
+            return Ok(());
+        }
+        if elapsed >= timeout {
+            anyhow::bail!(
+                "{}; timed out after {:.0}s, nothing was installed or started",
+                verdict.line,
+                elapsed.as_secs_f64()
+            );
+        }
+        if elapsed >= heartbeat {
+            eprintln!(
+                "{} ({:.0}s of {})",
+                verdict.line,
+                elapsed.as_secs_f64(),
+                config.timeout
+            );
+            heartbeat = elapsed + Duration::from_secs(15);
+        }
+        std::thread::sleep(Duration::from_secs(2).min(timeout - elapsed));
+    }
 }
 
 fn cores() -> usize {
@@ -211,6 +333,7 @@ mod admission_tests {
                 &Admission {
                     max_load: None,
                     timeout: "5s".to_string(),
+                    ..Admission::default()
                 },
                 || {
                     samples

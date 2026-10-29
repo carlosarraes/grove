@@ -28,11 +28,15 @@ pub struct Config {
 }
 
 /// Optional limits for `run --heavy` and `up --heavy`; ordinary commands do not wait.
+/// `full_install` and `link_only` are the `[1-minute, 15-minute]` load limits that
+/// `grove gate` and `up --gate` apply, chosen by whether setup would build or only link.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Admission {
     pub max_load: Option<f64>,
     pub timeout: String,
+    pub full_install: [f64; 2],
+    pub link_only: [f64; 2],
 }
 
 impl Default for Admission {
@@ -40,6 +44,8 @@ impl Default for Admission {
         Self {
             max_load: None,
             timeout: "10m".to_string(),
+            full_install: [25.0, 35.0],
+            link_only: [60.0, 60.0],
         }
     }
 }
@@ -215,6 +221,17 @@ impl Config {
                 .is_some_and(|limit| !limit.is_finite() || limit <= 0.0)
             {
                 anyhow::bail!("[admission] max_load must be positive and finite");
+            }
+            for (name, limits) in [
+                ("full_install", admission.full_install),
+                ("link_only", admission.link_only),
+            ] {
+                if limits
+                    .iter()
+                    .any(|limit| !limit.is_finite() || *limit <= 0.0)
+                {
+                    anyhow::bail!("[admission] {name} limits must be positive and finite");
+                }
             }
             let timeout = crate::instance::parse_duration(&admission.timeout)
                 .context("[admission] timeout")?;

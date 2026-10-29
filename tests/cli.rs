@@ -272,7 +272,17 @@ impl Cli {
     }
 
     fn run(&self, cwd: &Path, args: &[&str]) -> assert_cmd::assert::Assert {
+        self.run_env(cwd, &[], args)
+    }
+
+    fn run_env(
+        &self,
+        cwd: &Path,
+        envs: &[(&str, &str)],
+        args: &[&str],
+    ) -> assert_cmd::assert::Assert {
         let mut command = Command::cargo_bin("grove").expect("binary");
+        command.envs(envs.iter().copied());
         command
             .current_dir(cwd)
             .env("GROVE_STATE_DIR", self.state.path())
@@ -3213,6 +3223,85 @@ fn installs(cli: &Cli) -> usize {
     std::fs::read_to_string(cli.fx.main.parent().unwrap().join("worktrees/installs.log"))
         .map(|s| s.lines().count())
         .unwrap_or(0)
+}
+
+/// The install gate holds a build at 25/35 but lets an up that only links from the store
+/// through at 60/60, decided from the store key the lockfile produces, and says which.
+#[test]
+fn install_gate_admits_a_link_only_up_at_load_that_holds_a_full_install() {
+    let cli = Cli::with_config(&format!("{CACHE_CONFIG}\n[admission]\ntimeout = \"1s\"\n"));
+    with_lockfile(&cli, "lockfile A\n");
+    let a = cli.worktree("gate_full");
+    let b = cli.worktree("gate_link");
+    let busy = [("GROVE_LOAD", "48"), ("GROVE_LOAD15", "52")];
+    let text = |a: &assert_cmd::assert::Assert| {
+        let out = a.get_output();
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+
+    // Nothing in the store: a full install, held at load 48.
+    let gate = cli.run_env(&a, &busy, &["gate"]).code(3);
+    let out = text(&gate);
+    assert!(
+        out.contains("load gate: full install (web lockfile not in store")
+            && out.contains("limits 25/35, load 48.0/52.0 over, holding"),
+        "{out}"
+    );
+    let held = cli.run_env(&a, &busy, &["up", "--gate"]).failure();
+    assert!(text(&held).contains("timed out"), "{}", text(&held));
+    assert_eq!(installs(&cli), 0, "a held up must not install");
+
+    // Under the full-install limits it builds and publishes.
+    let calm = [("GROVE_LOAD", "10"), ("GROVE_LOAD15", "20")];
+    let up = cli.run_env(&a, &calm, &["up", "--gate"]).success();
+    assert!(
+        text(&up).contains("load gate: full install") && text(&up).contains("10.0/20.0 ok"),
+        "{}",
+        text(&up)
+    );
+    assert_eq!(installs(&cli), 1);
+
+    // Same lockfile in another worktree: link-only, admitted at the same load.
+    let gate = cli.run_env(&b, &busy, &["gate"]).success();
+    assert_eq!(
+        String::from_utf8_lossy(&gate.get_output().stdout).trim(),
+        "load gate: link-only (lockfile matches store), limits 60/60, load 48.0/52.0 ok"
+    );
+    let up = cli.run_env(&b, &busy, &["up", "--gate"]).success();
+    assert!(
+        text(&up).contains("load gate: link-only (lockfile matches store)"),
+        "{}",
+        text(&up)
+    );
+    assert_eq!(installs(&cli), 1, "a link-only up must not build");
+
+    // Link-only still has a ceiling, and a 15-minute spike alone holds it.
+    let gate = cli
+        .run_env(
+            &b,
+            &[("GROVE_LOAD", "40"), ("GROVE_LOAD15", "65")],
+            &["gate"],
+        )
+        .code(3);
+    assert!(
+        text(&gate).contains("load gate: link-only (dependencies already in place), limits 60/60, load 40.0/65.0 over"),
+        "{}",
+        text(&gate)
+    );
+    // --no-cache is always a build.
+    let gate = cli.run_env(&b, &busy, &["gate", "--no-cache"]).code(3);
+    assert!(
+        text(&gate).contains("full install (--no-cache"),
+        "{}",
+        text(&gate)
+    );
+
+    cli.run(&a, &["down"]).success();
+    cli.run(&b, &["down"]).success();
 }
 
 /// `ls` reports the store from the size each entry recorded at publication and never

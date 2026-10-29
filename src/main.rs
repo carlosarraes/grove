@@ -121,6 +121,11 @@ enum Command {
         /// Wait for a machine-wide startup slot and load admission
         #[arg(long)]
         heavy: bool,
+        /// Hold until load is under the install gate: `[admission] link_only` (default
+        /// 60/60) when the store already has every dependency tree, `full_install`
+        /// (default 25/35) when one must be built
+        #[arg(long)]
+        gate: bool,
         /// Restart services that are already running
         #[arg(long)]
         fresh: bool,
@@ -161,6 +166,13 @@ enum Command {
         name: Option<String>,
         #[arg(long)]
         json: bool,
+    },
+    /// Whether `up` here would link or build dependencies, and whether load admits it now;
+    /// exits 0 when admitted, 3 when holding
+    Gate {
+        /// Judge as `up --no-cache` would: always a full install
+        #[arg(long)]
+        no_cache: bool,
     },
     /// Every instance on this machine
     #[command(visible_alias = "list", alias = "instances")]
@@ -271,9 +283,24 @@ fn main() -> Result<()> {
             println!();
             Ok(())
         }
+        Some(Command::Gate { no_cache }) => {
+            let instance = Instance::open(&cwd)?;
+            let install = instance.install_plan(no_cache);
+            let verdict = grove::load::judge(
+                &install,
+                &instance.config.admission.clone().unwrap_or_default(),
+                grove::load::averages(),
+            );
+            println!("{}", verdict.line);
+            if !verdict.admitted {
+                std::process::exit(3);
+            }
+            Ok(())
+        }
         Some(Command::Up {
             up_log_child: _,
             heavy,
+            gate,
             fresh,
             allow_main,
             expose,
@@ -297,6 +324,13 @@ fn main() -> Result<()> {
             } else {
                 None
             };
+            if gate {
+                let install = instance.install_plan(no_cache);
+                grove::load::wait_for_install_gate(
+                    &install,
+                    &instance.config.admission.clone().unwrap_or_default(),
+                )?;
+            }
             instance.touch()?;
             if let Some(idle) = &instance.config.idle {
                 enforce_idle(&instance, &idle.stop_after)?;

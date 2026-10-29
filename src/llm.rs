@@ -177,6 +177,14 @@ needed data, then deliberately remove and recreate that container.
                      the slot while overloaded, and holds it through setup, seeds and
                      readiness once admitted. Queue time is separate from readiness.
                      Load averages lag and do not measure free memory.
+    full_install     [1-min, 15-min] load limits, default [25, 35], for `grove gate`
+                     and `grove up --gate` when setup would build a dependency tree
+    link_only        [1-min, 15-min], default [60, 60], when every cached tree's
+                     lockfile key is already in the store (or already in place), so
+                     up only links. Both averages must be under the limits. `grove
+                     gate` prints e.g. "load gate: link-only (lockfile matches store),
+                     limits 60/60, load 48.0/52.0 ok" and exits 0, or 3 when holding;
+                     `up --gate` waits up to `timeout`, printing the same line.
 
   [idle]             optional; opt in to stopping forgotten instances
   stop_after         e.g. "2h". Every `grove up` for this repo first stops its sibling

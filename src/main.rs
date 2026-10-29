@@ -413,9 +413,15 @@ fn main() -> Result<()> {
                     format!("orphaned ({live})")
                 } else if live > 0 {
                     format!("running ({live})")
-                } else if last_up_failed(entry) {
-                    failed += 1;
-                    "up failed".to_string()
+                } else if let Some(last) =
+                    last_up(entry).filter(|last| last.failed() || last.interrupted())
+                {
+                    if last.interrupted() {
+                        "interrupted".to_string()
+                    } else {
+                        failed += 1;
+                        "up failed".to_string()
+                    }
                 } else {
                     "stopped".to_string()
                 };
@@ -997,12 +1003,8 @@ fn disk_footer(entries: &[Entry]) -> Option<String> {
 /// The machine-wide counterpart to `status --json`: everything an agent needs to decide
 /// whether the box is the problem, without parsing a table or shelling out to `uptime`.
 /// From the run log alone: `ls` reads the registry and has no config to check setup with.
-fn last_up_failed(entry: &Entry) -> bool {
-    entry
-        .instance_dir
-        .as_deref()
-        .and_then(grove::last_up::read)
-        .is_some_and(|last| last.failed())
+fn last_up(entry: &Entry) -> Option<grove::last_up::LastUp> {
+    entry.instance_dir.as_deref().and_then(grove::last_up::read)
 }
 
 fn ls_json(entries: &[Entry], now: u64, machine: &Machine) -> serde_json::Value {
@@ -1020,7 +1022,8 @@ fn ls_json(entries: &[Entry], now: u64, machine: &Machine) -> serde_json::Value 
                 "ports": e.ports,
                 "database": e.db_name,
                 "disk_bytes": disk_of(e),
-                "last_up_failed": last_up_failed(e),
+                "last_up_failed": last_up(e).is_some_and(|last| last.failed()),
+                "last_up_interrupted": last_up(e).is_some_and(|last| last.interrupted()),
             })
         })
         .collect();
@@ -1113,6 +1116,7 @@ fn status_json(instance: &Instance) -> serde_json::Value {
         "setup_incomplete": instance.setup_incomplete(),
         "last_up": instance.last_up().map(|last| serde_json::json!({
             "failed": last.failed(),
+            "interrupted": last.interrupted(),
             "exit_code": last.exit_code(),
             "error": last.error(),
             "log": last.log,
@@ -1137,6 +1141,8 @@ fn attention(instance: &Instance) -> Vec<String> {
         ));
     } else if let Some(last) = last.as_ref().filter(|last| last.failed()) {
         notes.push(format!("{} (failed)", last.describe()));
+    } else if let Some(last) = last.as_ref().filter(|last| last.interrupted()) {
+        notes.push(last.describe());
     }
     if let Some(last) = last.filter(|_| !notes.is_empty()) {
         notes.push(format!("up log:   {}", last.log.display()));

@@ -6163,3 +6163,52 @@ fn status_names_a_setup_that_has_never_run() {
         "{status}"
     );
 }
+
+/// Ctrl-C during `up` is the person at the keyboard, not a broken instance: say so, and
+/// keep it out of the failed count `ls` asks someone to investigate.
+#[test]
+fn an_up_stopped_with_ctrl_c_reads_as_interrupted_not_failed() {
+    let config = SETUP_ONLY_CONFIG.replace("touch synced", "touch started; sleep 3");
+    let cli = Cli::with_config(&config);
+    let wt = cli.worktree("ctrl_c");
+    std::fs::write(wt.join("uv.lock"), "lock").unwrap();
+    let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("grove"))
+        .arg("up")
+        .current_dir(&wt)
+        .env("GROVE_STATE_DIR", cli.state.path())
+        .env("GROVE_PORT_RANGE", cli.port_range())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !wt.join("started").exists() {
+        assert!(std::time::Instant::now() < deadline, "setup did not start");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // SAFETY: child.id() is the live process this test owns.
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(130));
+
+    let text = |args: &[&str]| -> String {
+        String::from_utf8_lossy(&cli.run(&wt, args).success().get_output().stdout).into_owned()
+    };
+    let status = text(&["status"]);
+    assert!(
+        status.contains("setup: venv never completed (last up ")
+            && status.contains(": interrupted (Ctrl-C)); run grove up")
+            && !status.contains("exit code 130"),
+        "{status}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&text(&["status", "--json"])).unwrap();
+    assert_eq!(json["last_up"]["interrupted"], true, "{json}");
+    assert_eq!(json["last_up"]["failed"], false, "{json}");
+    let ls = text(&["ls"]);
+    let row = ls.lines().find(|l| l.contains("ctrl_c")).unwrap();
+    assert!(
+        row.contains("interrupted") && !row.contains("up failed"),
+        "{ls}"
+    );
+    assert!(!ls.contains("last up failed"), "{ls}");
+}

@@ -11,6 +11,9 @@ pub enum Outcome {
         code: i32,
         error: Option<String>,
     },
+    /// Exit 130: someone pressed Ctrl-C. Not a fault in the instance, but setup may
+    /// still be unfinished, so it is reported rather than hidden.
+    Interrupted,
     /// Still holding its log lock: an `up` is running right now.
     Running,
     /// No exit line and nobody holding the log: the run was killed outright.
@@ -29,11 +32,16 @@ impl LastUp {
     }
 
     /// `last up 23:31: startup admission: timed out after 602.2s`
+    pub fn interrupted(&self) -> bool {
+        matches!(self.outcome, Outcome::Interrupted)
+    }
+
     pub fn describe(&self) -> String {
         let when = clock(self.at);
         match &self.outcome {
             Outcome::Succeeded => format!("last up {when}: ok"),
             Outcome::Running => format!("last up {when}: still running"),
+            Outcome::Interrupted => format!("last up {when}: interrupted (Ctrl-C)"),
             Outcome::Unfinished => format!("last up {when}: killed before it finished"),
             Outcome::Failed {
                 error: Some(error), ..
@@ -48,6 +56,7 @@ impl LastUp {
         match self.outcome {
             Outcome::Succeeded => Some(0),
             Outcome::Failed { code, .. } => Some(code),
+            Outcome::Interrupted => Some(130),
             _ => None,
         }
     }
@@ -82,6 +91,7 @@ pub fn read(instance_dir: &Path) -> Option<LastUp> {
         .and_then(|code| code.trim().parse::<i32>().ok());
     let outcome = match code {
         Some(0) => Outcome::Succeeded,
+        Some(130) => Outcome::Interrupted,
         Some(code) => Outcome::Failed {
             code,
             error: body

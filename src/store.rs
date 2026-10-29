@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::Cache;
 
@@ -78,11 +79,21 @@ pub fn link_tree(from: &Path, to: &Path) -> Result<Linked> {
         method: LinkMethod::Hardlink,
         files: 0,
     };
-    link_dir(from, to, &mut linked)?;
+    link_dir(from, to, &mut linked, &AtomicU64::new(0))?;
     Ok(linked)
 }
 
-fn link_dir(from: &Path, to: &Path, state: &mut Linked) -> Result<()> {
+/// `link_tree`, publishing the running file count to `progress` for a heartbeat.
+fn link_tree_counting(from: &Path, to: &Path, progress: &AtomicU64) -> Result<Linked> {
+    let mut linked = Linked {
+        method: LinkMethod::Hardlink,
+        files: 0,
+    };
+    link_dir(from, to, &mut linked, progress)?;
+    Ok(linked)
+}
+
+fn link_dir(from: &Path, to: &Path, state: &mut Linked, progress: &AtomicU64) -> Result<()> {
     std::fs::create_dir_all(to).with_context(|| format!("creating {}", to.display()))?;
     for item in std::fs::read_dir(from).with_context(|| format!("reading {}", from.display()))? {
         let item = item?;
@@ -91,13 +102,14 @@ fn link_dir(from: &Path, to: &Path, state: &mut Linked) -> Result<()> {
         let meta = src
             .symlink_metadata()
             .with_context(|| format!("reading {}", src.display()))?;
+        progress.store(state.files, Ordering::Relaxed);
         if meta.is_symlink() {
             state.files += 1;
             let target = std::fs::read_link(&src)?;
             std::os::unix::fs::symlink(target, &dst)
                 .with_context(|| format!("linking {}", dst.display()))?;
         } else if meta.is_dir() {
-            link_dir(&src, &dst, state)?;
+            link_dir(&src, &dst, state, progress)?;
         } else {
             state.files += 1;
             if state.method == LinkMethod::Hardlink {
@@ -178,6 +190,16 @@ pub fn lock_key(store: &Path, hash: &str, shared: bool) -> Result<File> {
     Ok(lock)
 }
 
+/// `GROVE_HEARTBEAT_SECS` exists for the test suite; 15s otherwise.
+fn heartbeat_interval() -> std::time::Duration {
+    let secs = std::env::var("GROVE_HEARTBEAT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|secs| *secs > 0.0)
+        .unwrap_or(15.0);
+    std::time::Duration::from_secs_f64(secs)
+}
+
 /// Check the entry inventory after linking, before the caller replaces its install.
 pub fn link_entry(store: &Path, hash: &str, to: &Path) -> Result<Linked> {
     let count = crate::timing::measure(&format!("cache {hash}: inventory read"), || {
@@ -189,12 +211,24 @@ pub fn link_entry(store: &Path, hash: &str, to: &Path) -> Result<Linked> {
             .parse::<u64>()
             .context("invalid store inventory")
     })?;
+    let progress = AtomicU64::new(0);
     let mut linked = crate::timing::measure(&format!("cache {hash}: tree creation"), || {
         #[cfg(target_os = "macos")]
         if std::env::var_os("GROVE_MACOS_CLONE").as_deref() == Some(std::ffi::OsStr::new("1")) {
             return clone_tree(&entry(store, hash), to);
         }
-        link_tree(&entry(store, hash), to)
+        // 5s typical on the Mac, 197s once at load 53 with no output in between.
+        crate::timing::with_heartbeat(
+            heartbeat_interval(),
+            |elapsed| {
+                eprintln!(
+                    "cache {hash}: still linking, {} of {count} files ({}s)",
+                    progress.load(Ordering::Relaxed),
+                    elapsed.as_secs()
+                )
+            },
+            || link_tree_counting(&entry(store, hash), to, &progress),
+        )
     })?;
     crate::timing::measure(&format!("cache {hash}: inventory validation"), || {
         if linked.method == LinkMethod::Clone {

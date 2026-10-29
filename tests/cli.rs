@@ -3265,6 +3265,41 @@ fn ls_reports_the_store_from_recorded_entry_sizes() {
     assert!(!out.contains("unmeasured until"), "{out}");
 }
 
+/// A link from the store once took 197s at load 53 on the Mac with nothing printed
+/// in between, and an agent reported it as hung.
+#[test]
+fn a_long_link_from_the_store_reports_progress() {
+    let cli = Cli::with_config(&CACHE_CONFIG.replace(
+        "mkdir -p node_modules &&",
+        "mkdir -p node_modules && for i in $(seq 1 3000); do : > node_modules/f$i; done &&",
+    ));
+    with_lockfile(&cli, "lockfile A\n");
+    let a = cli.worktree("first");
+    let b = cli.worktree("second");
+    cli.run(&a, &["up"]).success();
+    let output = Command::cargo_bin("grove")
+        .unwrap()
+        .arg("up")
+        .current_dir(&b)
+        .env("GROVE_STATE_DIR", cli.state.path())
+        .env("GROVE_CACHE_DIR", cli.state.path().join("store"))
+        .env("GROVE_PORT_RANGE", cli.port_range())
+        .env("GROVE_HEARTBEAT_SECS", "0.0002")
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let stderr = String::from_utf8_lossy(&output);
+    assert!(stderr.contains("linked from the store"), "{stderr}");
+    let beat = stderr
+        .lines()
+        .find(|line| line.contains(": still linking, "))
+        .unwrap_or_else(|| panic!("no heartbeat: {stderr}"));
+    assert!(beat.starts_with("cache "), "{beat}");
+    assert!(beat.contains(" of 3001 files ("), "{beat}");
+}
+
 /// The whole point: the second worktree on a lockfile pays nothing for its dependencies.
 /// Names are private per worktree, blocks are shared — the inode says which.
 #[test]

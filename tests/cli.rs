@@ -76,6 +76,16 @@ path = "node_modules"
 key = ["package-lock.json"]
 "#;
 
+const LONG_SETUP_CONFIG: &str = r#"
+version = 1
+
+[[service]]
+name = "web"
+setup = "sleep 60"
+command = "python3 -u -m http.server {{ port.web }}"
+ready = { http = "http://127.0.0.1:{{ port.web }}/", timeout = "30s" }
+"#;
+
 const EXPOSURE_CONFIG: &str = r#"
 version = 1
 
@@ -3528,6 +3538,135 @@ fn prune_removes_store_entries_no_worktree_references() {
         .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
         .collect();
     assert_eq!(left, vec![kept_hash], "{stdout}");
+}
+
+#[test]
+fn prune_removes_only_old_temps_from_dead_non_grove_processes() {
+    use std::process::Stdio;
+
+    let cli = Cli::with_config(LONG_SETUP_CONFIG);
+    let wt = cli.worktree("feat_search");
+    use std::os::unix::process::CommandExt;
+
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("grove"));
+    command
+        .current_dir(&wt)
+        .env("GROVE_STATE_DIR", cli.state.path())
+        .env("GROVE_CACHE_DIR", cli.state.path().join("store"))
+        .env("PATH", cli.client_path())
+        .env("GROVE_PORT_RANGE", cli.port_range())
+        .env_remove("GROVE_MACOS_CLONE")
+        .arg("up")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command.process_group(0);
+    let up = command.spawn().expect("start long-running grove up");
+    let up = ChildReaper(up);
+    let live_pid = up.0.id();
+    let store = cli.state.path().join("store");
+    std::fs::create_dir_all(&store).expect("store");
+    let stale_dead = store.join(format!("x.tmp-{}", dead_pid()));
+    let stale_live = store.join(format!("y.tmp-{live_pid}"));
+    let fresh_dead = store.join(format!("z.tmp-{}", dead_pid()));
+    for path in [&stale_dead, &stale_live, &fresh_dead] {
+        std::fs::create_dir_all(path).expect("temp staging dir");
+        std::fs::write(path.join("payload"), "data").expect("payload");
+    }
+    let stale_file = store.join(format!("x-file.tmp-{}", dead_pid()));
+    std::fs::write(&stale_file, "stray temp bytes").expect("temp file");
+    for path in [&stale_dead, &stale_live] {
+        std::process::Command::new("touch")
+            .args(["-t", "202001010000"])
+            .arg(path)
+            .status()
+            .expect("age temp directory")
+            .success()
+            .then_some(())
+            .expect("touch succeeded");
+    }
+    std::process::Command::new("touch")
+        .args(["-t", "202001010000"])
+        .arg(&stale_file)
+        .status()
+        .expect("age temp file")
+        .success()
+        .then_some(())
+        .expect("touch succeeded");
+
+    let dry = cli
+        .run(&cli.fx.main, &["prune", "--dry-run"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let dry = String::from_utf8_lossy(&dry).into_owned();
+    assert!(
+        dry.contains(
+            &stale_dead
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        ),
+        "{dry}"
+    );
+    assert!(
+        dry.contains(stale_file.file_name().unwrap().to_str().unwrap()),
+        "{dry}"
+    );
+    assert!(
+        !dry.contains(
+            &stale_live
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        ),
+        "{dry}"
+    );
+    assert!(
+        !dry.contains(
+            &fresh_dead
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        ),
+        "{dry}"
+    );
+    assert!(stale_dead.exists() && stale_live.exists() && fresh_dead.exists());
+
+    let real = cli
+        .run(&cli.fx.main, &["prune"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let real = String::from_utf8_lossy(&real).into_owned();
+    assert!(!stale_dead.exists(), "{real}");
+    assert!(!stale_file.exists(), "{real}");
+    assert!(stale_live.exists() && fresh_dead.exists(), "{real}");
+}
+
+struct ChildReaper(std::process::Child);
+
+impl Drop for ChildReaper {
+    fn drop(&mut self) {
+        // The test's setup command is a child of grove; clean up its whole process group.
+        unsafe {
+            libc::kill(-(self.0.id() as i32), libc::SIGKILL);
+        }
+        let _ = self.0.wait();
+    }
+}
+
+fn dead_pid() -> u32 {
+    let mut child = std::process::Command::new("true")
+        .spawn()
+        .expect("spawn true");
+    let pid = child.id();
+    child.wait().expect("wait for true");
+    pid
 }
 
 /// A clean machine gets a report that says so, and an exit code scripts can gate on.

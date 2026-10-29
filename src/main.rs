@@ -659,8 +659,14 @@ fn main() -> Result<()> {
                 .flat_map(|e| e.cache_keys.values().cloned())
                 .collect();
             let store = grove::store::dir()?;
+            let planned_swept = grove::store::unreferenced(&store, &referenced)?;
+            let stale_temp_count = planned_swept
+                .iter()
+                .filter(|name| name.rsplit_once(".tmp-").is_some())
+                .count();
+            let stale_temp_bytes = grove::store::stale_temp_bytes(&store, &planned_swept)?;
             let swept = if dry_run {
-                grove::store::unreferenced(&store, &referenced)?
+                planned_swept.clone()
             } else {
                 grove::store::gc(&store, &referenced)?
             };
@@ -734,13 +740,35 @@ fn main() -> Result<()> {
                 1 => println!("1 database left in place (--purge drops it)"),
                 n => println!("{n} databases left in place (--purge drops them)"),
             }
-            match swept.len() {
+            for name in swept
+                .iter()
+                .filter(|name| name.rsplit_once(".tmp-").is_some())
+            {
+                println!(
+                    "{} {name}",
+                    if dry_run { "would remove" } else { "removed" }
+                );
+            }
+            let store_entries = swept.len().saturating_sub(stale_temp_count);
+            match store_entries {
                 0 => {}
                 n => println!(
                     "{} {n} store {} no worktree references",
                     if dry_run { "would remove" } else { "removed" },
                     if n == 1 { "entry" } else { "entries" }
                 ),
+            }
+            if stale_temp_count > 0 {
+                println!(
+                    "{} {stale_temp_count} stale store temp {} ({})",
+                    if dry_run { "would remove" } else { "removed" },
+                    if stale_temp_count == 1 {
+                        "path"
+                    } else {
+                        "paths"
+                    },
+                    human_size(stale_temp_bytes)
+                );
             }
             if dry_run {
                 println!("{} orphaned. Nothing reclaimed (--dry-run).", orphans.len());

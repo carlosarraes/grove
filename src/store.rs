@@ -9,6 +9,7 @@ use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 use crate::config::Cache;
 
@@ -343,7 +344,18 @@ pub fn size(store: &Path) -> Result<Size> {
 /// Forget one entry. Worktrees that linked from it keep their blocks; only the store's
 /// names go.
 pub fn evict(store: &Path, hash: &str) -> Result<()> {
-    match std::fs::remove_dir_all(store.join(hash)) {
+    let path = store.join(hash);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading store entry {hash}")),
+    };
+    let removed = if metadata.is_dir() {
+        std::fs::remove_dir_all(&path)
+    } else {
+        std::fs::remove_file(&path)
+    };
+    match removed {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e).with_context(|| format!("removing store entry {hash}")),
@@ -374,12 +386,85 @@ pub fn unreferenced(store: &Path, referenced: &HashSet<String>) -> Result<Vec<St
         .map(|item| Ok(item?.file_name().to_string_lossy().into_owned()))
         .collect::<Result<_>>()?;
     doomed.retain(|name| {
-        name.len() == 16
+        (name.len() == 16
             && name.bytes().all(|b| b.is_ascii_hexdigit())
-            && !referenced.contains(name)
+            && !referenced.contains(name))
+            || stale_temp(store, name)
     });
     doomed.sort();
     Ok(doomed)
+}
+
+const STALE_TEMP_AGE: Duration = Duration::from_secs(60 * 60);
+
+fn stale_temp(store: &Path, name: &str) -> bool {
+    let Some((_, pid)) = name.rsplit_once(".tmp-") else {
+        return false;
+    };
+    if pid.is_empty() || !pid.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let Ok(pid) = pid.parse::<u32>() else {
+        return false;
+    };
+    if pid == 0 || is_grove_process(pid) {
+        return false;
+    }
+    let path = store.join(name);
+    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+        return false;
+    };
+    if !metadata.is_dir() && !metadata.is_file() {
+        return false;
+    }
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age > STALE_TEMP_AGE)
+}
+
+/// Keep entries owned by a live Grove process even when its PID is old enough to have
+/// been reused. If `ps` cannot establish what a still-live PID runs, preserve the temp.
+fn is_grove_process(pid: u32) -> bool {
+    let output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output();
+    if let Ok(output) = output
+        && output.status.success()
+        && let Some(name) = String::from_utf8_lossy(&output.stdout).lines().next()
+    {
+        let name = Path::new(name.trim())
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(name.trim());
+        return name == "grove";
+    }
+    // `kill(pid, 0)` distinguishes a dead PID from a process that `ps` could not inspect.
+    // SAFETY: signal zero only checks whether the process exists and sends no signal.
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// Bytes held by stale staging paths in a GC candidate list.
+pub fn stale_temp_bytes(store: &Path, names: &[String]) -> Result<u64> {
+    names.iter().try_fold(0_u64, |total, name| {
+        if name.rsplit_once(".tmp-").is_none() {
+            return Ok(total);
+        }
+        Ok(total + path_bytes(&store.join(name))?)
+    })
+}
+
+fn path_bytes(path: &Path) -> Result<u64> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.is_dir() {
+        std::fs::read_dir(path)?.try_fold(0_u64, |total, entry| {
+            Ok(total + path_bytes(&entry?.path())?)
+        })
+    } else {
+        Ok(metadata.len())
+    }
 }
 
 /// 64-bit FNV-1a, hand-rolled like the 32-bit one in `resolve` and for the same reason:

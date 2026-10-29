@@ -902,17 +902,28 @@ impl Instance {
             crate::timing::measure(&format!("{}: readiness", service.name), || {
                 supervise::wait_ready(&handle, &url, timeout).map_err(|why| {
                     let tail = tail(&log, 30).unwrap_or_default();
+                    // A worktree deleted mid-up makes the service fail on whatever it
+                    // reads next, so its own output points the reader the wrong way.
+                    let gone = if self.resolved.worktree.exists() {
+                        String::new()
+                    } else {
+                        format!(
+                            "\nthe worktree {} no longer exists: something removed it while \
+                             grove up was running, so the output below is a symptom",
+                            self.resolved.worktree.display()
+                        )
+                    };
                     match why {
                         // Spelled out rather than wrapped: "never became ready" reads as
                         // slow, and a reader waits. This one died, and the tail says why.
                         supervise::NotReady::Exited { url } => anyhow::anyhow!(
-                            "{} exited before answering on {url}\n\
+                            "{} exited before answering on {url}{gone}\n\
                          full output in {}\n{tail}",
                             service.name,
                             log.display()
                         ),
                         timed_out => anyhow::anyhow!(
-                            "{} never became ready: {timed_out}\nTCP check: {} (observed after timeout)\nfull output in {}\n{tail}",
+                            "{} never became ready: {timed_out}{gone}\nTCP check: {} (observed after timeout)\nfull output in {}\n{tail}",
                             service.name,
                             supervise::tcp_observation(&url),
                             log.display()

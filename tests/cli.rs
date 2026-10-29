@@ -4504,6 +4504,33 @@ fn readiness_timeout_names_the_log_and_observes_tcp_acceptance() {
     }
 }
 
+/// mact-run's `end` once removed a worktree while its `grove up` was still waiting on
+/// the backend; the backend then died on a missing setting and grove reported only that.
+#[test]
+fn readiness_failure_says_when_the_worktree_was_removed_during_up() {
+    let config = r#"version = 1
+[ports]
+names = ['web']
+[[service]]
+name = 'web'
+command = '''sleep 1; rm -rf "$PWD"; exit 1'''
+ready = {http = 'http://localhost:{{ port.web }}/', timeout = '10s'}
+"#;
+    let cli = Cli::with_config(config);
+    let wt = cli.worktree("vanishing");
+    let output = cli.run(&wt, &["up"]).failure().get_output().stderr.clone();
+    let error = String::from_utf8_lossy(&output);
+    assert!(!wt.exists());
+    assert!(
+        error.contains("web exited before answering on http://localhost:")
+            && error.contains(&format!(
+                "the worktree {} no longer exists: something removed it while grove up was running",
+                wt.display()
+            )),
+        "{error}"
+    );
+}
+
 fn saved_up_log(output: &std::process::Output) -> std::path::PathBuf {
     let stderr = String::from_utf8_lossy(&output.stderr);
     std::path::PathBuf::from(

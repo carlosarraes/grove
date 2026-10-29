@@ -6078,3 +6078,88 @@ fn mongo_readiness_client_error_stops_before_the_seed() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("PyMongo"));
     assert!(!wt.join("seed-ran").exists());
 }
+
+/// A setup-only instance that never got past startup admission used to read as a plain
+/// `stopped` everywhere, so an agent took the half-made .venv for a finished one.
+const SETUP_ONLY_CONFIG: &str = r#"
+version = 1
+[admission]
+timeout = "1s"
+[[service]]
+name = "venv"
+setup = "touch synced"
+setup_inputs = ["uv.lock"]
+"#;
+
+#[test]
+fn status_and_ls_say_when_up_failed_before_setup_ever_completed() {
+    let cli = Cli::with_config(SETUP_ONLY_CONFIG);
+    let wt = cli.worktree("admission_failed");
+    std::fs::write(wt.join("uv.lock"), "lock").unwrap();
+    let up = |load: &str| {
+        let mut command = Command::cargo_bin("grove").expect("binary");
+        command
+            .current_dir(&wt)
+            .env("GROVE_STATE_DIR", cli.state.path())
+            .env("GROVE_CACHE_DIR", cli.state.path().join("store"))
+            .env("GROVE_PORT_RANGE", cli.port_range())
+            .env("GROVE_LOAD", load)
+            .env("GROVE_CORES", "4")
+            .args(["up", "--heavy"])
+            .assert()
+    };
+    let text = |args: &[&str]| -> String {
+        String::from_utf8_lossy(&cli.run(&wt, args).success().get_output().stdout).into_owned()
+    };
+
+    up("100").failure();
+    assert!(!wt.join("synced").exists());
+    let status = text(&["status"]);
+    assert!(
+        status.contains("setup: venv never completed (last up ")
+            && status.contains(": startup admission: timed out after ")
+            && status.contains("up log:   "),
+        "{status}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&text(&["status", "--json"])).unwrap();
+    assert_eq!(
+        json["setup_incomplete"],
+        serde_json::json!(["venv"]),
+        "{json}"
+    );
+    assert_eq!(json["last_up"]["failed"], true, "{json}");
+    assert_eq!(json["last_up"]["exit_code"], 1, "{json}");
+    let ls = text(&["ls"]);
+    let row = ls.lines().find(|l| l.contains("admission_failed")).unwrap();
+    assert!(row.contains("up failed"), "{ls}");
+    assert!(
+        ls.contains("1 whose last up failed. `grove status NAME` says why."),
+        "{ls}"
+    );
+
+    up("0").success();
+    assert!(wt.join("synced").exists());
+    let status = text(&["status"]);
+    assert!(
+        !status.contains("never completed") && !status.contains("up log:"),
+        "{status}"
+    );
+    let ls = text(&["ls"]);
+    let row = ls.lines().find(|l| l.contains("admission_failed")).unwrap();
+    assert!(
+        row.contains("stopped") && !ls.contains("last up failed"),
+        "{ls}"
+    );
+}
+
+#[test]
+fn status_names_a_setup_that_has_never_run() {
+    let cli = Cli::with_config(SETUP_ONLY_CONFIG);
+    let wt = cli.worktree("never_up");
+    let status = String::from_utf8_lossy(&cli.run(&wt, &["status"]).success().get_output().stdout)
+        .into_owned();
+    assert!(
+        status.contains("setup: venv never completed (no grove up has run here); run grove up"),
+        "{status}"
+    );
+}

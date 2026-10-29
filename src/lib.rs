@@ -4,6 +4,7 @@ pub mod exposure;
 pub mod footprint;
 pub mod health;
 pub mod instance;
+pub mod last_up;
 pub mod llm;
 pub mod load;
 pub mod mongo;

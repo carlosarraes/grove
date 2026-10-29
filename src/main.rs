@@ -316,7 +316,7 @@ fn main() -> Result<()> {
             for outcome in instance.up(fresh, no_cache)? {
                 eprintln!("{outcome}");
             }
-            print_summary(&instance, None);
+            print_summary(&instance, None, &[]);
             Ok(())
         }
         Some(Command::Down {
@@ -360,7 +360,7 @@ fn main() -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&status_json(&instance))?);
             } else {
-                print_summary(&instance, elsewhere(&instance, &cwd));
+                print_summary(&instance, elsewhere(&instance, &cwd), &attention(&instance));
                 print_services(&instance);
                 warn_if_stale(&instance);
             }
@@ -399,6 +399,7 @@ fn main() -> Result<()> {
                 println!("no instances");
             }
             let orphans = entries.iter().filter(|e| !e.worktree.exists()).count();
+            let mut failed = 0;
             for entry in &entries {
                 // Ask the processes, not the record. A recorded pid says only that a
                 // service was started once; reading that as "up" turns a stopped
@@ -412,6 +413,9 @@ fn main() -> Result<()> {
                     format!("orphaned ({live})")
                 } else if live > 0 {
                     format!("running ({live})")
+                } else if last_up_failed(entry) {
+                    failed += 1;
+                    "up failed".to_string()
                 } else {
                     "stopped".to_string()
                 };
@@ -446,6 +450,9 @@ fn main() -> Result<()> {
                 println!(
                     "\n{orphans} orphaned — their worktree is gone. `grove prune` stops them."
                 );
+            }
+            if failed > 0 {
+                println!("\n{failed} whose last up failed. `grove status NAME` says why.");
             }
 
             // The facts unconditionally — this is where someone deciding what to stop is
@@ -561,7 +568,7 @@ fn main() -> Result<()> {
             // `up` only starts what is not already running, so stopping first is what
             // makes this a restart rather than a no-op.
             instance.up(false, false)?;
-            print_summary(&instance, None);
+            print_summary(&instance, None, &[]);
             Ok(())
         }
         Some(Command::Prune { purge, dry_run }) => {
@@ -989,6 +996,15 @@ fn disk_footer(entries: &[Entry]) -> Option<String> {
 
 /// The machine-wide counterpart to `status --json`: everything an agent needs to decide
 /// whether the box is the problem, without parsing a table or shelling out to `uptime`.
+/// From the run log alone: `ls` reads the registry and has no config to check setup with.
+fn last_up_failed(entry: &Entry) -> bool {
+    entry
+        .instance_dir
+        .as_deref()
+        .and_then(grove::last_up::read)
+        .is_some_and(|last| last.failed())
+}
+
 fn ls_json(entries: &[Entry], now: u64, machine: &Machine) -> serde_json::Value {
     let instances: Vec<serde_json::Value> = entries
         .iter()
@@ -1004,6 +1020,7 @@ fn ls_json(entries: &[Entry], now: u64, machine: &Machine) -> serde_json::Value 
                 "ports": e.ports,
                 "database": e.db_name,
                 "disk_bytes": disk_of(e),
+                "last_up_failed": last_up_failed(e),
             })
         })
         .collect();
@@ -1093,7 +1110,38 @@ fn status_json(instance: &Instance) -> serde_json::Value {
         "ports": instance.entry.ports,
         "database": instance.db_name(),
         "services": services,
+        "setup_incomplete": instance.setup_incomplete(),
+        "last_up": instance.last_up().map(|last| serde_json::json!({
+            "failed": last.failed(),
+            "exit_code": last.exit_code(),
+            "error": last.error(),
+            "log": last.log,
+        })),
     })
+}
+
+/// Why an instance that looks merely stopped is not usable: a setup that never finished,
+/// or an `up` that failed before it could start anything. Silent when all is well.
+fn attention(instance: &Instance) -> Vec<String> {
+    let incomplete = instance.setup_incomplete();
+    let last = instance.last_up();
+    let mut notes = Vec::new();
+    if !incomplete.is_empty() {
+        let why = match &last {
+            Some(last) => last.describe(),
+            None => "no grove up has run here".to_string(),
+        };
+        notes.push(format!(
+            "setup: {} never completed ({why}); run grove up",
+            incomplete.join(", ")
+        ));
+    } else if let Some(last) = last.as_ref().filter(|last| last.failed()) {
+        notes.push(format!("{} (failed)", last.describe()));
+    }
+    if let Some(last) = last.filter(|_| !notes.is_empty()) {
+        notes.push(format!("up log:   {}", last.log.display()));
+    }
+    notes
 }
 
 /// The only thing an agent should need to read after `up`.
@@ -1106,8 +1154,11 @@ fn elsewhere<'a>(instance: &'a Instance, cwd: &Path) -> Option<&'a Path> {
     (!canon(cwd).starts_with(canon(worktree))).then_some(worktree.as_path())
 }
 
-fn print_summary(instance: &Instance, cd: Option<&Path>) {
+fn print_summary(instance: &Instance, cd: Option<&Path>, notes: &[String]) {
     println!("instance  {}", instance.resolved.slug);
+    for note in notes {
+        println!("{note}");
+    }
     for (name, port) in &instance.entry.ports {
         println!(
             "{name:<10}http://{}:{port}",

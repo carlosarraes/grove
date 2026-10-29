@@ -421,6 +421,32 @@ impl Instance {
         self.instance_dir().join(format!("{service}.log"))
     }
 
+    /// What the newest `grove up` here ended with, from its saved run log.
+    pub fn last_up(&self) -> Option<crate::last_up::LastUp> {
+        crate::last_up::read(&self.instance_dir())
+    }
+
+    /// Services whose setup has never finished in this worktree. A local install counts
+    /// once its receipt says complete; a cached one once its marker exists. A marker that
+    /// predates receipts counts as complete — it was only ever written on success.
+    pub fn setup_incomplete(&self) -> Vec<String> {
+        self.config
+            .services
+            .iter()
+            .filter(|s| s.setup.is_some())
+            .filter(|s| {
+                let marker = self.instance_dir().join(format!(".setup-{}", s.name));
+                match std::fs::read(&marker) {
+                    Err(_) => true,
+                    Ok(_) if s.cache.is_some() => false,
+                    Ok(body) => serde_json::from_slice::<SetupReceipt>(&body)
+                        .is_ok_and(|receipt| !receipt.complete),
+                }
+            })
+            .map(|s| s.name.clone())
+            .collect()
+    }
+
     pub fn db_name(&self) -> Option<String> {
         self.entry.db_name.clone()
     }

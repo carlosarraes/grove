@@ -6322,3 +6322,35 @@ fn status_during_a_running_up_says_wait_not_run_grove_up() {
     let row = ls.lines().find(|l| l.contains("slow_up")).unwrap();
     assert!(row.contains("starting"), "{ls}");
 }
+
+/// `grove ls | head` closes the pipe before grove is done printing. That is the reader
+/// saying it has enough, not an error: no panic text, no failure code.
+#[test]
+fn a_reader_that_closes_early_ends_reporting_commands_quietly() {
+    use std::os::unix::process::ExitStatusExt;
+    let cli = Cli::with_config(SETUP_ONLY_CONFIG);
+    let wt = cli.worktree("closed_pipe");
+    for args in [&["ls"][..], &["status"], &["--help"]] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("grove"))
+            .args(args)
+            .current_dir(&wt)
+            .env("GROVE_STATE_DIR", cli.state.path())
+            .env("GROVE_PORT_RANGE", cli.port_range())
+            .stdout(writer)
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("panicked") && !stderr.contains("Broken pipe"),
+            "{args:?}: {stderr}"
+        );
+        let status = output.status;
+        assert!(
+            status.success() || status.signal() == Some(libc::SIGPIPE),
+            "{args:?}: {status:?} {stderr}"
+        );
+    }
+}

@@ -237,6 +237,17 @@ enum SkillAction {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Rust ignores SIGPIPE, so a reader that closes early (`grove ls | head`) turns the
+    // next print into a panic. Every command but `up` is a plain reporter: let a closed
+    // stdout end it quietly, as it would `cat`. `up` keeps ignoring it on purpose — its
+    // wrapper must outlive a closed terminal to finish the run and its log.
+    if !matches!(cli.command, Some(Command::Up { .. })) {
+        // SAFETY: called before any thread starts; only resets a signal disposition.
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
+    }
+
     if cli.llm {
         print!("{}", llm::reference());
         return Ok(());

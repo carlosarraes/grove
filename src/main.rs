@@ -413,10 +413,12 @@ fn main() -> Result<()> {
                     format!("orphaned ({live})")
                 } else if live > 0 {
                     format!("running ({live})")
-                } else if let Some(last) =
-                    last_up(entry).filter(|last| last.failed() || last.interrupted())
+                } else if let Some(last) = last_up(entry)
+                    .filter(|last| last.failed() || last.interrupted() || last.running())
                 {
-                    if last.interrupted() {
+                    if last.running() {
+                        "starting".to_string()
+                    } else if last.interrupted() {
                         "interrupted".to_string()
                     } else {
                         failed += 1;
@@ -1024,6 +1026,7 @@ fn ls_json(entries: &[Entry], now: u64, machine: &Machine) -> serde_json::Value 
                 "disk_bytes": disk_of(e),
                 "last_up_failed": last_up(e).is_some_and(|last| last.failed()),
                 "last_up_interrupted": last_up(e).is_some_and(|last| last.interrupted()),
+                "up_running": last_up(e).is_some_and(|last| last.running()),
             })
         })
         .collect();
@@ -1049,6 +1052,7 @@ fn print_services(instance: &Instance) {
     if services.is_empty() {
         return;
     }
+    let starting = instance.last_up().is_some_and(|last| last.running());
     let width = services
         .iter()
         .map(|s| s.name.len())
@@ -1064,6 +1068,7 @@ fn print_services(instance: &Instance) {
         let state = match (service.running, service.pid) {
             (true, Some(pid)) => format!("running  pid {pid}"),
             (true, None) => "running".to_string(),
+            (false, _) if starting => "not started yet (grove up is running)".to_string(),
             (false, _) => "stopped".to_string(),
         };
         let name = format!("  {:<width$}", service.name, width = width);
@@ -1117,6 +1122,8 @@ fn status_json(instance: &Instance) -> serde_json::Value {
         "last_up": instance.last_up().map(|last| serde_json::json!({
             "failed": last.failed(),
             "interrupted": last.interrupted(),
+            "running": last.running(),
+            "phase": last.phase,
             "exit_code": last.exit_code(),
             "error": last.error(),
             "log": last.log,
@@ -1130,7 +1137,17 @@ fn attention(instance: &Instance) -> Vec<String> {
     let incomplete = instance.setup_incomplete();
     let last = instance.last_up();
     let mut notes = Vec::new();
-    if !incomplete.is_empty() {
+    // Before the setup check: mid-run, setup is incomplete by definition, and telling
+    // someone to run `grove up` while one is working sends them to start a second.
+    if let Some(running) = last.as_ref().filter(|last| last.running()) {
+        notes.push(format!(
+            "up:       {}; wait for it, do not start another",
+            running.describe()
+        ));
+        if let Some(phase) = &running.phase {
+            notes.push(format!("now:      {phase}"));
+        }
+    } else if !incomplete.is_empty() {
         let why = match &last {
             Some(last) => last.describe(),
             None => "no grove up has run here".to_string(),

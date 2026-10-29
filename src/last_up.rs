@@ -24,11 +24,21 @@ pub struct LastUp {
     pub log: PathBuf,
     pub at: SystemTime,
     pub outcome: Outcome,
+    /// When the run began, from the log's name.
+    pub started: Option<SystemTime>,
+    /// The wrapper's pid, from the log's name.
+    pub pid: Option<u32>,
+    /// The newest progress line, so a slow step is not mistaken for a hung one.
+    pub phase: Option<String>,
 }
 
 impl LastUp {
     pub fn failed(&self) -> bool {
         matches!(self.outcome, Outcome::Failed { .. } | Outcome::Unfinished)
+    }
+
+    pub fn running(&self) -> bool {
+        matches!(self.outcome, Outcome::Running)
     }
 
     /// `last up 23:31: startup admission: timed out after 602.2s`
@@ -40,7 +50,13 @@ impl LastUp {
         let when = clock(self.at);
         match &self.outcome {
             Outcome::Succeeded => format!("last up {when}: ok"),
-            Outcome::Running => format!("last up {when}: still running"),
+            Outcome::Running => {
+                let since = self.started.map(clock).unwrap_or(when);
+                match self.pid {
+                    Some(pid) => format!("grove up still running here (since {since}, pid {pid})"),
+                    None => format!("grove up still running here (since {since})"),
+                }
+            }
             Outcome::Interrupted => format!("last up {when}: interrupted (Ctrl-C)"),
             Outcome::Unfinished => format!("last up {when}: killed before it finished"),
             Outcome::Failed {
@@ -80,8 +96,11 @@ pub fn read(instance_dir: &Path) -> Option<LastUp> {
             let key = (timestamp.parse::<u128>().ok()?, pid.parse::<u32>().ok()?);
             Some((key, entry.path()))
         })
-        .max_by_key(|(key, _)| *key)?
-        .1;
+        .max_by_key(|(key, _)| *key)?;
+    let ((nanos, pid), newest) = newest;
+    let started = u64::try_from(nanos)
+        .ok()
+        .map(|n| SystemTime::UNIX_EPOCH + std::time::Duration::from_nanos(n));
     let body = std::fs::read_to_string(&newest).ok()?;
     let at = std::fs::metadata(&newest).and_then(|m| m.modified()).ok()?;
     let code = body
@@ -103,10 +122,19 @@ pub fn read(instance_dir: &Path) -> Option<LastUp> {
         None if held(&newest) => Outcome::Running,
         None => Outcome::Unfinished,
     };
+    let phase = body
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with("timing: "))
+        .map(str::to_string);
     Some(LastUp {
         log: newest,
         at,
         outcome,
+        started,
+        pid: Some(pid),
+        phase,
     })
 }
 

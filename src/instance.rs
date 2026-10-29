@@ -706,16 +706,25 @@ impl Instance {
                 .with_context(|| format!("opening {}", log.display()))?;
             let errors = sink.try_clone().context("duplicating the log handle")?;
 
+            eprintln!("seed {}: running (log: {})", seed.name, log.display());
             crate::timing::measure(&format!("seed {}", seed.name), || {
-                let status = std::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(&command)
-                    .current_dir(&cwd)
-                    .envs(&environment)
-                    .stdout(std::process::Stdio::from(sink))
-                    .stderr(std::process::Stdio::from(errors))
-                    .status()
-                    .with_context(|| format!("running seed {}: {command}", seed.name))?;
+                let status = crate::timing::with_heartbeat(
+                    std::time::Duration::from_secs(15),
+                    |elapsed| {
+                        eprintln!("seed {}: still running ({}s)", seed.name, elapsed.as_secs())
+                    },
+                    || {
+                        std::process::Command::new("sh")
+                            .arg("-c")
+                            .arg(&command)
+                            .current_dir(&cwd)
+                            .envs(&environment)
+                            .stdout(std::process::Stdio::from(sink))
+                            .stderr(std::process::Stdio::from(errors))
+                            .status()
+                    },
+                )
+                .with_context(|| format!("running seed {}: {command}", seed.name))?;
 
                 if !status.success() {
                     bail!(
@@ -821,8 +830,18 @@ impl Instance {
         // `up` never reruns setup, so without it those would never get a figure.
         let declares_setup = self.config.services.iter().any(|s| s.setup.is_some());
         if installed || (declares_setup && self.entry.disk_bytes.is_none()) {
+            eprintln!("measuring dependency footprint");
             self.entry.disk_bytes = crate::timing::measure("dependency footprint", || {
-                Ok(crate::footprint::measure(&self.resolved.worktree))
+                Ok(crate::timing::with_heartbeat(
+                    std::time::Duration::from_secs(15),
+                    |elapsed| {
+                        eprintln!(
+                            "still measuring dependency footprint ({}s)",
+                            elapsed.as_secs()
+                        )
+                    },
+                    || crate::footprint::measure(&self.resolved.worktree),
+                ))
             })?;
             self.registry.record(&self.entry)?;
         }

@@ -6274,3 +6274,51 @@ fn an_up_stopped_with_ctrl_c_reads_as_interrupted_not_failed() {
     );
     assert!(!ls.contains("last up failed"), "{ls}");
 }
+
+/// A slow `up` is not a hung one. While it works, `status` must say so and what it is
+/// doing, never call its setup unfinished and send someone to start a second `up`.
+#[test]
+fn status_during_a_running_up_says_wait_not_run_grove_up() {
+    let config = SETUP_ONLY_CONFIG.replace("touch synced", "touch started; sleep 30");
+    let cli = Cli::with_config(&config);
+    let wt = cli.worktree("slow_up");
+    std::fs::write(wt.join("uv.lock"), "lock").unwrap();
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("grove"))
+        .arg("up")
+        .current_dir(&wt)
+        .env("GROVE_STATE_DIR", cli.state.path())
+        .env("GROVE_PORT_RANGE", cli.port_range())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !wt.join("started").exists() {
+        assert!(std::time::Instant::now() < deadline, "setup did not start");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let text = |args: &[&str]| -> String {
+        String::from_utf8_lossy(&cli.run(&wt, args).success().get_output().stdout).into_owned()
+    };
+    let status = text(&["status"]);
+    let json: serde_json::Value = serde_json::from_str(&text(&["status", "--json"])).unwrap();
+    let ls = text(&["ls"]);
+    // SAFETY: child.id() is the live process this test owns.
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    child.wait().unwrap();
+
+    assert!(
+        status.contains("up:       grove up still running here (since ")
+            && status.contains(&format!("pid {})", child.id()))
+            && status.contains("wait for it, do not start another")
+            && status.contains("now:      venv: ")
+            && status.contains("up log:   ")
+            && !status.contains("run grove up")
+            && !status.contains("never completed"),
+        "{status}"
+    );
+    assert_eq!(json["last_up"]["running"], true, "{json}");
+    assert_eq!(json["last_up"]["failed"], false, "{json}");
+    let row = ls.lines().find(|l| l.contains("slow_up")).unwrap();
+    assert!(row.contains("starting"), "{ls}");
+}

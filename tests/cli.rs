@@ -6354,3 +6354,63 @@ fn a_reader_that_closes_early_ends_reporting_commands_quietly() {
         );
     }
 }
+
+/// `down` while this instance's `up` is still seeding: the up must be gone before down
+/// says stopped, and nothing it would have started may come up afterwards.
+#[test]
+fn down_stops_an_up_that_is_still_running_before_tearing_down() {
+    let config = SEEDED_CONFIG.replace(
+        "echo $GROVE_SLUG >> seeded.log",
+        "touch seeding; sleep 6; echo $GROVE_SLUG >> seeded.log",
+    );
+    let cli = Cli::with_config(&config);
+    let wt = cli.worktree("down_mid_up");
+    let mut up = std::process::Command::new(assert_cmd::cargo::cargo_bin("grove"))
+        .arg("up")
+        .current_dir(&wt)
+        .env("GROVE_STATE_DIR", cli.state.path())
+        .env("GROVE_CACHE_DIR", cli.state.path().join("store"))
+        .env("PATH", cli.client_path())
+        .env("GROVE_PORT_RANGE", cli.port_range())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !wt.join("seeding").exists() {
+        assert!(std::time::Instant::now() < deadline, "seed did not start");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let down = cli.run(&wt, &["down"]).success();
+    let out = String::from_utf8_lossy(&down.get_output().stdout).into_owned();
+    // down has returned: the up must already be over, not merely signalled.
+    let exited = up.try_wait().unwrap();
+    if exited.is_none() {
+        let _ = up.kill();
+        let _ = up.wait();
+    }
+    assert!(exited.is_some(), "grove up still running after down: {out}");
+    assert!(
+        out.contains(&format!(
+            "stopped the running grove up (pid {}) first",
+            up.id()
+        )) && out.contains("stopped down_mid_up"),
+        "{out}"
+    );
+
+    // Past the point where the seed would have finished and the service started.
+    std::thread::sleep(std::time::Duration::from_secs(8));
+    assert!(!wt.join("seeded.log").exists(), "the seed kept running");
+    let status = String::from_utf8_lossy(&cli.run(&wt, &["status"]).success().get_output().stdout)
+        .into_owned();
+    assert!(
+        !status.contains("running  pid") && !status.contains("still running here"),
+        "{status}"
+    );
+
+    // Idempotent: again with nothing running is a plain down.
+    let again = cli.run(&wt, &["down"]).success();
+    let again = String::from_utf8_lossy(&again.get_output().stdout).into_owned();
+    assert!(!again.contains("grove up (pid"), "{again}");
+}

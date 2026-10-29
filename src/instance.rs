@@ -339,6 +339,82 @@ pub fn lock_up(cwd: &Path) -> Result<std::fs::File> {
     Ok(lock)
 }
 
+/// Stop a `grove up` still running for the instance at `cwd`, and wait until it is gone.
+/// Returns its pid when there was one. `down` calls this before tearing down: an up that
+/// outlives `down` would start services after `down` reported them stopped.
+///
+/// Delivers SIGINT to the up and every descendant, exactly what Ctrl-C at its terminal
+/// does, so the run log reads it as interrupted. Escalates to SIGKILL after 20s; errors
+/// rather than returning while the up still holds its log. Safe to repeat: with no up
+/// running it does nothing.
+pub fn stop_running_up(cwd: &Path) -> Result<Option<u32>> {
+    let resolved = resolve::resolve(cwd)?;
+    let directory = state_dir()?.join(resolved.state_key()).join(&resolved.slug);
+    let running = |dir: &Path| crate::last_up::read(dir).filter(|last| last.running());
+    let Some(pid) = running(&directory).and_then(|last| last.pid) else {
+        return Ok(None);
+    };
+    let wait = |limit: std::time::Duration| {
+        let deadline = std::time::Instant::now() + limit;
+        while std::time::Instant::now() < deadline {
+            if running(&directory).is_none() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        running(&directory).is_none()
+    };
+    for (signal, limit) in [(libc::SIGINT, 20), (libc::SIGKILL, 5)] {
+        // The tree first, then the up: once the up exits its children are reparented
+        // and can no longer be found from its pid.
+        for target in descendants(pid).into_iter().rev().chain([pid]) {
+            // SAFETY: plain kill(2); a pid that already exited just returns ESRCH.
+            unsafe {
+                libc::kill(target as libc::pid_t, signal);
+            }
+        }
+        if wait(std::time::Duration::from_secs(limit)) {
+            return Ok(Some(pid));
+        }
+    }
+    bail!(
+        "grove up (pid {pid}) for {} is still running after SIGINT and SIGKILL; \
+         nothing was torn down. Check `ps -p {pid}` and run grove down again",
+        resolved.slug
+    )
+}
+
+/// Every process below `root`, parents before children, from one `ps` snapshot.
+fn descendants(root: u32) -> Vec<u32> {
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-A", "-o", "pid=", "-o", "ppid="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let pairs: Vec<(u32, u32)> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
+        })
+        .collect();
+    let mut found = vec![root];
+    let mut index = 0;
+    while index < found.len() {
+        let parent = found[index];
+        found.extend(
+            pairs
+                .iter()
+                .filter(|(_, ppid)| *ppid == parent)
+                .map(|(pid, _)| *pid),
+        );
+        index += 1;
+    }
+    found.remove(0);
+    found
+}
+
 /// Where grove keeps the registry and per-service logs. `GROVE_STATE_DIR` overrides
 /// it, which is what lets the test suite run instances without touching real state.
 pub fn state_dir() -> Result<PathBuf> {

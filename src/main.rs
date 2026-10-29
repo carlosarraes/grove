@@ -349,7 +349,15 @@ fn main() -> Result<()> {
                 return sweep(&instance.resolved.worktree, idle.as_deref(), dry_run);
             }
 
-            let mut instance = Instance::open(&target(name.as_deref(), &cwd)?)?;
+            let worktree = target(name.as_deref(), &cwd)?;
+            // An up still working here would start services after this reports them
+            // stopped. Stop it first, then hold its lock so none starts mid-teardown.
+            let stopped_up = grove::instance::stop_running_up(&worktree)?;
+            let _up_lock = grove::instance::lock_up(&worktree)?;
+            if let Some(pid) = stopped_up {
+                println!("stopped the running grove up (pid {pid}) first");
+            }
+            let mut instance = Instance::open(&worktree)?;
             instance.down()?;
             if purge {
                 // Report a failed drop without failing `down` — the services really did

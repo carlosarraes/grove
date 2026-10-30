@@ -835,7 +835,18 @@ impl Instance {
                 let status = crate::timing::with_heartbeat(
                     std::time::Duration::from_secs(15),
                     |elapsed| {
-                        eprintln!("seed {}: still running ({}s)", seed.name, elapsed.as_secs())
+                        let log_status = std::fs::metadata(&log).ok().and_then(|metadata| {
+                            let modified = metadata.modified().ok()?;
+                            let since_last_write = std::time::SystemTime::now()
+                                .duration_since(modified)
+                                .unwrap_or_default();
+                            Some((metadata.len(), since_last_write))
+                        });
+                        eprintln!(
+                            "seed {}: {}",
+                            seed.name,
+                            format_seed_heartbeat(elapsed, log_status)
+                        )
                     },
                     || {
                         std::process::Command::new("sh")
@@ -1696,8 +1707,38 @@ fn setup_identity(service: &crate::config::Service, setup: &str, cwd: &Path) -> 
     Ok(format!("setup-inputs-v1:{:016x}", hash.finish()))
 }
 
-// Keep valid existing names unchanged. Hash the full rendered name, including the slug.
+fn format_seed_heartbeat(
+    elapsed: std::time::Duration,
+    log: Option<(u64, std::time::Duration)>,
+) -> String {
+    let base = format!("still running ({}s", elapsed.as_secs());
+    match log {
+        Some((bytes, since_last_write)) => {
+            let size = crate::footprint::human_size(bytes);
+            let size = [
+                ("B", " B"),
+                ("K", " KB"),
+                ("M", " MB"),
+                ("G", " GB"),
+                ("T", " TB"),
+            ]
+            .into_iter()
+            .find_map(|(short, long)| {
+                size.strip_suffix(short)
+                    .map(|value| format!("{value}{long}"))
+            })
+            .unwrap_or(size);
+            format!(
+                "{base}; log {size}, last write {}s ago)",
+                since_last_write.as_secs()
+            )
+        }
+        None => format!("{base})"),
+    }
+}
+
 fn bounded_database_name(name: &str) -> String {
+    // Keep valid existing names unchanged. Hash the full rendered name, including the slug.
     const LIMIT: usize = 63;
     if name.len() <= LIMIT {
         return name.to_owned();
@@ -1748,6 +1789,50 @@ mod seed_marker_tests {
             decision,
             SeedDecision::Run { why: Some(why) } if why == "resource mongo was recreated"
         ));
+    }
+
+    #[test]
+    fn seed_heartbeat_formats_log_size_and_age() {
+        assert_eq!(
+            super::format_seed_heartbeat(
+                std::time::Duration::from_secs(480),
+                Some((41 * 1024, std::time::Duration::from_secs(3)))
+            ),
+            "still running (480s; log 41 KB, last write 3s ago)"
+        );
+    }
+
+    #[test]
+    fn seed_heartbeat_formats_human_size_units() {
+        assert_eq!(
+            super::format_seed_heartbeat(
+                std::time::Duration::from_secs(15),
+                Some((1024, std::time::Duration::ZERO))
+            ),
+            "still running (15s; log 1.0 KB, last write 0s ago)"
+        );
+        assert_eq!(
+            super::format_seed_heartbeat(
+                std::time::Duration::from_secs(15),
+                Some((1024 * 1024, std::time::Duration::ZERO))
+            ),
+            "still running (15s; log 1.0 MB, last write 0s ago)"
+        );
+        assert_eq!(
+            super::format_seed_heartbeat(
+                std::time::Duration::from_secs(15),
+                Some((42, std::time::Duration::ZERO))
+            ),
+            "still running (15s; log 42 B, last write 0s ago)"
+        );
+    }
+
+    #[test]
+    fn seed_heartbeat_falls_back_when_log_metadata_is_unavailable() {
+        assert_eq!(
+            super::format_seed_heartbeat(std::time::Duration::from_secs(480), None),
+            "still running (480s)"
+        );
     }
 
     #[test]

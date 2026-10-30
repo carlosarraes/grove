@@ -1714,22 +1714,9 @@ fn format_seed_heartbeat(
     let base = format!("still running ({}s", elapsed.as_secs());
     match log {
         Some((bytes, since_last_write)) => {
-            let size = crate::footprint::human_size(bytes);
-            let size = [
-                ("B", " B"),
-                ("K", " KB"),
-                ("M", " MB"),
-                ("G", " GB"),
-                ("T", " TB"),
-            ]
-            .into_iter()
-            .find_map(|(short, long)| {
-                size.strip_suffix(short)
-                    .map(|value| format!("{value}{long}"))
-            })
-            .unwrap_or(size);
             format!(
-                "{base}; log {size}, last write {}s ago)",
+                "{base}; log {}, last write {}s ago)",
+                crate::footprint::human_size(bytes),
                 since_last_write.as_secs()
             )
         }
@@ -1737,8 +1724,8 @@ fn format_seed_heartbeat(
     }
 }
 
+// Keep valid existing names unchanged. Hash the full rendered name, including the slug.
 fn bounded_database_name(name: &str) -> String {
-    // Keep valid existing names unchanged. Hash the full rendered name, including the slug.
     const LIMIT: usize = 63;
     if name.len() <= LIMIT {
         return name.to_owned();
@@ -1798,7 +1785,7 @@ mod seed_marker_tests {
                 std::time::Duration::from_secs(480),
                 Some((41 * 1024, std::time::Duration::from_secs(3)))
             ),
-            "still running (480s; log 41 KB, last write 3s ago)"
+            "still running (480s; log 41K, last write 3s ago)"
         );
     }
 
@@ -1809,21 +1796,21 @@ mod seed_marker_tests {
                 std::time::Duration::from_secs(15),
                 Some((1024, std::time::Duration::ZERO))
             ),
-            "still running (15s; log 1.0 KB, last write 0s ago)"
+            "still running (15s; log 1.0K, last write 0s ago)"
         );
         assert_eq!(
             super::format_seed_heartbeat(
                 std::time::Duration::from_secs(15),
                 Some((1024 * 1024, std::time::Duration::ZERO))
             ),
-            "still running (15s; log 1.0 MB, last write 0s ago)"
+            "still running (15s; log 1.0M, last write 0s ago)"
         );
         assert_eq!(
             super::format_seed_heartbeat(
                 std::time::Duration::from_secs(15),
                 Some((42, std::time::Duration::ZERO))
             ),
-            "still running (15s; log 42 B, last write 0s ago)"
+            "still running (15s; log 42B, last write 0s ago)"
         );
     }
 

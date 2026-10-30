@@ -194,16 +194,17 @@ It prints another wait message every 15 seconds, then reports admission or timeo
 Timeout or an unreadable load fails without a child process. Ctrl-C cancels the wait.
 The timeout applies to admission, not command execution.
 
-Load averages lag behind new work and do not measure free memory. Keep fleetlock's
-concurrency limit. Run admission before the lock so the load wait does not occupy a slot:
+Load averages lag behind new work and do not measure free memory. Use Ferry's shared
+slot pool to limit concurrent work. Run admission before the lock so the load wait does
+not occupy a slot:
 
 ```sh
-grove run --heavy -- fleetlock run pytest <lane> <card> -- <cmd>
+grove run --heavy -- ferry lock pytest --lane <lane> --label <card> -- <cmd>
 ```
 
-The order is admission, then the fleetlock slot, then the command. The admission wait
-stays outside fleetlock's hold cap. Load can change during the slot wait, so this remains
-a heuristic. This flag provides neither FIFO ordering nor a slot reservation.
+The order is admission, then the Ferry slot, then the command. The admission wait stays
+outside the slot. Load can change during the slot wait, so this remains a heuristic.
+This flag provides neither FIFO ordering nor a slot reservation.
 
 ## Gate installs by load
 

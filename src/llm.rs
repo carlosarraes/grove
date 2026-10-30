@@ -171,7 +171,7 @@ needed data, then deliberately remove and recreate that container.
                      Both wait for one-minute load strictly below max_load and report
                      waiting every 15s. Plain run and up do not wait. Timeout or invalid
                      load fails before starting work.
-                     run --heavy polls every 2s. It reserves no capacity; keep fleetlock.
+                     run --heavy polls every 2s. It reserves no capacity; use Ferry for shared slots.
                      up --heavy polls every 200ms, reserving one of two startup slots
                      under the shared state root before rechecking load. It releases
                      the slot while overloaded, and holds it through setup, seeds and

@@ -186,7 +186,7 @@ fn cores() -> usize {
         .unwrap_or(1)
 }
 
-/// Admission is a load check, not a concurrency reservation. Keep fleetlock's slot cap.
+/// Admission is a load check, not a concurrency reservation. Use Ferry for slot limits.
 pub fn wait_for_admission(config: &crate::config::Admission) -> anyhow::Result<()> {
     wait_with_samples(config, sample)
 }

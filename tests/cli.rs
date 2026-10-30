@@ -4191,13 +4191,17 @@ fn phase_durations_distinguish_warm_link_work_from_setup_and_seeds() {
 #[test]
 fn phase_durations_report_failed_seeds_without_changing_the_exit_status() {
     let cli = Cli::with_config(&format!(
-        "{CONFIG}\n[[seed]]\nname = \"broken\"\ncommand = \"sleep 0.1; exit 7\"\n"
+        "{CONFIG}\n[[seed]]\nname = \"broken\"\ncommand = \"sleep 0.1; echo seed-tail-marker; exit 7\"\n"
     ));
     let wt = cli.worktree("broken");
     let output = cli.run(&wt, &["up"]).failure().get_output().clone();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(phase_seconds(&stderr, "seed broken", "failed") >= 0.1);
     assert!(stderr.contains("seed broken failed"));
+    let entry = registry_of(&cli).get(&wt).unwrap().unwrap();
+    let log = entry.instance_dir.unwrap().join("seed-broken.log");
+    assert!(stderr.contains(&format!("full output in {}", log.display())));
+    assert!(stderr.contains("seed-tail-marker"));
     assert!(!stderr.contains("timing: web: process start:"));
 }
 

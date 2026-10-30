@@ -851,12 +851,20 @@ impl Instance {
                 .with_context(|| format!("running seed {}: {command}", seed.name))?;
 
                 if !status.success() {
-                    bail!(
-                        "seed {} failed: {command}\nfull output in {}\n{}",
+                    let mut message = format!(
+                        "seed {} failed: {command}\nfull output in {}",
                         seed.name,
-                        log.display(),
-                        tail(&log, 30).unwrap_or_default()
+                        log.display()
                     );
+                    if let Some(error) = std::fs::read_to_string(&log)
+                        .ok()
+                        .and_then(|body| first_error(&body))
+                    {
+                        message.push_str(&format!("\nfirst error: {error}"));
+                    }
+                    message.push('\n');
+                    message.push_str(&tail(&log, 30).unwrap_or_default());
+                    bail!("{message}");
                 }
                 Ok(())
             })?;
@@ -1556,6 +1564,54 @@ pub fn tail(path: &Path, lines: usize) -> Option<String> {
     Some(collected[start..].join("\n"))
 }
 
+fn first_error(log: &str) -> Option<String> {
+    let lines: Vec<&str> = log.lines().collect();
+    for (index, line) in lines.iter().enumerate() {
+        let frame = line.trim();
+        let Some(path) = frame
+            .strip_prefix("File \"")
+            .and_then(|rest| rest.split_once('\"').map(|(path, _)| path))
+        else {
+            continue;
+        };
+        if path.contains("/site-packages/")
+            || path.contains("/dist-packages/")
+            || path.contains("/.venv/lib/python")
+        {
+            continue;
+        }
+        let source = lines
+            .get(index + 1)
+            .map(|source| source.trim())
+            .filter(|source| !source.is_empty());
+        return Some(match source {
+            Some(source) => format!("{frame}: {source}"),
+            None => frame.to_owned(),
+        });
+    }
+
+    lines
+        .iter()
+        .rev()
+        .map(|line| line.trim())
+        .find(|line| {
+            line.starts_with("Error:") || line.starts_with("error:") || exception_line(line)
+        })
+        .map(str::to_owned)
+}
+
+fn exception_line(line: &str) -> bool {
+    let name = line.split_once(':').map_or(line, |(name, _)| name);
+    let parts = name.split('.');
+    let valid = parts.clone().all(|part| {
+        !part.is_empty()
+            && part
+                .chars()
+                .all(|character| character == '_' || character.is_ascii_alphanumeric())
+    });
+    valid && (name.ends_with("Error") || name.ends_with("Exception") || name.ends_with("Cancelled"))
+}
+
 /// `"180s"`, `"2m"`, `"6h"`, `"2d"`, `"500ms"`, or a bare number of seconds. Readiness
 /// timeouts and `--idle` windows are the same kind of value written by the same hands, so
 /// they parse the same way.
@@ -1659,7 +1715,7 @@ fn bounded_database_name(name: &str) -> String {
 
 #[cfg(test)]
 mod seed_marker_tests {
-    use super::{SeedDecision, SeedMarker, StoredSeedMarker, seed_decision};
+    use super::{SeedDecision, SeedMarker, StoredSeedMarker, first_error, seed_decision};
     use std::collections::{BTreeMap, BTreeSet};
 
     #[test]
@@ -1692,5 +1748,33 @@ mod seed_marker_tests {
             decision,
             SeedDecision::Run { why: Some(why) } if why == "resource mongo was recreated"
         ));
+    }
+
+    #[test]
+    fn first_error_prefers_seed_frames_over_python_library_frames() {
+        let log = r#"Traceback (most recent call last):
+  File "/work/seed.py", line 12, in <module>
+    insert()
+  File "/work/.venv/lib/python3.12/site-packages/pymongo/collection.py", line 1, in insert
+    raise ValueError("bad")
+ValueError: bad"#;
+
+        assert_eq!(
+            first_error(log).as_deref(),
+            Some("File \"/work/seed.py\", line 12, in <module>: insert()")
+        );
+    }
+
+    #[test]
+    fn first_error_returns_error_line_when_there_is_no_traceback() {
+        assert_eq!(
+            first_error("starting\nError: boom\ncleanup"),
+            Some("Error: boom".into())
+        );
+    }
+
+    #[test]
+    fn first_error_is_none_for_clean_logs() {
+        assert_eq!(first_error("seed started\nseed finished"), None);
     }
 }

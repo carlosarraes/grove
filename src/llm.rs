@@ -162,6 +162,8 @@ needed data, then deliberately remove and recreate that container.
   name               identifier, also the marker and log file name
   cwd                working directory relative to the worktree root
   command            run once per instance, after dependencies, before services
+  timeout            positive duration, default "20m"; kills the seed process group
+                     on timeout, failing up with the log path and last log line
   if_exists          skip unless this path exists, relative to cwd -- for a fixture
                      that may not have been fetched
 

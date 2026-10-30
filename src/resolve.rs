@@ -85,11 +85,10 @@ fn slugify(name: &str) -> String {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
-        .current_dir(cwd)
-        .args(args)
-        .output()
-        .with_context(|| format!("running `git {}`", args.join(" ")))?;
+    let out = crate::timing::progress(&format!("git {}", args.join(" ")), || {
+        Command::new("git").current_dir(cwd).args(args).output()
+    })
+    .with_context(|| format!("running `git {}`", args.join(" ")))?;
 
     if !out.status.success() {
         bail!(

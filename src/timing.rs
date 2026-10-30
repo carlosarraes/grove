@@ -13,6 +13,32 @@ pub(crate) fn measure<T>(phase: &str, work: impl FnOnce() -> Result<T>) -> Resul
     result
 }
 
+pub(crate) fn measure_wait<T>(phase: &str, work: impl FnOnce() -> Result<T>) -> Result<T> {
+    measure(phase, || progress(phase, work))
+}
+
+pub(crate) fn progress<T>(phase: &str, work: impl FnOnce() -> T) -> T {
+    with_heartbeat(
+        heartbeat_interval(),
+        |elapsed| eprintln!("{}", format_progress(phase, elapsed)),
+        work,
+    )
+}
+
+fn format_progress(phase: &str, elapsed: Duration) -> String {
+    format!("{phase}: still waiting ({}s)", elapsed.as_secs())
+}
+
+/// `GROVE_HEARTBEAT_SECS` exists for the test suite; 15s otherwise.
+pub(crate) fn heartbeat_interval() -> Duration {
+    let secs = std::env::var("GROVE_HEARTBEAT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|secs| secs.is_finite() && *secs > 0.0)
+        .unwrap_or(15.0);
+    Duration::from_secs_f64(secs)
+}
+
 /// Run `work`, calling `beat` with the elapsed time every `every` until it returns.
 /// A long step under load otherwise looks exactly like a hung one.
 pub(crate) fn with_heartbeat<T>(
@@ -71,5 +97,16 @@ mod tests {
             || (),
         );
         assert_eq!(*beats.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn progress_line_names_the_wait_and_elapsed_seconds() {
+        assert_eq!(
+            format_progress(
+                "resource mongo: docker inspect",
+                Duration::from_millis(15_900)
+            ),
+            "resource mongo: docker inspect: still waiting (15s)"
+        );
     }
 }

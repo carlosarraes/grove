@@ -70,10 +70,16 @@ pub struct Seed {
     /// Working directory, relative to the worktree root.
     pub cwd: Option<String>,
     pub command: String,
+    #[serde(default = "seed_timeout")]
+    pub timeout: String,
     /// Skip unless this path exists, relative to `cwd`. For fixtures that may not be
     /// present — an LFS dump nobody has pulled should mean "no sample data", not a
     /// failed `up`.
     pub if_exists: Option<String>,
+}
+
+fn seed_timeout() -> String {
+    "20m".to_string()
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -215,6 +221,13 @@ pub fn parse(text: &str) -> Result<Config> {
 
 impl Config {
     fn validate(&self) -> Result<()> {
+        for seed in &self.seeds {
+            let timeout = crate::instance::parse_duration(&seed.timeout)
+                .with_context(|| format!("seed {}: timeout", seed.name))?;
+            if timeout.is_zero() {
+                anyhow::bail!("seed {}: timeout must be greater than zero", seed.name);
+            }
+        }
         if let Some(admission) = &self.admission {
             if admission
                 .max_load

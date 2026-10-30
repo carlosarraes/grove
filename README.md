@@ -164,7 +164,7 @@ repo's own fixture or settings constructor.
 | `down --idle 2h` \| `--all-but-this` | stop instances across the machine, keeping their ports; `--dry-run` names them first |
 | `restart [service]` | replace one service without touching the others |
 | `status [NAME] [--worktree NAME\|PATH] [--json]` | ports, pids, and whether each service's `ready.http` answers — plus a warning if a service predates your last edit |
-| `ls [--json]` | every instance on the machine, most neglected first, with the machine's load and what each holds on disk |
+| `ls [--json]` | every instance on the machine, most neglected first, with its owner, the machine's load and what each holds on disk |
 | `test-containers [--remove-stale]` | report stale Mongo testcontainers; recheck and remove only with the explicit flag |
 | `health [--json]` | everything on the machine that is costing someone — stray listeners, orphans, idle instances, disk — each with the command that ends it |
 | `run -- <cmd>` | run a command with this instance's environment overlaid |
@@ -407,6 +407,11 @@ The readiness deadline is 180 seconds per resource before each seed, with attemp
 bounded to five seconds. The log reports readiness time separately from seed time.
 Skipped seeds need no probe. Grove does not replay a failed seed automatically.
 An OOM or disconnect after the probe can still fail a seed.
+
+Each `[[seed]]` accepts a positive `timeout` duration, default `"20m"`, using the
+same units as `ready.timeout`. This bounds the seed command after Mongo readiness.
+When the deadline expires, Grove kills the seed's process group and fails `up`.
+The error names the seed, elapsed time, log path, last log line, and recovery steps.
 
 Ordinary `grove health` reports available disk space and recorded instance usage,
 but labels the store size as unmeasured. It does not recursively scan the store

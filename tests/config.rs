@@ -211,6 +211,35 @@ command = "mongorestore --db {{ db.name }} fixtures/propositions.archive"
 }
 
 #[test]
+fn seed_timeouts_default_to_twenty_minutes_and_accept_duration_units() {
+    for (setting, expected) in [
+        ("", "20m"),
+        ("timeout = '1s'", "1s"),
+        ("timeout = '25m'", "25m"),
+    ] {
+        let config = config::parse(&format!(
+            "version = 1\n[[seed]]\nname = 'demo'\ncommand = 'true'\n{setting}\n"
+        ))
+        .unwrap();
+        assert_eq!(config.seeds[0].timeout, expected);
+    }
+}
+
+#[test]
+fn seed_timeouts_must_be_positive_durations() {
+    for timeout in ["0s", "-1s", "forever", "18446744073709551615h"] {
+        let error = config::parse(&format!(
+            "version = 1\n[[seed]]\nname = 'demo'\ncommand = 'true'\ntimeout = '{timeout}'\n"
+        ))
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("seed demo: timeout"),
+            "{error:#}"
+        );
+    }
+}
+
+#[test]
 fn a_service_can_declare_what_its_setup_produces_and_what_decides_it() {
     let wt = worktree_with(
         r#"

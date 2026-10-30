@@ -359,6 +359,48 @@ fn recording_a_stale_entry_does_not_roll_back_the_idle_clock() {
 }
 
 #[test]
+fn recording_a_stale_entry_does_not_erase_a_newer_started_by() {
+    let h = Harness::new();
+    let r = h.resolved("feat_search");
+    h.registry.reserve(&r, &names()).expect("reserve");
+    h.registry
+        .set_started_by(&r.worktree, Some("herdr pane A".into()))
+        .expect("set initial owner");
+    let stale = h.registry.get(&r.worktree).expect("get").expect("entry");
+
+    h.registry
+        .set_started_by(&r.worktree, Some("herdr pane B".into()))
+        .expect("set newer owner");
+
+    h.registry.record(&stale).expect("record stale copy");
+
+    let entry = h.registry.get(&r.worktree).expect("get").expect("entry");
+    assert_eq!(entry.started_by.as_deref(), Some("herdr pane B"));
+}
+
+#[test]
+fn an_old_registry_entry_loads_without_started_by() {
+    let h = Harness::new();
+    let r = h.resolved("feat_search");
+    h.registry.reserve(&r, &names()).expect("reserve");
+    let path = h._state.path().join("registry.json");
+    let old_registry = serde_json::json!({
+        "instances": {
+            r.worktree.to_string_lossy(): {
+                "worktree": r.worktree,
+                "slug": r.slug,
+                "ports": {"frontend": 21000, "backend": 21001}
+            }
+        }
+    });
+    std::fs::write(&path, serde_json::to_vec(&old_registry).expect("serialize"))
+        .expect("write old registry");
+
+    let entry = h.registry.get(&r.worktree).expect("load").expect("entry");
+    assert_eq!(entry.started_by, None);
+}
+
+#[test]
 fn exposure_is_updated_through_its_own_locked_registry_operation() {
     let h = Harness::new();
     let r = h.resolved("feat_search");

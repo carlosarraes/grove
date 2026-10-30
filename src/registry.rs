@@ -48,6 +48,9 @@ pub struct Entry {
     /// written before this existed and on worktrees where no setup has run.
     #[serde(default)]
     pub disk_bytes: Option<u64>,
+    /// Who ran the last `up` or `restart`; None for older entries or starts outside herdr.
+    #[serde(default)]
+    pub started_by: Option<String>,
     /// Which store entry each service's dependencies came from, by service name.
     /// Recorded so `prune` can tell an entry somebody would link from again from one
     /// nobody will — the store itself has no way to know who uses it.
@@ -189,6 +192,7 @@ impl Registry {
                 last_used: None,
                 instance_dir: None,
                 disk_bytes: None,
+                started_by: None,
                 cache_keys: BTreeMap::new(),
             };
             state.instances.insert(key, entry.clone());
@@ -205,6 +209,9 @@ impl Registry {
             // that command just made back to whatever it was minutes earlier.
             if let Some(stored) = state.instances.get(&key(&entry.worktree)) {
                 entry.last_used = entry.last_used.max(stored.last_used);
+                // Ownership has a dedicated setter. A snapshot opened before that setter
+                // must not overwrite the current owner when it records service handles.
+                entry.started_by = stored.started_by.clone();
                 // Exposure has a dedicated setter. A command that opened the instance
                 // before a mode switch may still record pids or database metadata later;
                 // that unrelated stale write must not reopen or close the network boundary.
@@ -255,6 +262,17 @@ impl Registry {
                 .get_mut(&key(worktree))
                 .context("the instance is not registered")?;
             entry.exposure = exposure;
+            Ok(())
+        })
+    }
+
+    pub fn set_started_by(&self, worktree: &Path, started_by: Option<String>) -> Result<()> {
+        self.with_lock(|state| {
+            let entry = state
+                .instances
+                .get_mut(&key(worktree))
+                .context("the instance is not registered")?;
+            entry.started_by = started_by;
             Ok(())
         })
     }

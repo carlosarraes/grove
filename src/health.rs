@@ -30,7 +30,32 @@ pub fn check(cwd: &Path) -> Result<Vec<Verdict>> {
     verdicts.extend(unmanaged(cwd, &entries));
     verdicts.push(memory());
     verdicts.push(machine(&entries));
+    verdicts.extend(
+        entries
+            .iter()
+            .filter(|entry| entry.is_running())
+            .map(|entry| {
+                Verdict::Ok(running_owner_line(
+                    &entry.slug,
+                    &entry.worktree,
+                    entry.started_by.as_deref(),
+                ))
+            }),
+    );
     Ok(verdicts)
+}
+
+fn running_owner_line(slug: &str, worktree: &Path, started_by: Option<&str>) -> String {
+    match started_by {
+        Some(owner) => format!(
+            "{slug} running, started by {owner}; worktree {}",
+            worktree.display()
+        ),
+        None => format!(
+            "{slug} running, unknown owner (started before grove 0.1.51 or outside herdr); worktree {}; find out: grove status {slug} lists its pids, ps -o pid,ppid,command -p <pid> shows who launched them",
+            worktree.display()
+        ),
+    }
 }
 
 /// The finding this command exists for: a listener on a grove port with no running
@@ -474,4 +499,30 @@ pub fn json(verdicts: &[Verdict]) -> serde_json::Value {
         })
         .collect();
     serde_json::Value::Array(findings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::running_owner_line;
+    use std::path::Path;
+
+    #[test]
+    fn running_owner_line_names_a_known_owner() {
+        assert_eq!(
+            running_owner_line(
+                "rbp_warm_1",
+                Path::new("/home/carlos/mondrio/rbp-warm-1"),
+                Some("herdr pane wT:pX"),
+            ),
+            "rbp_warm_1 running, started by herdr pane wT:pX; worktree /home/carlos/mondrio/rbp-warm-1"
+        );
+    }
+
+    #[test]
+    fn running_owner_line_explains_an_unknown_owner() {
+        assert_eq!(
+            running_owner_line("rbp_warm_2", Path::new("/tmp/rbp-warm-2"), None),
+            "rbp_warm_2 running, unknown owner (started before grove 0.1.51 or outside herdr); worktree /tmp/rbp-warm-2; find out: grove status rbp_warm_2 lists its pids, ps -o pid,ppid,command -p <pid> shows who launched them"
+        );
+    }
 }

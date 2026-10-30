@@ -10,6 +10,13 @@ use std::path::{Path, PathBuf};
 /// The window the printed prescription proposes; `health` reads the same one.
 const IDLE_WINDOW: &str = grove::health::IDLE_WINDOW;
 
+fn herdr_owner() -> Option<String> {
+    std::env::var("HERDR_PANE_ID")
+        .ok()
+        .filter(|pane| !pane.is_empty())
+        .map(|pane| format!("herdr pane {pane}"))
+}
+
 /// What this machine looks like right now — how loaded, how crowded, and which instances
 /// nobody has touched lately.
 struct Machine {
@@ -322,6 +329,8 @@ fn main() -> Result<()> {
             if !allow_main {
                 instance.refuse_in_main()?;
             }
+            grove::instance::registry()?
+                .set_started_by(&instance.resolved.worktree, herdr_owner())?;
             let _startup_slot = if heavy {
                 Some(grove::load::wait_for_startup(
                     &instance.config.admission.clone().unwrap_or_default(),
@@ -631,6 +640,8 @@ fn main() -> Result<()> {
             let _up_lock = grove::instance::lock_up(&cwd)?;
             let mut instance = Instance::open(&cwd)?;
             instance.refuse_in_main()?;
+            grove::instance::registry()?
+                .set_started_by(&instance.resolved.worktree, herdr_owner())?;
             instance.touch()?;
             for name in instance.stop_services(service.as_deref())? {
                 println!("stopped {name}");

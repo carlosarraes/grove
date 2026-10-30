@@ -3729,6 +3729,27 @@ fn health_is_quiet_on_a_clean_machine() {
     cli.run(&wt, &["down"]).success();
 }
 
+#[test]
+fn health_reports_the_pane_that_started_a_running_instance() {
+    let cli = Cli::new();
+    let wt = cli.worktree("feat_search");
+    cli.run_env(&wt, &[("HERDR_PANE_ID", "wT:pX")], &["up"])
+        .success();
+
+    let output = cli
+        .run(&wt, &["health"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&output);
+    assert!(
+        stdout.contains("feat_search running, started by herdr pane wT:pX"),
+        "{stdout}"
+    );
+    cli.run(&wt, &["down"]).success();
+}
+
 /// The case the command exists for: something is listening on a grove port and no
 /// instance is running there — a `down` that missed a child, a server from an older
 /// grove, a squatter. Health names it and hands over the command that ends it.

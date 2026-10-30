@@ -66,12 +66,13 @@ grove down
 
 Commands act on the worktree you run them in. To look at another instance without
 leaving yours, give `status`, `doctor` or `down` its name as `grove ls` prints it, or
-its worktree path:
+its worktree path. `status` also accepts that target with `--worktree`:
 
 ```sh
-grove status mon_10033          # read-only, from anywhere
+grove status feature_branch     # read-only, from anywhere
+grove status --worktree ../other-worktree
 grove doctor ../other-worktree
-grove down mon_10033
+grove down feature_branch
 ```
 
 An unknown name fails and points at `grove ls`. `logs`, `restart`, `run` and `seed` already
@@ -162,7 +163,7 @@ repo's own fixture or settings constructor.
 | `down [--purge]` | stop services; `--purge` also drops the database |
 | `down --idle 2h` \| `--all-but-this` | stop instances across the machine, keeping their ports; `--dry-run` names them first |
 | `restart [service]` | replace one service without touching the others |
-| `status [--json]` | ports, pids, and whether each service's `ready.http` answers — plus a warning if a service predates your last edit |
+| `status [NAME] [--worktree NAME\|PATH] [--json]` | ports, pids, and whether each service's `ready.http` answers — plus a warning if a service predates your last edit |
 | `ls [--json]` | every instance on the machine, most neglected first, with the machine's load and what each holds on disk |
 | `test-containers [--remove-stale]` | report stale Mongo testcontainers; recheck and remove only with the explicit flag |
 | `health [--json]` | everything on the machine that is costing someone — stray listeners, orphans, idle instances, disk — each with the command that ends it |

@@ -100,7 +100,8 @@ impl Machine {
     disable_help_subcommand = true,
     after_help = "Commands act on the worktree you run them in. `status`, `doctor` and `down` \
                   also take an instance name as `grove ls` shows it, or a worktree path: \
-                  `grove status mon_10033`."
+                  `grove status feature_branch`. For `status`, use `--worktree` as an alias \
+                  for the positional target."
 )]
 struct Cli {
     /// Emit the .grove.toml schema and worked examples, then exit
@@ -163,7 +164,11 @@ enum Command {
     /// Ports, pids, and whether each service's endpoint actually answers
     Status {
         /// Instance name as `grove ls` shows it, or a worktree path [default: the worktree you are in]
+        #[arg(conflicts_with = "worktree")]
         name: Option<String>,
+        /// Instance name as `grove ls` shows it, or a worktree path
+        #[arg(long, value_name = "NAME|PATH", conflicts_with = "name")]
+        worktree: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -408,8 +413,12 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Some(Command::Status { name, json }) => {
-            let instance = Instance::open(&target(name.as_deref(), &cwd)?)?;
+        Some(Command::Status {
+            name,
+            worktree,
+            json,
+        }) => {
+            let instance = Instance::open(&target(name.as_deref().or(worktree.as_deref()), &cwd)?)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&status_json(&instance))?);
             } else {

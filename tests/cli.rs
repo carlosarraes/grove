@@ -796,6 +796,44 @@ fn status_doctor_and_down_target_an_instance_by_name_or_path() {
 }
 
 #[test]
+fn status_worktree_flag_aliases_the_positional_target() {
+    let cli = Cli::new();
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+    let elsewhere = cli.state.path().to_path_buf();
+
+    let positional = cli
+        .run(&elsewhere, &["status", "feat_search", "--json"])
+        .success();
+    let flagged = cli
+        .run(
+            &elsewhere,
+            &["status", "--worktree", "feat_search", "--json"],
+        )
+        .success();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&flagged.get_output().stdout).unwrap(),
+        serde_json::from_slice::<serde_json::Value>(&positional.get_output().stdout).unwrap()
+    );
+
+    let current = cli
+        .run(&wt, &["status", "--worktree", ".", "--json"])
+        .success();
+    let current: serde_json::Value = serde_json::from_slice(&current.get_output().stdout).unwrap();
+    assert_eq!(current["slug"], "feat_search");
+
+    let conflict = cli
+        .run(&elsewhere, &["status", "feat_search", "--worktree", "."])
+        .failure();
+    assert_eq!(conflict.get_output().status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&conflict.get_output().stderr).contains("--worktree"),
+        "{}",
+        String::from_utf8_lossy(&conflict.get_output().stderr)
+    );
+}
+
+#[test]
 fn an_unknown_instance_name_points_at_grove_ls() {
     let cli = Cli::new();
     let wt = cli.worktree("feat_search");

@@ -1137,6 +1137,240 @@ fn ls_lists_every_running_instance() {
 }
 
 #[test]
+fn list_shows_known_and_unknown_owners_in_text_and_json() {
+    let cli = Cli::with_config("version = 1\n");
+    let known = cli.worktree("known");
+    let unknown = cli.worktree("unknown");
+    cli.run_env(&known, &[("HERDR_PANE_ID", "wA:pT")], &["up"])
+        .success();
+    cli.run_env(&unknown, &[("HERDR_PANE_ID", "")], &["up"])
+        .success();
+    let out = cli
+        .run(&known, &["list"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(out).unwrap();
+    let rows: Vec<_> = stdout.lines().take(3).collect();
+    assert_eq!(
+        rows,
+        vec![
+            format!(
+                "{:<28} {:<13} {:<10} {:>5}  {:<5}  OWNER",
+                "INSTANCE", "STATE", "IDLE", "SIZE", "PORTS"
+            ),
+            format!(
+                "{:<28} {:<13} {:<10} {:>5}  {:<5}  herdr pane wA:pT",
+                "known", "stopped", "", "", ""
+            ),
+            format!(
+                "{:<28} {:<13} {:<10} {:>5}  {:<5}  -",
+                "unknown", "stopped", "", "", ""
+            ),
+        ]
+    );
+    let out = cli
+        .run(&known, &["list", "--json"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(value["instances"][0]["started_by"], "herdr pane wA:pT");
+    assert!(
+        value["instances"][1]
+            .as_object()
+            .unwrap()
+            .contains_key("started_by")
+    );
+    assert!(value["instances"][1]["started_by"].is_null());
+}
+
+#[test]
+fn seed_timeout_fails_fast_reports_the_log_and_reaps_sleep() {
+    let cli = Cli::with_config(
+        r#"
+version = 1
+[[seed]]
+name = "slow"
+timeout = "1s"
+command = "echo $$ > sleep.pid; echo seed-tail-marker; exec sleep 30"
+"#,
+    );
+    let wt = cli.worktree("seed_timeout");
+    let began = std::time::Instant::now();
+    let output = cli.run(&wt, &["up"]).failure().get_output().clone();
+    assert!(began.elapsed() < std::time::Duration::from_secs(5));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let elapsed: f64 = stderr
+        .split("seed slow timed out after ")
+        .nth(1)
+        .and_then(|rest| rest.split('s').next())
+        .and_then(|seconds| seconds.parse().ok())
+        .unwrap_or_else(|| panic!("missing timeout with elapsed seconds: {stderr}"));
+    assert!((1.0..5.0).contains(&elapsed), "{stderr}");
+    let log = registry_of(&cli)
+        .get(&wt)
+        .unwrap()
+        .unwrap()
+        .instance_dir
+        .unwrap()
+        .join("seed-slow.log");
+    assert!(
+        stderr.contains(&format!("log: {}", log.display())),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("last log line: seed-tail-marker"),
+        "{stderr}"
+    );
+    assert!(
+        stderr
+            .contains("raise seeds.slow.timeout in .grove.toml, or check mongo with grove health"),
+        "{stderr}"
+    );
+    let pid: i32 = std::fs::read_to_string(wt.join("sleep.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        rustix::process::test_kill_process(rustix::process::Pid::from_raw(pid).unwrap()).is_err(),
+        "sleep {pid} survived"
+    );
+    assert!(!log.parent().unwrap().join(".seed-slow").exists());
+}
+
+#[test]
+fn seed_timeout_kills_descendants_in_the_seed_process_group() {
+    let cli = Cli::with_config(
+        r#"
+version = 1
+[[seed]]
+name = "children"
+timeout = "1s"
+command = "sleep 30 & echo $! > sleep.pid; wait"
+"#,
+    );
+    let wt = cli.worktree("seed_children");
+    let output = cli.run(&wt, &["up"]).failure().get_output().clone();
+    assert!(String::from_utf8_lossy(&output.stderr).contains("seed children timed out"));
+    let raw: i32 = std::fs::read_to_string(wt.join("sleep.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let pid = rustix::process::Pid::from_raw(raw).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while rustix::process::test_kill_process(pid).is_ok() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        rustix::process::test_kill_process(pid).is_err(),
+        "seed child {raw} survived"
+    );
+}
+
+#[test]
+fn cancelling_up_during_seed_kills_its_isolated_process_group() {
+    use rustix::process::{Pid, Signal, kill_process_group, test_kill_process};
+    use std::os::unix::process::CommandExt;
+    for signal in [Signal::INT, Signal::TERM, Signal::HUP] {
+        let cli = Cli::with_config(
+            "version = 1\n[[seed]]\nname = 'slow'\ncommand = 'echo $$ > seed.pid; exec sleep 30'\n",
+        );
+        let wt = cli.worktree("cancel_seed");
+        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("grove"));
+        let child = command
+            .current_dir(&wt)
+            .env("GROVE_STATE_DIR", cli.state.path())
+            .env("GROVE_CACHE_DIR", cli.state.path().join("store"))
+            .env("GROVE_PORT_RANGE", cli.port_range())
+            .args(["up"])
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !wt.join("seed.pid").exists() {
+            assert!(std::time::Instant::now() < deadline, "seed did not start");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let raw: i32 = std::fs::read_to_string(wt.join("seed.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let pid = Pid::from_raw(raw).unwrap();
+        kill_process_group(Pid::from_child(&child), signal).unwrap();
+        let output = child.wait_with_output().unwrap();
+        let alive = test_kill_process(pid).is_ok();
+        if alive {
+            let _ = kill_process_group(pid, Signal::KILL);
+        }
+        assert!(!alive, "seed survived cancellation with {signal:?}");
+        assert_eq!(output.status.code(), Some(128 + signal.as_raw()));
+    }
+}
+
+#[test]
+fn service_readiness_reports_progress_while_the_service_starts() {
+    let cli = Cli::with_config(&CONFIG.replace(
+        "python3 -u -m http.server",
+        "sleep 0.3; exec python3 -u -m http.server",
+    ));
+    let wt = cli.worktree("readiness_progress");
+    let output = cli
+        .run_env(&wt, &[("GROVE_HEARTBEAT_SECS", "0.05")], &["up"])
+        .success()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("web: readiness: still waiting (0s)"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn instance_and_setup_locks_report_progress_while_another_up_holds_them() {
+    for (file, phase) in [
+        ("up.lock", "instance up lock wait"),
+        (".setup-web.lock", "web: setup lock wait"),
+    ] {
+        let cli = Cli::with_config("version = 1\n[[service]]\nname = 'web'\nsetup = 'true'\n");
+        let wt = cli.worktree("lock_progress");
+        cli.run(&wt, &["status", "--json"]).success();
+        let directory = registry_of(&cli)
+            .get(&wt)
+            .unwrap()
+            .unwrap()
+            .instance_dir
+            .unwrap();
+        std::fs::create_dir_all(&directory).unwrap();
+        let lock = std::fs::File::create(directory.join(file)).unwrap();
+        lock.lock().unwrap();
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            drop(lock);
+        });
+        let output = cli
+            .run_env(&wt, &[("GROVE_HEARTBEAT_SECS", "0.05")], &["up"])
+            .success()
+            .get_output()
+            .clone();
+        holder.join().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("{phase}: still waiting (0s)")),
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
 fn run_executes_a_command_with_the_instance_environment() {
     let cli = Cli::new();
     let wt = cli.worktree("feat_search");
@@ -5440,7 +5674,7 @@ fn resource_inspect_failure_never_creates_or_starts_a_container() {
 }
 
 #[test]
-fn running_resource_waits_for_its_port_without_starting_it_again() {
+fn running_resource_reports_progress_waiting_for_its_port_without_starting_again() {
     let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = reservation.local_addr().unwrap().port();
     let cli = stopped_resource_fixture(
@@ -5463,14 +5697,22 @@ fn running_resource_waits_for_its_port_without_starting_it_again() {
                 _ => return,
             }
         }
+        std::thread::sleep(std::time::Duration::from_millis(300));
         let _listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
         let _ = stopped.recv_timeout(std::time::Duration::from_secs(15));
     });
     let wt = cli.worktree("running_resource");
-    let result = cli.run(&wt, &["up"]);
+    let result = cli.run_env(&wt, &[("GROVE_HEARTBEAT_SECS", "0.05")], &["up"]);
     let _ = stop.send(());
     server.join().unwrap();
-    result.success();
+    let output = result.success().get_output().clone();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "resource mongo: waiting for host port {port}: still waiting (0s)"
+        )),
+        "{stderr}"
+    );
     let calls = std::fs::read_to_string(cli.state.path().join("docker-calls")).unwrap();
     assert!(
         calls.lines().all(|line| line.starts_with("inspect ")),
@@ -5605,6 +5847,74 @@ impl Drop for InitResourceRig {
         let _ = self.stop.take().unwrap().send(());
         self.server.take().unwrap().join().unwrap();
     }
+}
+
+#[test]
+fn docker_and_mongosh_waits_report_progress_without_printing_arguments() {
+    for (pattern, notice) in [
+        (
+            "inspect) cat",
+            "shared resource: docker inspect: still waiting (0s)",
+        ),
+        (
+            "start|run)\n",
+            "shared resource: docker start: still waiting (0s)",
+        ),
+        ("exec)\n", "waiting for mongosh initialization"),
+    ] {
+        let rig = InitResourceRig::new();
+        std::fs::remove_file(rig.cli.state.path().join("fail-init")).unwrap();
+        let program = &rig.cli.docker.as_ref().unwrap().program;
+        let body = std::fs::read_to_string(program).unwrap();
+        let delayed = pattern.replacen(')', ") sleep 0.3;", 1);
+        std::fs::write(program, body.replace(pattern, &delayed)).unwrap();
+        let wt = rig.cli.worktree("docker_progress");
+        let output = rig
+            .cli
+            .run_env(&wt, &[("GROVE_HEARTBEAT_SECS", "0.05")], &["up"])
+            .success()
+            .get_output()
+            .clone();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(notice), "{stderr}");
+        assert!(!stderr.contains("HOME=/tmp"), "{stderr}");
+        assert!(!stderr.contains("initialize()"), "{stderr}");
+    }
+}
+
+#[test]
+fn resource_init_has_one_heartbeat_while_checking_a_refused_connection() {
+    let rig = InitResourceRig::new();
+    let root = rig.cli.state.path();
+    std::fs::remove_file(root.join("fail-init")).unwrap();
+    std::fs::write(root.join("refuse-init"), "1").unwrap();
+    let program = &rig.cli.docker.as_ref().unwrap().program;
+    let body = std::fs::read_to_string(program).unwrap();
+    std::fs::write(
+        program,
+        body.replace(
+            "inspect) cat",
+            "inspect) if [ -f \"$root/init-attempts\" ]; then sleep 0.3; fi; cat",
+        ),
+    )
+    .unwrap();
+    let wt = rig.cli.worktree("init_heartbeat");
+    let output = rig
+        .cli
+        .run_env(&wt, &[("GROVE_HEARTBEAT_SECS", "0.05")], &["up"])
+        .success()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let init = stderr.split("started shared mongo").next().unwrap();
+    assert!(
+        init.contains("waiting for mongosh initialization"),
+        "{stderr}"
+    );
+    assert!(
+        !init.contains("shared resource: docker inspect: still waiting"),
+        "{stderr}"
+    );
 }
 
 #[test]

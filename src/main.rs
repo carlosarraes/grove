@@ -466,12 +466,39 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
+            let port_labels: Vec<String> = entries
+                .iter()
+                .map(|entry| {
+                    let ports: Vec<String> = entry
+                        .ports
+                        .iter()
+                        .map(|(name, port)| format!("{name}={port}"))
+                        .collect();
+                    let exposure = if entry.exposure.is_exposed() {
+                        format!(" exposed {}", entry.exposure.public_host())
+                    } else {
+                        String::new()
+                    };
+                    format!("{}{exposure}", ports.join(" "))
+                })
+                .collect();
+            let port_width = port_labels
+                .iter()
+                .map(String::len)
+                .max()
+                .unwrap_or(0)
+                .max(5);
             if entries.is_empty() {
                 println!("no instances");
+            } else {
+                println!(
+                    "{:<28} {:<13} {:<10} {:>5}  {:<port_width$}  OWNER",
+                    "INSTANCE", "STATE", "IDLE", "SIZE", "PORTS"
+                );
             }
             let orphans = entries.iter().filter(|e| !e.worktree.exists()).count();
             let mut failed = 0;
-            for entry in &entries {
+            for (entry, ports) in entries.iter().zip(&port_labels) {
                 // Ask the processes, not the record. A recorded pid says only that a
                 // service was started once; reading that as "up" turns a stopped
                 // instance into an apparent port conflict.
@@ -504,25 +531,15 @@ fn main() -> Result<()> {
                     Some(age) => format!("idle {}", human_age(age)),
                     None => String::new(),
                 };
-                let ports: Vec<String> = entry
-                    .ports
-                    .iter()
-                    .map(|(n, p)| format!("{n}={p}"))
-                    .collect();
-                let exposure = if entry.exposure.is_exposed() {
-                    format!(" exposed {}", entry.exposure.public_host())
-                } else {
-                    String::new()
-                };
                 let size = disk_of(entry).map(human_size).unwrap_or_default();
                 println!(
-                    "{:<28} {:<13} {:<10} {:>5}  {}{}",
+                    "{:<28} {:<13} {:<10} {:>5}  {:<port_width$}  {}",
                     entry.slug,
                     state,
                     idle,
                     size,
-                    ports.join(" "),
-                    exposure
+                    ports,
+                    entry.started_by.as_deref().unwrap_or("-")
                 );
             }
             if orphans > 0 {
@@ -1124,6 +1141,7 @@ fn ls_json(entries: &[Entry], now: u64, machine: &Machine) -> serde_json::Value 
                 "public_host": e.exposure.public_host(),
                 "ports": e.ports,
                 "database": e.db_name,
+                "started_by": e.started_by,
                 "disk_bytes": disk_of(e),
                 "last_up_failed": last_up(e).is_some_and(|last| last.failed()),
                 "last_up_interrupted": last_up(e).is_some_and(|last| last.interrupted()),

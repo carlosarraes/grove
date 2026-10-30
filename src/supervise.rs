@@ -10,7 +10,58 @@ use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
+
+static SEED_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn remember_seed_signal(signal: libc::c_int) {
+    SEED_SIGNAL.store(signal, Ordering::Relaxed);
+}
+
+/// Keep the seed supervisor alive long enough to reap its isolated group on Ctrl-C.
+pub(crate) struct SeedSignals {
+    previous: Vec<(libc::c_int, libc::sigaction)>,
+}
+
+impl SeedSignals {
+    pub(crate) fn capture() -> Result<Self> {
+        let mut signals = Self {
+            previous: Vec::new(),
+        };
+        SEED_SIGNAL.store(0, Ordering::Relaxed);
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            // SAFETY: both sigactions are initialized; the handler only stores an atomic.
+            unsafe {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                let mut previous: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = remember_seed_signal as *const () as libc::sighandler_t;
+                libc::sigemptyset(&mut action.sa_mask);
+                if libc::sigaction(signal, &action, &mut previous) != 0 {
+                    return Err(std::io::Error::last_os_error())
+                        .context("installing seed cancellation handler");
+                }
+                signals.previous.push((signal, previous));
+            }
+        }
+        Ok(signals)
+    }
+
+    pub(crate) fn pending(&self) -> libc::c_int {
+        SEED_SIGNAL.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for SeedSignals {
+    fn drop(&mut self) {
+        for (signal, previous) in &self.previous {
+            // SAFETY: restore the dispositions saved when this guard was created.
+            unsafe {
+                libc::sigaction(*signal, previous, std::ptr::null_mut());
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Handle {

@@ -162,13 +162,15 @@ impl InstallChange {
 
     fn commit(mut self, service: &str) {
         self.committed = true;
-        let cleanup = crate::timing::measure(&format!("{service}: old install cleanup"), || {
-            match self.backup.symlink_metadata() {
+        let cleanup =
+            crate::timing::measure_wait(&format!("{service}: old install cleanup"), || match self
+                .backup
+                .symlink_metadata()
+            {
                 Ok(_) => remove_path(&self.backup),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(error) => Err(error.into()),
-            }
-        });
+            });
         if let Err(error) = cleanup {
             eprintln!(
                 "warning: {service}: old install cleanup failed: {error:#}; \
@@ -335,7 +337,7 @@ pub fn lock_up(cwd: &Path) -> Result<std::fs::File> {
         .truncate(false)
         .write(true)
         .open(directory.join("up.lock"))?;
-    crate::timing::measure("instance up lock wait", || Ok(lock.lock()?))?;
+    crate::timing::measure_wait("instance up lock wait", || Ok(lock.lock()?))?;
     Ok(lock)
 }
 
@@ -849,17 +851,64 @@ impl Instance {
                         )
                     },
                     || {
-                        std::process::Command::new("sh")
+                        use std::os::unix::process::CommandExt;
+                        let timeout = parse_duration(&seed.timeout)?;
+                        let signals = supervise::SeedSignals::capture()?;
+                        let began = std::time::Instant::now();
+                        let mut child = std::process::Command::new("sh")
                             .arg("-c")
                             .arg(&command)
                             .current_dir(&cwd)
                             .envs(&environment)
                             .stdout(std::process::Stdio::from(sink))
                             .stderr(std::process::Stdio::from(errors))
-                            .status()
+                            .process_group(0)
+                            .spawn()
+                            .with_context(|| format!("starting seed {}", seed.name))?;
+                        loop {
+                            let signal = signals.pending();
+                            if signal != 0 {
+                                let group = rustix::process::Pid::from_child(&child);
+                                let _ = rustix::process::kill_process_group(
+                                    group,
+                                    rustix::process::Signal::KILL,
+                                );
+                                child.wait().context("reaping cancelled seed")?;
+                                drop(signals);
+                                // SAFETY: cleanup is complete and the original disposition is restored.
+                                unsafe {
+                                    libc::raise(signal);
+                                }
+                                bail!("seed {} cancelled by signal {signal}", seed.name);
+                            }
+                            if let Some(status) = child.try_wait()? {
+                                break Ok(status);
+                            }
+                            if began.elapsed() >= timeout {
+                                let group = rustix::process::Pid::from_child(&child);
+                                let _ = rustix::process::kill_process_group(
+                                    group,
+                                    rustix::process::Signal::KILL,
+                                );
+                                child.wait().context("reaping timed-out seed")?;
+                                bail!(
+                                    "seed {} timed out after {:.1}s; log: {}\nlast log line: {}\nraise seeds.{}.timeout in .grove.toml, or check mongo with grove health",
+                                    seed.name,
+                                    began.elapsed().as_secs_f64(),
+                                    log.display(),
+                                    tail(&log, 1)
+                                        .filter(|line| !line.is_empty())
+                                        .unwrap_or_else(|| "(no output)".to_string()),
+                                    seed.name
+                                );
+                            }
+                            std::thread::sleep(
+                                std::time::Duration::from_millis(25)
+                                    .min(timeout.saturating_sub(began.elapsed())),
+                            );
+                        }
                     },
-                )
-                .with_context(|| format!("running seed {}: {command}", seed.name))?;
+                )?;
 
                 if !status.success() {
                     let mut message = format!(
@@ -1052,16 +1101,17 @@ impl Instance {
         let command = render::value(command, &context)
             .with_context(|| format!("rendering the command for {}", service.name))?;
         let environment = self.environment()?;
-        let handle = crate::timing::measure(&format!("{}: process start", service.name), || {
-            supervise::spawn(&command, &cwd, &environment, &log)
-        })?;
+        let handle =
+            crate::timing::measure_wait(&format!("{}: process start", service.name), || {
+                supervise::spawn(&command, &cwd, &environment, &log)
+            })?;
         self.entry.services.insert(service.name.clone(), handle);
         self.registry.record(&self.entry)?;
 
         if let Some(ready) = &service.ready {
             let url = render::value(&ready.http, &context)?;
             let timeout = parse_duration(&ready.timeout)?;
-            crate::timing::measure(&format!("{}: readiness", service.name), || {
+            crate::timing::measure_wait(&format!("{}: readiness", service.name), || {
                 supervise::wait_ready(&handle, &url, timeout).map_err(|why| {
                     let tail = tail(&log, 30).unwrap_or_default();
                     // A worktree deleted mid-up makes the service fail on whatever it
@@ -1121,7 +1171,7 @@ impl Instance {
             .copied()
             .filter(supervise::is_alive);
         if let Some(handle) = running {
-            crate::timing::measure(
+            crate::timing::measure_wait(
                 &format!("{}: stop before dependency replacement", service.name),
                 || {
                     supervise::stop(&handle)?;
@@ -1206,7 +1256,7 @@ impl Instance {
             .truncate(false)
             .write(true)
             .open(marker.with_extension("lock"))?;
-        crate::timing::measure(&format!("{name}: setup lock wait"), || {
+        crate::timing::measure_wait(&format!("{name}: setup lock wait"), || {
             Ok(instance_lock.lock()?)
         })?;
         let step = Step {
@@ -1293,16 +1343,18 @@ impl Instance {
         }
         let entry = crate::store::entry(&store, &hash);
         eprintln!("{name}: checking dependency cache ({hash})");
-        let mut lease = crate::timing::measure(&format!("{name}: shared cache lock wait"), || {
-            crate::store::lock_key(&store, &hash, true)
-        })?;
+        let mut lease =
+            crate::timing::measure_wait(&format!("{name}: shared cache lock wait"), || {
+                crate::store::lock_key(&store, &hash, true)
+            })?;
         if no_cache || !entry.exists() {
             drop(lease);
-            lease = crate::timing::measure(&format!("{name}: exclusive cache lock wait"), || {
-                crate::store::lock_key(&store, &hash, false)
-            })?;
+            lease =
+                crate::timing::measure_wait(&format!("{name}: exclusive cache lock wait"), || {
+                    crate::store::lock_key(&store, &hash, false)
+                })?;
             if no_cache {
-                crate::timing::measure(&format!("{name}: cache eviction"), || {
+                crate::timing::measure_wait(&format!("{name}: cache eviction"), || {
                     crate::store::evict(&store, &hash)
                 })?;
             }
@@ -1327,7 +1379,7 @@ impl Instance {
                 let linked = crate::store::link_entry(&store, &hash, &staged)
                     .with_context(|| format!("linking {} from the store", built.display()))?;
                 self.replace_install(service, &built, stopped, |_| {
-                    crate::timing::measure(&format!("{name}: dependency replacement"), || {
+                    crate::timing::measure_wait(&format!("{name}: dependency replacement"), || {
                         std::fs::rename(&staged, &built)?;
                         Ok(())
                     })
@@ -1338,7 +1390,7 @@ impl Instance {
                 let _ = std::fs::remove_dir_all(&staged);
             }
             let linked: crate::store::Linked = result?;
-            crate::timing::measure(&format!("{name}: store entry size"), || {
+            crate::timing::measure_wait(&format!("{name}: store entry size"), || {
                 crate::store::record_bytes(&store, &hash)
             })?;
             eprintln!(
@@ -1364,7 +1416,7 @@ impl Instance {
         if !built.is_dir() {
             bail!("{name}: setup left no {} directory to cache", cache.path);
         }
-        let promoted = crate::timing::measure(&format!("{name}: cache publication"), || {
+        let promoted = crate::timing::measure_wait(&format!("{name}: cache publication"), || {
             crate::store::promote(&built, &store, &hash)
         })
         .with_context(|| format!("storing {}", built.display()))?;

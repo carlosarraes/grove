@@ -191,19 +191,9 @@ pub fn lock_key(store: &Path, hash: &str, shared: bool) -> Result<File> {
     Ok(lock)
 }
 
-/// `GROVE_HEARTBEAT_SECS` exists for the test suite; 15s otherwise.
-fn heartbeat_interval() -> std::time::Duration {
-    let secs = std::env::var("GROVE_HEARTBEAT_SECS")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|secs| *secs > 0.0)
-        .unwrap_or(15.0);
-    std::time::Duration::from_secs_f64(secs)
-}
-
 /// Check the entry inventory after linking, before the caller replaces its install.
 pub fn link_entry(store: &Path, hash: &str, to: &Path) -> Result<Linked> {
-    let count = crate::timing::measure(&format!("cache {hash}: inventory read"), || {
+    let count = crate::timing::measure_wait(&format!("cache {hash}: inventory read"), || {
         std::fs::read_to_string(store.join(hash).join("files"))
             .with_context(|| {
                 format!("store entry {hash} has no complete inventory; run grove up --no-cache")
@@ -214,13 +204,9 @@ pub fn link_entry(store: &Path, hash: &str, to: &Path) -> Result<Linked> {
     })?;
     let progress = AtomicU64::new(0);
     let mut linked = crate::timing::measure(&format!("cache {hash}: tree creation"), || {
-        #[cfg(target_os = "macos")]
-        if std::env::var_os("GROVE_MACOS_CLONE").as_deref() == Some(std::ffi::OsStr::new("1")) {
-            return clone_tree(&entry(store, hash), to);
-        }
         // 5s typical on the Mac, 197s once at load 53 with no output in between.
         crate::timing::with_heartbeat(
-            heartbeat_interval(),
+            crate::timing::heartbeat_interval(),
             |elapsed| {
                 eprintln!(
                     "cache {hash}: still linking, {} of {count} files ({}s)",
@@ -228,10 +214,18 @@ pub fn link_entry(store: &Path, hash: &str, to: &Path) -> Result<Linked> {
                     elapsed.as_secs()
                 )
             },
-            || link_tree_counting(&entry(store, hash), to, &progress),
+            || {
+                #[cfg(target_os = "macos")]
+                if std::env::var_os("GROVE_MACOS_CLONE").as_deref()
+                    == Some(std::ffi::OsStr::new("1"))
+                {
+                    return clone_tree(&entry(store, hash), to);
+                }
+                link_tree_counting(&entry(store, hash), to, &progress)
+            },
         )
     })?;
-    crate::timing::measure(&format!("cache {hash}: inventory validation"), || {
+    crate::timing::measure_wait(&format!("cache {hash}: inventory validation"), || {
         if linked.method == LinkMethod::Clone {
             linked.files = count_files(to)?;
         }

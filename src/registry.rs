@@ -325,7 +325,7 @@ impl Registry {
             .write(true)
             .open(&lock_path)
             .with_context(|| format!("opening {}", lock_path.display()))?;
-        lock.lock()
+        crate::timing::progress("instance registry lock", || lock.lock())
             .with_context(|| format!("locking {}", lock_path.display()))?;
 
         let result = (|| {

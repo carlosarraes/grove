@@ -152,7 +152,7 @@ pub fn ensure(resource: &Resource) -> Result<EnsureResult> {
         .truncate(false)
         .write(true)
         .open(directory.join("init.lock"))?;
-    crate::timing::measure(
+    crate::timing::measure_wait(
         &format!("resource {}: init lock wait", resource.name),
         || Ok(lock.lock()?),
     )?;
@@ -227,9 +227,6 @@ pub fn ensure(resource: &Resource) -> Result<EnsureResult> {
 /// A container that exits ends the wait at once, so the ceiling only bounds a hang.
 const INIT_READY_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// How often a long wait says it is still waiting, so it never looks hung.
-const INIT_PROGRESS_EVERY: Duration = Duration::from_secs(15);
-
 fn run_init(resource: &Resource, id: &str, init: &str) -> Result<()> {
     let mut argv = vec![
         "exec".to_string(),
@@ -248,50 +245,51 @@ fn run_init(resource: &Resource, id: &str, init: &str) -> Result<()> {
     }
     argv.extend(["--eval".to_string(), init.to_string()]);
     let began = std::time::Instant::now();
-    let mut reported = Duration::ZERO;
-    loop {
-        match docker(&argv) {
-            Ok(_) => return Ok(()),
-            Err(error) if is_not_listening(&format!("{error:#}")) => {
-                if let Some(code) = exited(id) {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "`{}` exited with code {code} before it accepted connections;                              `docker logs --tail 50 {}` shows why",
-                            resource.name,
-                            container_name(resource)
-                        )
-                    });
+    crate::timing::with_heartbeat(
+        crate::timing::heartbeat_interval(),
+        |elapsed| {
+            eprintln!(
+                "{}: still starting inside its container ({}s), waiting for mongosh initialization; after an unclean shutdown mongod recovers its journal before it listens",
+                resource.name,
+                elapsed.as_secs()
+            )
+        },
+        || loop {
+            match docker(&argv) {
+                Ok(_) => return Ok(()),
+                Err(error) if is_not_listening(&format!("{error:#}")) => {
+                    if let Some(code) = exited(id) {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "`{}` exited with code {code} before it accepted connections; \
+                                 `docker logs --tail 50 {}` shows why",
+                                resource.name,
+                                container_name(resource)
+                            )
+                        });
+                    }
+                    let waited = began.elapsed();
+                    if waited >= INIT_READY_TIMEOUT {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "`{}` was still refusing connections inside its container after {}s",
+                                resource.name,
+                                INIT_READY_TIMEOUT.as_secs()
+                            )
+                        });
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
                 }
-                let waited = began.elapsed();
-                if waited >= INIT_READY_TIMEOUT {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "`{}` was still refusing connections inside its container after {}s",
-                            resource.name,
-                            INIT_READY_TIMEOUT.as_secs()
-                        )
-                    });
-                }
-                if waited >= reported + INIT_PROGRESS_EVERY {
-                    reported = waited;
-                    eprintln!(
-                        "{}: still starting inside its container ({}s); after an unclean \
-                         shutdown mongod recovers its journal before it listens",
-                        resource.name,
-                        waited.as_secs()
-                    );
-                }
-                std::thread::sleep(Duration::from_millis(500));
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
-        }
-    }
+        },
+    )
 }
 
 /// The exit code of a container Docker reports as stopped. Anything short of that
 /// answer, including Docker failing to say, keeps the wait going.
 fn exited(id: &str) -> Option<i64> {
-    let out = docker_output(&["inspect".to_string(), id.to_string()]).ok()?;
+    let out = docker_output_unmonitored(&["inspect".to_string(), id.to_string()]).ok()?;
     if !out.status.success() {
         return None;
     }
@@ -466,16 +464,24 @@ fn validate_existing(resource: &Resource, container: &ContainerObservation) -> R
 }
 
 fn wait_reachable(resource: &Resource) -> Result<()> {
-    for _ in 0..100 {
-        if is_reachable(resource.port) {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    bail!(
-        "`{}` was started but never answered on port {}",
-        resource.name,
-        resource.port
+    crate::timing::progress(
+        &format!(
+            "resource {}: waiting for host port {}",
+            resource.name, resource.port
+        ),
+        || {
+            for _ in 0..100 {
+                if is_reachable(resource.port) {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            bail!(
+                "`{}` was started but never answered on port {}",
+                resource.name,
+                resource.port
+            )
+        },
     )
 }
 
@@ -634,6 +640,18 @@ fn docker_program() -> OsString {
 }
 
 fn docker_output(argv: &[String]) -> Result<std::process::Output> {
+    // Resource init has one heartbeat across all mongosh attempts and retries.
+    if argv.first().is_some_and(|arg| arg == "exec") {
+        docker_output_unmonitored(argv)
+    } else {
+        let operation = argv.first().map(String::as_str).unwrap_or("command");
+        crate::timing::progress(&format!("shared resource: docker {operation}"), || {
+            docker_output_unmonitored(argv)
+        })
+    }
+}
+
+fn docker_output_unmonitored(argv: &[String]) -> Result<std::process::Output> {
     std::process::Command::new(docker_program())
         .args(argv)
         .output()

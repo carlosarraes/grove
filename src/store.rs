@@ -6,7 +6,7 @@
 use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
@@ -128,7 +128,13 @@ fn link_dir(from: &Path, to: &Path, state: &mut Linked, progress: &AtomicU64) ->
                     {
                         state.method = LinkMethod::Copy;
                     }
-                    Err(e) => return Err(e).with_context(|| format!("linking {}", dst.display())),
+                    Err(e) => {
+                        return Err(contextualize_store_link_error(
+                            e,
+                            format!("linking {}", dst.display()),
+                            &dst,
+                        ));
+                    }
                 }
             }
             std::fs::copy(&src, &dst).with_context(|| format!("copying {}", dst.display()))?;
@@ -254,18 +260,37 @@ fn clone_tree(from: &Path, to: &Path) -> Result<Linked> {
     // Both strings remain valid and NUL-terminated throughout the syscall.
     let result = unsafe { libc::clonefile(source.as_ptr(), destination.as_ptr(), CLONE_NOFOLLOW) };
     if result != 0 {
-        return Err(std::io::Error::last_os_error()).with_context(|| {
+        return Err(contextualize_store_link_error(
+            std::io::Error::last_os_error(),
             format!(
                 "cloning {} to {} (GROVE_MACOS_CLONE=1)",
                 from.display(),
                 to.display()
-            )
-        });
+            ),
+            to,
+        ));
     }
     Ok(Linked {
         method: LinkMethod::Clone,
         files: 0,
     })
+}
+
+fn contextualize_store_link_error(
+    error: io::Error,
+    context: String,
+    destination: &Path,
+) -> anyhow::Error {
+    let storage_full = error.kind() == ErrorKind::StorageFull || error.raw_os_error() == Some(28);
+    let error = anyhow::Error::new(error).context(context);
+    if storage_full {
+        error.context(format!(
+            "the volume is full; free disk space, then retry (filesystem holding destination path: {})",
+            destination.display()
+        ))
+    } else {
+        error
+    }
 }
 
 fn count_files(path: &Path) -> Result<u64> {
@@ -481,5 +506,41 @@ impl Fnv64 {
 
     fn finish(&self) -> u64 {
         self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contextualize_store_link_error;
+    use std::io;
+    use std::path::Path;
+
+    #[test]
+    fn storage_full_link_error_names_destination_and_recovery() {
+        let error = contextualize_store_link_error(
+            io::Error::from_raw_os_error(28),
+            "linking /volume/worktree/node_modules/package/file.js".to_owned(),
+            Path::new("/volume/worktree/node_modules/package/file.js"),
+        );
+
+        let chain = format!("{error:#}");
+        assert!(chain.contains("linking /volume/worktree/node_modules/package/file.js"));
+        assert!(chain.contains("volume is full"));
+        assert!(chain.contains("/volume/worktree/node_modules/package/file.js"));
+        assert!(chain.contains("free disk space, then retry"));
+    }
+
+    #[test]
+    fn other_link_errors_do_not_get_storage_full_hint() {
+        let error = contextualize_store_link_error(
+            io::Error::from(io::ErrorKind::PermissionDenied),
+            "linking /worktree/node_modules/package/file.js".to_owned(),
+            Path::new("/worktree/node_modules/package/file.js"),
+        );
+
+        let chain = format!("{error:#}");
+        assert!(chain.contains("linking /worktree/node_modules/package/file.js"));
+        assert!(!chain.contains("volume is full"));
+        assert!(!chain.contains("free disk space"));
     }
 }

@@ -964,9 +964,14 @@ impl Instance {
     ///
     /// Dependencies first, then seeds, then the services — a seed that writes straight to
     /// the datastore needs the dependencies but not a listening server.
-    pub fn up(&mut self, fresh: bool, no_cache: bool) -> Result<Vec<SeedOutcome>> {
+    pub fn up(
+        &mut self,
+        fresh: bool,
+        no_cache: bool,
+        measure_footprint: bool,
+    ) -> Result<Vec<SeedOutcome>> {
         let mut stopped = BTreeSet::new();
-        let result = self.up_inner(fresh, no_cache, &mut stopped);
+        let result = self.up_inner(fresh, no_cache, measure_footprint, &mut stopped);
         if let Err(mut error) = result {
             for service in self.config.services.clone() {
                 if stopped.contains(&service.name)
@@ -987,10 +992,10 @@ impl Instance {
         &mut self,
         fresh: bool,
         no_cache: bool,
+        measure_footprint: bool,
         stopped: &mut BTreeSet<String>,
     ) -> Result<Vec<SeedOutcome>> {
         self.refuse_taken_ports()?;
-        let mut installed = false;
         let mut keys = Vec::new();
         for service in self.config.services.clone() {
             if let Some(setup) = &service.setup {
@@ -1006,9 +1011,8 @@ impl Instance {
                 .with_context(|| format!("{}: dependency setup failed", service.name))?
                 {
                     SetupOutcome::Skipped => {}
-                    SetupOutcome::Installed => installed = true,
+                    SetupOutcome::Installed => {}
                     SetupOutcome::Linked { hash } | SetupOutcome::Stored { hash } => {
-                        installed = true;
                         keys.push((service.name.clone(), hash));
                     }
                 }
@@ -1018,12 +1022,9 @@ impl Instance {
         for (name, hash) in keys {
             self.entry.cache_keys.insert(name, hash);
         }
-        // Measured here, before anything below can fail: a service that will not start
-        // has still put its dependencies on disk. The second arm is a one-time catch-up
-        // for worktrees whose setup ran under a grove that did not measure — an ordinary
-        // `up` never reruns setup, so without it those would never get a figure.
-        let declares_setup = self.config.services.iter().any(|s| s.setup.is_some());
-        if installed || (declares_setup && self.entry.disk_bytes.is_none()) {
+        // Measure after setup, before anything below can fail, when explicitly requested.
+        // A requested scan also runs when setup was skipped or absent.
+        if measure_footprint {
             eprintln!("measuring dependency footprint");
             self.entry.disk_bytes = crate::timing::measure("dependency footprint", || {
                 Ok(crate::timing::with_heartbeat(

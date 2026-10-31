@@ -360,21 +360,33 @@ fn disk(cwd: &Path, entries: &[Entry]) -> Verdict {
         .filter(|e| e.worktree.exists())
         .filter_map(|e| e.disk_bytes)
         .sum();
+    let unmeasured = entries
+        .iter()
+        .filter(|e| e.worktree.exists() && e.disk_bytes.is_none())
+        .count();
     let Some((total, free)) = df(cwd) else {
-        return Verdict::Warn(format!(
+        let mut what = format!(
             "could not read free space for {}; grove's instances hold {} in dependencies",
             cwd.display(),
             human_size(held)
-        ));
+        );
+        if unmeasured > 0 {
+            what.push_str(&format!(", {unmeasured} unmeasured (grove up --footprint)"));
+        }
+        return Verdict::Warn(what);
     };
     let percent = (free * 100).checked_div(total).unwrap_or(100);
-    let what = format!(
-        "{} free of {} ({percent}%) on the volume holding {}; instances hold {} in private dependencies; store size not measured",
+    let mut what = format!(
+        "{} free of {} ({percent}%) on the volume holding {}; instances hold {} in private dependencies",
         human_size(free),
         human_size(total),
         cwd.display(),
         human_size(held)
     );
+    if unmeasured > 0 {
+        what.push_str(&format!(", {unmeasured} unmeasured (grove up --footprint)"));
+    }
+    what.push_str("; store size not measured");
     if percent < 10 {
         Verdict::Fail {
             what,

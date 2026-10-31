@@ -159,7 +159,7 @@ repo's own fixture or settings constructor.
 | | |
 |---|---|
 | `gate [--no-cache]` | whether `up` here would link or build dependencies, and whether load admits it; exits 0 or 3 |
-| `up [--heavy] [--gate] [--expose] [--expose-host HOST]` | render config, optionally expose opted-in services to the local network, start shared resources and services |
+| `up [--heavy] [--gate] [--footprint] [--expose] [--expose-host HOST]` | render config, optionally measure dependency footprint, expose opted-in services, and start shared resources and services |
 | `down [--purge]` | stop services; `--purge` also drops the database |
 | `down --idle 2h` \| `--all-but-this` | stop instances across the machine, keeping their ports; `--dry-run` names them first |
 | `restart [service]` | replace one service without touching the others |
@@ -172,6 +172,8 @@ repo's own fixture or settings constructor.
 | `seed [--force]` | populate the datastore; markers follow the managed container incarnation, while `--force` rebuilds dirtied data |
 | `prune` | stop and forget instances whose worktree is gone |
 | `doctor` | check everything needed to start, and say what to fix |
+
+Dependency footprint walks are opt-in: `grove up --footprint` measures after setup. Plain `grove up`, `grove ls` and `grove health` do not walk the worktree; `ls` and health read stored figures and label unmeasured instances with the flag to run next.
 
 ## Admit heavy commands by load
 
@@ -361,6 +363,9 @@ distinguish APFS clone blocks from private blocks through that check.
 The private-dependency figures in `ls` and `health` can therefore overstate unique disk use
 and space reclaimable from cloned installs. Those figures are not reliable for clone trials.
 This change does not fix accounting for cloned blocks.
+
+Grove measures private-dependency footprint only when `grove up --footprint` is passed.
+`ls` and `health` read the stored figure; unmeasured instances point to this flag.
 
 ## What it doesn't do
 

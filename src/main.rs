@@ -137,6 +137,9 @@ enum Command {
         /// Restart services that are already running
         #[arg(long)]
         fresh: bool,
+        /// Measure the dependency footprint after setup (walks the worktree; off by default)
+        #[arg(long)]
+        footprint: bool,
         /// Permit running in the main worktree, overwriting its real env files
         #[arg(long)]
         allow_main: bool,
@@ -314,6 +317,7 @@ fn main() -> Result<()> {
             heavy,
             gate,
             fresh,
+            footprint,
             allow_main,
             expose,
             expose_host,
@@ -372,7 +376,7 @@ fn main() -> Result<()> {
                 eprintln!("started shared {started}");
             }
             instance.render_for_up(exposure)?;
-            for outcome in instance.up(fresh, no_cache)? {
+            for outcome in instance.up(fresh, no_cache, footprint)? {
                 eprintln!("{outcome}");
             }
             print_summary(&instance, None, &[]);
@@ -665,7 +669,7 @@ fn main() -> Result<()> {
             }
             // `up` only starts what is not already running, so stopping first is what
             // makes this a restart rather than a no-op.
-            instance.up(false, false)?;
+            instance.up(false, false, false)?;
             print_summary(&instance, None, &[]);
             Ok(())
         }
@@ -1076,24 +1080,27 @@ fn disk_of(entry: &Entry) -> Option<u64> {
     entry.disk_bytes.filter(|_| entry.worktree.exists())
 }
 
-/// Everything setup has put on disk across the machine, and how many instances grove
-/// has not measured, so a total nobody can trust is not presented as one.
+/// Stored private-dependency sizes and how many instances grove has not measured.
 fn disk_footer(entries: &[Entry]) -> Option<String> {
     let measured: Vec<u64> = entries.iter().filter_map(disk_of).collect();
-    if measured.is_empty() {
-        return None;
-    }
     let unmeasured = entries
         .iter()
         .filter(|e| e.worktree.exists() && e.disk_bytes.is_none())
         .count();
-    let mut line = format!(
-        "{} on disk in private dependencies across {} instances",
-        human_size(measured.iter().sum()),
-        measured.len()
-    );
+    if measured.is_empty() && unmeasured == 0 {
+        return None;
+    }
+    let mut line = if measured.is_empty() {
+        "private-dependency footprint: none measured".to_string()
+    } else {
+        format!(
+            "{} on disk in private dependencies across {} instances",
+            human_size(measured.iter().sum()),
+            measured.len()
+        )
+    };
     if unmeasured > 0 {
-        line.push_str(&format!(", {unmeasured} unmeasured"));
+        line.push_str(&format!(", {unmeasured} unmeasured (grove up --footprint)"));
     }
     // The shared trees once, whatever the number of worktrees linking them — the point of
     // the store is that this number stops growing with the fleet. Read from what each

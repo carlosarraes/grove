@@ -544,9 +544,44 @@ impl Instance {
     /// worktree already holds that tree or the store has a published entry for it. Read
     /// only — it takes no cache lock, so a concurrent publish can only turn a full
     /// install into a link, never the reverse.
-    pub fn install_plan(&self, no_cache: bool) -> crate::load::Install {
+    pub fn validate_services(&self, selected: &[String]) -> Result<()> {
+        let unknown: Vec<_> = selected
+            .iter()
+            .filter(|name| {
+                !self
+                    .config
+                    .services
+                    .iter()
+                    .any(|service| &service.name == *name)
+            })
+            .collect();
+        if unknown.is_empty() {
+            return Ok(());
+        }
+        let configured = self
+            .config
+            .services
+            .iter()
+            .map(|service| service.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "unknown service {} (configured services: {configured})",
+            unknown
+                .iter()
+                .map(|name| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+
+    pub fn service_selected(name: &str, selected: &[String]) -> bool {
+        selected.is_empty() || selected.iter().any(|selected| selected == name)
+    }
+
+    pub fn install_plan(&self, no_cache: bool, selected: &[String]) -> crate::load::Install {
         use crate::load::Install;
-        let plans = self.setup_install_plan(no_cache);
+        let plans = self.setup_install_plan(no_cache, selected);
         let cached: Vec<_> = plans
             .iter()
             .filter(|(_, plan)| !matches!(plan, SetupInstallPlan::NoCache))
@@ -570,11 +605,16 @@ impl Instance {
     }
 
     /// Per-service view of the same cache decision used by `install_plan` and setup.
-    pub fn setup_install_plan(&self, no_cache: bool) -> Vec<(String, SetupInstallPlan)> {
+    pub fn setup_install_plan(
+        &self,
+        no_cache: bool,
+        selected: &[String],
+    ) -> Vec<(String, SetupInstallPlan)> {
         let store = crate::store::dir();
         self.config
             .services
             .iter()
+            .filter(|service| Self::service_selected(&service.name, selected))
             .filter_map(|service| {
                 let setup = service.setup.as_ref()?;
                 let Some(cache) = &service.cache else {
@@ -1015,9 +1055,10 @@ impl Instance {
         fresh: bool,
         no_cache: bool,
         measure_footprint: bool,
+        selected: &[String],
     ) -> Result<Vec<SeedOutcome>> {
         let mut stopped = BTreeSet::new();
-        let result = self.up_inner(fresh, no_cache, measure_footprint, &mut stopped);
+        let result = self.up_inner(fresh, no_cache, measure_footprint, selected, &mut stopped);
         if let Err(mut error) = result {
             for service in self.config.services.clone() {
                 if stopped.contains(&service.name)
@@ -1039,9 +1080,11 @@ impl Instance {
         &mut self,
         no_cache: bool,
         measure_footprint: bool,
+        selected: &[String],
     ) -> Result<Vec<(crate::config::Service, SetupOutcome)>> {
         let mut stopped = BTreeSet::new();
-        let result = self.setup_dependencies(no_cache, measure_footprint, true, &mut stopped);
+        let result =
+            self.setup_dependencies(no_cache, measure_footprint, true, selected, &mut stopped);
         match result {
             Ok(outcomes) => {
                 let mut recovery_error: Option<anyhow::Error> = None;
@@ -1082,12 +1125,20 @@ impl Instance {
         fresh: bool,
         no_cache: bool,
         measure_footprint: bool,
+        selected: &[String],
         stopped: &mut BTreeSet<String>,
     ) -> Result<Vec<SeedOutcome>> {
         self.refuse_taken_ports()?;
-        self.setup_dependencies(no_cache, measure_footprint, false, stopped)?;
-        let seeded = self.seed(false)?;
+        self.setup_dependencies(no_cache, measure_footprint, false, selected, stopped)?;
+        let seeded = if selected.is_empty() {
+            self.seed(false)?
+        } else {
+            Vec::new()
+        };
         for service in self.config.services.clone() {
+            if !Self::service_selected(&service.name, selected) {
+                continue;
+            }
             self.start_service(&service, fresh)?;
             stopped.remove(&service.name);
         }
@@ -1099,11 +1150,15 @@ impl Instance {
         no_cache: bool,
         measure_footprint: bool,
         quiet_command: bool,
+        selected: &[String],
         stopped: &mut BTreeSet<String>,
     ) -> Result<Vec<(crate::config::Service, SetupOutcome)>> {
         let mut keys = Vec::new();
         let mut outcomes = Vec::new();
         for service in self.config.services.clone() {
+            if !Self::service_selected(&service.name, selected) {
+                continue;
+            }
             if let Some(setup) = &service.setup {
                 let cwd = match &service.cwd {
                     Some(dir) => self.resolved.worktree.join(dir),

@@ -158,6 +158,9 @@ enum Command {
         /// Reinstall dependencies from scratch and replace the store entry they came from
         #[arg(long)]
         no_cache: bool,
+        /// Limit setup/start to named services (repeatable)
+        #[arg(long = "service", value_name = "NAME", action = clap::ArgAction::Append)]
+        services: Vec<String>,
     },
     /// Stop this instance's services, or the named one's
     Down {
@@ -200,6 +203,9 @@ enum Command {
         /// Judge as `up --no-cache` would: always a full install
         #[arg(long)]
         no_cache: bool,
+        /// Limit setup/start to named services (repeatable)
+        #[arg(long = "service", value_name = "NAME", action = clap::ArgAction::Append)]
+        services: Vec<String>,
     },
     /// Every instance on this machine
     #[command(visible_alias = "list", alias = "instances")]
@@ -314,9 +320,11 @@ fn main() -> Result<()> {
             name,
             worktree,
             no_cache,
+            services,
         }) => {
             let instance = Instance::open(&target(name.as_deref().or(worktree.as_deref()), &cwd)?)?;
-            let install = instance.install_plan(no_cache);
+            instance.validate_services(&services)?;
+            let install = instance.install_plan(no_cache, &services);
             let verdict = grove::load::judge(
                 &install,
                 &instance.config.admission.clone().unwrap_or_default(),
@@ -340,6 +348,7 @@ fn main() -> Result<()> {
             expose,
             expose_host,
             no_cache,
+            services,
         }) => {
             let _up_lock = grove::instance::lock_up(&cwd)?;
             let exposure = if setup_only {
@@ -352,6 +361,7 @@ fn main() -> Result<()> {
                 }
             };
             let mut instance = Instance::open(&cwd)?;
+            instance.validate_services(&services)?;
             if !allow_main {
                 instance.refuse_in_main()?;
             }
@@ -367,7 +377,7 @@ fn main() -> Result<()> {
                 None
             };
             if gate {
-                let install = instance.install_plan(no_cache);
+                let install = instance.install_plan(no_cache, &services);
                 grove::load::wait_for_install_gate(
                     &install,
                     &instance.config.admission.clone().unwrap_or_default(),
@@ -390,7 +400,7 @@ fn main() -> Result<()> {
 
             if setup_only {
                 if dry_run {
-                    let plans = instance.setup_install_plan(no_cache);
+                    let plans = instance.setup_install_plan(no_cache, &services);
                     for (name, plan) in &plans {
                         eprintln!("{}", setup_plan_line(name, plan));
                     }
@@ -400,7 +410,7 @@ fn main() -> Result<()> {
                     );
                 } else {
                     instance.render()?;
-                    let outcomes = instance.setup_only(no_cache, footprint)?;
+                    let outcomes = instance.setup_only(no_cache, footprint, &services)?;
                     for (service, outcome) in outcomes {
                         eprintln!("{}", setup_outcome_line(&service, outcome));
                     }
@@ -410,7 +420,9 @@ fn main() -> Result<()> {
                             .config
                             .services
                             .iter()
-                            .filter(|s| s.setup.is_some())
+                            .filter(|s| {
+                                s.setup.is_some() && Instance::service_selected(&s.name, &services)
+                            })
                             .count()
                     );
                 }
@@ -429,7 +441,7 @@ fn main() -> Result<()> {
                     eprintln!("started shared {started}");
                 }
                 instance.render_for_up(exposure)?;
-                for outcome in instance.up(fresh, no_cache, footprint)? {
+                for outcome in instance.up(fresh, no_cache, footprint, &services)? {
                     eprintln!("{outcome}");
                 }
                 print_summary(&instance, None, &[]);
@@ -723,7 +735,7 @@ fn main() -> Result<()> {
             }
             // `up` only starts what is not already running, so stopping first is what
             // makes this a restart rather than a no-op.
-            instance.up(false, false, false)?;
+            instance.up(false, false, false, &[])?;
             print_summary(&instance, None, &[]);
             Ok(())
         }

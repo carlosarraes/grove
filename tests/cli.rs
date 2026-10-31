@@ -3875,6 +3875,134 @@ fn installs(cli: &Cli) -> usize {
         .unwrap_or(0)
 }
 
+#[test]
+fn setup_only_can_select_one_service() {
+    let config = r#"
+version = 1
+
+[[service]]
+name = "backend"
+setup = "mkdir -p backend-env && touch backend-env/installed"
+
+[[service]]
+name = "frontend"
+setup = "mkdir -p frontend-deps && touch frontend-deps/installed"
+"#;
+    let cli = Cli::with_config(config);
+    let wt = cli.worktree("selected_setup");
+
+    let output = cli
+        .run(&wt, &["up", "--setup-only", "--service", "backend"])
+        .success()
+        .get_output()
+        .clone();
+    let terminal = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(wt.join("backend-env/installed").exists(), "{terminal}");
+    assert!(!wt.join("frontend-deps").exists(), "{terminal}");
+    assert!(
+        terminal.contains("setup-only: 1 services set up, 0 started"),
+        "{terminal}"
+    );
+}
+
+#[test]
+fn up_starts_only_selected_service() {
+    let config = r#"
+version = 1
+
+[[service]]
+name = "backend"
+command = "touch backend-started && sleep 60"
+
+[[service]]
+name = "frontend"
+command = "touch frontend-started && sleep 60"
+"#;
+    let cli = Cli::with_config(config);
+    let wt = cli.worktree("selected_start");
+
+    cli.run(&wt, &["up", "--service", "backend"]).success();
+
+    assert!(wt.join("backend-started").exists());
+    assert!(!wt.join("frontend-started").exists());
+}
+
+#[test]
+fn up_rejects_an_unknown_selected_service_with_configured_names() {
+    let config = r#"
+version = 1
+[[service]]
+name = "backend"
+[[service]]
+name = "frontend"
+"#;
+    let cli = Cli::with_config(config);
+    let wt = cli.worktree("unknown_service");
+
+    let output = cli
+        .run(&wt, &["up", "--service", "nosuch", "--setup-only"])
+        .failure();
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+
+    assert!(stderr.contains("nosuch"), "{stderr}");
+    assert!(
+        stderr.contains("backend") && stderr.contains("frontend"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn gate_uses_only_selected_services_install_plans() {
+    let config = r#"
+version = 1
+
+[[service]]
+name = "backend"
+setup = "mkdir -p backend-deps && touch backend-deps/installed"
+[service.cache]
+path = "backend-deps"
+key = ["backend.lock"]
+
+[[service]]
+name = "frontend"
+setup = "mkdir -p frontend-deps && touch frontend-deps/installed"
+[service.cache]
+path = "frontend-deps"
+key = ["frontend.lock"]
+"#;
+    let cli = Cli::with_config(config);
+    std::fs::write(cli.fx.main.join("backend.lock"), "backend-input\n").unwrap();
+    std::fs::write(cli.fx.main.join("frontend.lock"), "frontend-input\n").unwrap();
+    common::git(&cli.fx.main, &["add", "backend.lock", "frontend.lock"]);
+    common::git(&cli.fx.main, &["commit", "-m", "add service inputs"]);
+
+    let primed = cli.worktree("selected_gate_primed");
+    cli.run(&primed, &["up", "--setup-only", "--service", "backend"])
+        .success();
+    let candidate = cli.worktree("selected_gate_candidate");
+    let output = cli
+        .run_env(
+            &candidate,
+            &[("GROVE_LOAD", "48"), ("GROVE_LOAD15", "52")],
+            &["gate", "--service", "backend"],
+        )
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert!(
+        String::from_utf8_lossy(&output).contains("load gate: link-only"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
 /// The install gate holds a build at 25/35 but lets an up that only links from the store
 /// through at 60/60, decided from the store key the lockfile produces, and says which.
 #[test]

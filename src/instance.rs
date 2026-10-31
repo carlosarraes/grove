@@ -3,6 +3,7 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::config::{self, Config};
@@ -823,13 +824,18 @@ impl Instance {
                     )?;
                 }
             }
-            std::fs::create_dir_all(self.instance_dir())?;
+            let instance_dir = self.instance_dir();
+            std::fs::create_dir_all(&instance_dir)?;
+            std::fs::set_permissions(&instance_dir, std::fs::Permissions::from_mode(0o700))?;
             let log = self.instance_dir().join(format!("seed-{}.log", seed.name));
+            use std::os::unix::fs::OpenOptionsExt;
             let sink = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
+                .mode(0o600)
                 .open(&log)
                 .with_context(|| format!("opening {}", log.display()))?;
+            std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o600))?;
             let errors = sink.try_clone().context("duplicating the log handle")?;
 
             eprintln!("seed {}: running (log: {})", seed.name, log.display());
@@ -892,13 +898,10 @@ impl Instance {
                                 );
                                 child.wait().context("reaping timed-out seed")?;
                                 bail!(
-                                    "seed {} timed out after {:.1}s; log: {}\nlast log line: {}\nraise seeds.{}.timeout in .grove.toml, or check mongo with grove health",
+                                    "seed {} timed out after {:.1}s; full output in {}\nraise seeds.{}.timeout in .grove.toml, or check mongo with grove health",
                                     seed.name,
                                     began.elapsed().as_secs_f64(),
                                     log.display(),
-                                    tail(&log, 1)
-                                        .filter(|line| !line.is_empty())
-                                        .unwrap_or_else(|| "(no output)".to_string()),
                                     seed.name
                                 );
                             }
@@ -912,7 +915,7 @@ impl Instance {
 
                 if !status.success() {
                     let mut message = format!(
-                        "seed {} failed: {command}\nfull output in {}",
+                        "seed {} failed\nfull output in {}",
                         seed.name,
                         log.display()
                     );
@@ -923,7 +926,6 @@ impl Instance {
                         message.push_str(&format!("\nfirst error: {error}"));
                     }
                     message.push('\n');
-                    message.push_str(&tail(&log, 30).unwrap_or_default());
                     bail!("{message}");
                 }
                 Ok(())

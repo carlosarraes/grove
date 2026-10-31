@@ -406,12 +406,13 @@ PyMongo stops the seed with an error. The probe never uses `docker exec`.
 The readiness deadline is 180 seconds per resource before each seed, with attempts
 bounded to five seconds. The log reports readiness time separately from seed time.
 Skipped seeds need no probe. Grove does not replay a failed seed automatically.
+Seed logs are private (0600, directory 0700); the terminal shows status, heartbeat and the first error line only; read the log for the rest.
 An OOM or disconnect after the probe can still fail a seed.
 
 Each `[[seed]]` accepts a positive `timeout` duration, default `"20m"`, using the
 same units as `ready.timeout`. This bounds the seed command after Mongo readiness.
 When the deadline expires, Grove kills the seed's process group and fails `up`.
-The error names the seed, elapsed time, log path, last log line, and recovery steps.
+The error names the seed, elapsed time, log path, and recovery steps.
 
 Ordinary `grove health` reports available disk space and recorded instance usage,
 but labels the store size as unmeasured. It does not recursively scan the store

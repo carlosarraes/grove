@@ -1188,6 +1188,99 @@ fn list_shows_known_and_unknown_owners_in_text_and_json() {
 }
 
 #[test]
+fn seed_logs_are_private_and_secret_output_stays_in_the_log() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let cli = Cli::with_config(
+        r#"
+version = 1
+[[seed]]
+name = "private"
+command = "echo portal code ZZTESTCODE42"
+"#,
+    );
+    let wt = cli.worktree("private_seed_log");
+    let output = cli.run(&wt, &["up"]).success().get_output().clone();
+    let terminal = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!terminal.contains("ZZTESTCODE42"), "{terminal}");
+
+    let entry = registry_of(&cli).get(&wt).unwrap().unwrap();
+    let dir = entry.instance_dir.unwrap();
+    let log = dir.join("seed-private.log");
+    assert!(terminal.contains(&format!("log: {}", log.display())));
+    assert!(
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("ZZTESTCODE42")
+    );
+    assert_eq!(
+        std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(&log).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn failed_seed_shows_first_error_but_not_raw_output_and_repairs_old_log_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let cli = Cli::with_config(
+        r#"
+version = 1
+[[seed]]
+name = "broken"
+command = "echo portal code ZZTESTCODE42; echo 'Error: expected failure' >&2; exit 7"
+"#,
+    );
+    let wt = cli.worktree("private_failed_seed_log");
+    let output = cli.run(&wt, &["up"]).failure().get_output().clone();
+    let terminal = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!terminal.contains("ZZTESTCODE42"), "{terminal}");
+    assert!(
+        terminal.contains("first error: Error: expected failure"),
+        "{terminal}"
+    );
+
+    let entry = registry_of(&cli).get(&wt).unwrap().unwrap();
+    let dir = entry.instance_dir.unwrap();
+    let log = dir.join("seed-broken.log");
+    assert!(terminal.contains(&format!("full output in {}", log.display())));
+    assert!(
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("ZZTESTCODE42")
+    );
+    assert_eq!(
+        std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let rerun = cli.run(&wt, &["up"]).failure().get_output().clone();
+    let rerun_terminal = format!(
+        "{}{}",
+        String::from_utf8_lossy(&rerun.stdout),
+        String::from_utf8_lossy(&rerun.stderr)
+    );
+    assert!(!rerun_terminal.contains("ZZTESTCODE42"), "{rerun_terminal}");
+    assert_eq!(
+        std::fs::metadata(&log).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
 fn seed_timeout_fails_fast_reports_the_log_and_reaps_sleep() {
     let cli = Cli::with_config(
         r#"
@@ -1195,7 +1288,7 @@ version = 1
 [[seed]]
 name = "slow"
 timeout = "1s"
-command = "echo $$ > sleep.pid; echo seed-tail-marker; exec sleep 30"
+command = "echo $$ > sleep.pid; echo portal code ZZTESTCODE42; exec sleep 30"
 "#,
     );
     let wt = cli.worktree("seed_timeout");
@@ -1203,6 +1296,7 @@ command = "echo $$ > sleep.pid; echo seed-tail-marker; exec sleep 30"
     let output = cli.run(&wt, &["up"]).failure().get_output().clone();
     assert!(began.elapsed() < std::time::Duration::from_secs(5));
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let terminal = format!("{}{}", String::from_utf8_lossy(&output.stdout), stderr);
     let elapsed: f64 = stderr
         .split("seed slow timed out after ")
         .nth(1)
@@ -1218,13 +1312,11 @@ command = "echo $$ > sleep.pid; echo seed-tail-marker; exec sleep 30"
         .unwrap()
         .join("seed-slow.log");
     assert!(
-        stderr.contains(&format!("log: {}", log.display())),
-        "{stderr}"
+        terminal.contains(&format!("full output in {}", log.display())),
+        "{terminal}"
     );
-    assert!(
-        stderr.contains("last log line: seed-tail-marker"),
-        "{stderr}"
-    );
+    assert!(!terminal.contains("ZZTESTCODE42"), "{terminal}");
+    assert!(!terminal.contains("last log line:"), "{terminal}");
     assert!(
         stderr
             .contains("raise seeds.slow.timeout in .grove.toml, or check mongo with grove health"),
@@ -1240,6 +1332,19 @@ command = "echo $$ > sleep.pid; echo seed-tail-marker; exec sleep 30"
         "sleep {pid} survived"
     );
     assert!(!log.parent().unwrap().join(".seed-slow").exists());
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(log.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(&log).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 }
 
 #[test]
@@ -4456,7 +4561,12 @@ fn phase_durations_report_failed_seeds_without_changing_the_exit_status() {
     let entry = registry_of(&cli).get(&wt).unwrap().unwrap();
     let log = entry.instance_dir.unwrap().join("seed-broken.log");
     assert!(stderr.contains(&format!("full output in {}", log.display())));
-    assert!(stderr.contains("seed-tail-marker"));
+    assert!(!stderr.contains("seed-tail-marker"));
+    assert!(
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("seed-tail-marker")
+    );
     assert!(!stderr.contains("timing: web: process start:"));
 }
 

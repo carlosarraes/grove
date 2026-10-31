@@ -629,12 +629,213 @@ fn up_help_names_network_exposure_and_its_host_override() {
     assert!(stdout.contains("--expose"), "{stdout}");
     assert!(stdout.contains("--expose-host <HOST>"), "{stdout}");
     assert!(stdout.contains("--footprint"), "{stdout}");
+    assert!(stdout.contains("--setup-only"), "{stdout}");
+    assert!(stdout.contains("--dry-run"), "{stdout}");
     assert!(
         stdout.contains("walks the worktree; off by default"),
         "{stdout}"
     );
     assert!(stdout.contains("local network"), "{stdout}");
     assert!(stdout.contains("default-route"), "{stdout}");
+}
+
+#[test]
+fn setup_only_stores_and_links_dependencies_without_starting_services() {
+    let config = format!(
+        "{CACHE_CONFIG}\n[[resource]]\nname = \"mongo\"\nkind = \"docker-shared\"\nimage = \"mongo:8\"\nport = 27017\n\n[[seed]]\nname = \"sample\"\ncommand = \"touch seed-ran\"\n"
+    );
+    let cli = Cli::with_fake_docker(&config, "setup-only-mongo");
+    cli.docker.as_ref().unwrap().set_container(
+        "setup-only-mongo",
+        false,
+        0,
+        Some((64_000, 64_000)),
+    );
+    with_lockfile(&cli, "setup-only-lock\n");
+    let first = cli.worktree("setup_first");
+    let output = cli
+        .run(&first, &["up", "--setup-only"])
+        .success()
+        .get_output()
+        .clone();
+    let terminal = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        terminal.contains("web: cache miss, installed and stored"),
+        "{terminal}"
+    );
+    assert!(
+        terminal.contains("setup-only: 1 services set up, 0 started"),
+        "{terminal}"
+    );
+    assert!(!terminal.contains("started shared"), "{terminal}");
+    assert!(!first.join("seed-ran").exists());
+    assert!(!terminal.contains("mkdir -p node_modules"), "{terminal}");
+    assert_eq!(installs(&cli), 1);
+    let status = cli
+        .run(&first, &["status"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status = String::from_utf8_lossy(&status);
+    assert!(
+        status.contains("web") && status.contains("stopped"),
+        "{status}"
+    );
+    let stored_hash = registry_of(&cli).get(&first).unwrap().unwrap().cache_keys["web"].clone();
+    assert!(terminal.contains(&stored_hash[..8]), "{terminal}");
+    assert!(!terminal.contains(&stored_hash), "{terminal}");
+
+    let second = cli.worktree("setup_second");
+    let output = cli
+        .run(&second, &["up", "--setup-only"])
+        .success()
+        .get_output()
+        .clone();
+    let terminal = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        terminal.contains("web: cache hit, linked node_modules from store"),
+        "{terminal}"
+    );
+    assert!(
+        terminal.contains("setup-only: 1 services set up, 0 started"),
+        "{terminal}"
+    );
+    assert_eq!(installs(&cli), 1);
+}
+
+#[test]
+fn setup_only_rejects_fresh_and_exposure_options() {
+    let cli = Cli::new();
+    let wt = cli.worktree("setup_conflicts");
+    cli.run(&wt, &["up", "--setup-only", "--fresh"])
+        .failure()
+        .code(2);
+    cli.run(&wt, &["up", "--setup-only", "--expose"])
+        .failure()
+        .code(2);
+    cli.run(&wt, &["up", "--setup-only", "--expose-host", "dev.local"])
+        .failure()
+        .code(2);
+    cli.run(&wt, &["up", "--dry-run"]).failure().code(2);
+}
+
+#[test]
+fn setup_only_and_plain_up_share_store_entries_in_both_directions() {
+    let cli = Cli::with_config(CACHE_CONFIG);
+    with_lockfile(&cli, "shared-cache-input\n");
+    let setup_first = cli.worktree("setup_first");
+    cli.run(&setup_first, &["up", "--setup-only"]).success();
+    let plain_second = cli.worktree("plain_second");
+    let plain = cli
+        .run(&plain_second, &["up"])
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    assert!(
+        String::from_utf8_lossy(&plain).contains("linking dependencies from the store"),
+        "{}",
+        String::from_utf8_lossy(&plain)
+    );
+    cli.run(&plain_second, &["down"]).success();
+    assert_eq!(installs(&cli), 1);
+
+    let plain_first = cli.worktree("plain_first");
+    std::fs::write(
+        plain_first.join("package-lock.json"),
+        "second-cache-input\n",
+    )
+    .unwrap();
+    cli.run(&plain_first, &["up"]).success();
+    cli.run(&plain_first, &["down"]).success();
+    let setup_second = cli.worktree("setup_second");
+    std::fs::write(
+        setup_second.join("package-lock.json"),
+        "second-cache-input\n",
+    )
+    .unwrap();
+    let setup = cli
+        .run(&setup_second, &["up", "--setup-only"])
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    assert!(
+        String::from_utf8_lossy(&setup).contains("web: cache hit, linked node_modules from store"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert_eq!(installs(&cli), 2);
+}
+
+#[test]
+fn setup_only_dry_run_reports_cache_decisions_without_changing_the_worktree() {
+    let cli = Cli::with_config(CACHE_CONFIG);
+    with_lockfile(&cli, "dry-run-cache-input\n");
+    let miss = cli.worktree("dry_miss");
+    let output = cli
+        .run(&miss, &["up", "--setup-only", "--dry-run"])
+        .success()
+        .get_output()
+        .clone();
+    let terminal = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        terminal.contains("web: cache miss (full install)"),
+        "{terminal}"
+    );
+    assert!(terminal.contains("setup-only dry-run"), "{terminal}");
+    assert!(!terminal.contains("package-lock.json"), "{terminal}");
+    assert!(!terminal.contains("mkdir -p node_modules"), "{terminal}");
+    assert!(!miss.join("node_modules").exists());
+    assert_eq!(installs(&cli), 0);
+
+    let primed = cli.worktree("dry_primed");
+    cli.run(&primed, &["up", "--setup-only"]).success();
+    let hit = cli.worktree("dry_hit");
+    let output = cli
+        .run(&hit, &["up", "--setup-only", "--dry-run"])
+        .success()
+        .get_output()
+        .clone();
+    let terminal = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        terminal.contains("web: cache hit (link-only)"),
+        "{terminal}"
+    );
+    assert!(!hit.join("node_modules").exists());
+    assert_eq!(installs(&cli), 1);
+}
+
+#[test]
+fn setup_only_restarts_a_service_stopped_for_dependency_replacement() {
+    let cli = writer_fixture();
+    let wt = cli.worktree("setup_writer");
+    cli.run(&wt, &["up"]).success();
+    let old = service_pid(&cli, &wt, "web");
+    std::fs::write(wt.join("package-lock.json"), "changed lock\n").unwrap();
+    let output = cli
+        .run(&wt, &["up", "--setup-only"])
+        .success()
+        .get_output()
+        .clone();
+    assert_ne!(service_pid(&cli, &wt, "web"), old);
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("setup-only: 1 services set up, 0 started")
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("stops")).unwrap(),
+        "old:True\n"
+    );
 }
 
 /// The headline: a worktree with no env file, no ports, and no setup becomes a running

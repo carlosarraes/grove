@@ -119,11 +119,24 @@ enum SeedDecision {
 /// How one blocking step of `up` names itself while it runs and when it fails.
 /// What `setup` did for one service, so `up` knows whether the tree on disk is new and
 /// which store entry it came from.
-enum SetupOutcome {
+pub enum SetupOutcome {
     Skipped,
     Installed,
     Linked { hash: String },
     Stored { hash: String },
+}
+
+#[derive(Clone, Copy)]
+struct SetupMode {
+    no_cache: bool,
+    quiet_command: bool,
+}
+
+pub enum SetupInstallPlan {
+    NoCache,
+    LinkOnly,
+    AlreadyInPlace,
+    FullInstall(String),
 }
 
 /// A directory, a file, or a symlink — whatever `setup` or an earlier link left there.
@@ -533,45 +546,78 @@ impl Instance {
     /// install into a link, never the reverse.
     pub fn install_plan(&self, no_cache: bool) -> crate::load::Install {
         use crate::load::Install;
-        let store = match crate::store::dir() {
-            Ok(store) => store,
-            Err(e) => return Install::Full(format!("cannot locate the store: {e}")),
-        };
-        let mut linking = Vec::new();
-        let mut cached = 0;
-        for service in &self.config.services {
-            let (Some(setup), Some(cache)) = (&service.setup, &service.cache) else {
-                continue;
-            };
-            cached += 1;
-            let name = &service.name;
-            if no_cache {
-                return Install::Full(format!("--no-cache rebuilds {name}"));
-            }
-            let cwd = match &service.cwd {
-                Some(dir) => self.resolved.worktree.join(dir),
-                None => self.resolved.worktree.clone(),
-            };
-            let hash = match crate::store::key(&cwd, cache, setup) {
-                Ok(hash) => hash,
-                Err(_) => return Install::Full(format!("{name} lockfile unreadable")),
-            };
-            let marker = self.instance_dir().join(format!(".setup-{name}"));
-            if cwd.join(&cache.path).is_dir()
-                && std::fs::read_to_string(&marker).ok().as_deref() == Some(hash.as_str())
-            {
-                continue;
-            }
-            if !crate::store::entry(&store, &hash).is_dir() {
-                return Install::Full(format!("{name} lockfile not in store, {hash}"));
-            }
-            linking.push(name.clone());
+        let plans = self.setup_install_plan(no_cache);
+        let cached: Vec<_> = plans
+            .iter()
+            .filter(|(_, plan)| !matches!(plan, SetupInstallPlan::NoCache))
+            .collect();
+        if cached.is_empty() {
+            return Install::Full("no cached dependencies to link".to_string());
         }
-        match (cached, linking.is_empty()) {
-            (0, _) => Install::Full("no cached dependencies to link".to_string()),
-            (_, true) => Install::LinkOnly("dependencies already in place".to_string()),
-            (_, false) => Install::LinkOnly("lockfile matches store".to_string()),
+        for (_, plan) in &cached {
+            if let SetupInstallPlan::FullInstall(reason) = plan {
+                return Install::Full(reason.clone());
+            }
         }
+        if cached
+            .iter()
+            .any(|(_, plan)| matches!(plan, SetupInstallPlan::LinkOnly))
+        {
+            Install::LinkOnly("lockfile matches store".to_string())
+        } else {
+            Install::LinkOnly("dependencies already in place".to_string())
+        }
+    }
+
+    /// Per-service view of the same cache decision used by `install_plan` and setup.
+    pub fn setup_install_plan(&self, no_cache: bool) -> Vec<(String, SetupInstallPlan)> {
+        let store = crate::store::dir();
+        self.config
+            .services
+            .iter()
+            .filter_map(|service| {
+                let setup = service.setup.as_ref()?;
+                let Some(cache) = &service.cache else {
+                    return Some((service.name.clone(), SetupInstallPlan::NoCache));
+                };
+                let plan = if no_cache {
+                    SetupInstallPlan::FullInstall(format!("--no-cache rebuilds {}", service.name))
+                } else if let Err(error) = &store {
+                    SetupInstallPlan::FullInstall(format!("cannot locate the store: {error}"))
+                } else {
+                    let cwd = match &service.cwd {
+                        Some(dir) => self.resolved.worktree.join(dir),
+                        None => self.resolved.worktree.clone(),
+                    };
+                    match crate::store::key(&cwd, cache, setup) {
+                        Err(_) => SetupInstallPlan::FullInstall(format!(
+                            "{} lockfile unreadable",
+                            service.name
+                        )),
+                        Ok(hash) => {
+                            let marker =
+                                self.instance_dir().join(format!(".setup-{}", service.name));
+                            if cwd.join(&cache.path).is_dir()
+                                && std::fs::read_to_string(&marker).ok().as_deref()
+                                    == Some(hash.as_str())
+                            {
+                                SetupInstallPlan::AlreadyInPlace
+                            } else if crate::store::entry(store.as_ref().expect("checked"), &hash)
+                                .is_dir()
+                            {
+                                SetupInstallPlan::LinkOnly
+                            } else {
+                                SetupInstallPlan::FullInstall(format!(
+                                    "{} lockfile not in store, {hash}",
+                                    service.name
+                                ))
+                            }
+                        }
+                    }
+                };
+                Some((service.name.clone(), plan))
+            })
+            .collect()
     }
 
     pub fn db_name(&self) -> Option<String> {
@@ -988,6 +1034,49 @@ impl Instance {
         result
     }
 
+    /// Run only dependency setup, restoring any live services stopped for safe replacement.
+    pub fn setup_only(
+        &mut self,
+        no_cache: bool,
+        measure_footprint: bool,
+    ) -> Result<Vec<(crate::config::Service, SetupOutcome)>> {
+        let mut stopped = BTreeSet::new();
+        let result = self.setup_dependencies(no_cache, measure_footprint, true, &mut stopped);
+        match result {
+            Ok(outcomes) => {
+                let mut recovery_error: Option<anyhow::Error> = None;
+                for service in self.config.services.clone() {
+                    if stopped.contains(&service.name)
+                        && let Err(error) = self.start_service(&service, false)
+                    {
+                        let error = anyhow::anyhow!("{}: {error:#}", service.name);
+                        recovery_error = Some(match recovery_error {
+                            Some(previous) => previous.context(error.to_string()),
+                            None => error,
+                        });
+                    }
+                }
+                match recovery_error {
+                    Some(error) => Err(error),
+                    None => Ok(outcomes),
+                }
+            }
+            Err(mut error) => {
+                for service in self.config.services.clone() {
+                    if stopped.contains(&service.name)
+                        && let Err(recovery) = self.start_service(&service, false)
+                    {
+                        error = error.context(format!(
+                            "{}: service recovery also failed: {recovery:#}",
+                            service.name
+                        ));
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
     fn up_inner(
         &mut self,
         fresh: bool,
@@ -996,7 +1085,24 @@ impl Instance {
         stopped: &mut BTreeSet<String>,
     ) -> Result<Vec<SeedOutcome>> {
         self.refuse_taken_ports()?;
+        self.setup_dependencies(no_cache, measure_footprint, false, stopped)?;
+        let seeded = self.seed(false)?;
+        for service in self.config.services.clone() {
+            self.start_service(&service, fresh)?;
+            stopped.remove(&service.name);
+        }
+        Ok(seeded)
+    }
+
+    fn setup_dependencies(
+        &mut self,
+        no_cache: bool,
+        measure_footprint: bool,
+        quiet_command: bool,
+        stopped: &mut BTreeSet<String>,
+    ) -> Result<Vec<(crate::config::Service, SetupOutcome)>> {
         let mut keys = Vec::new();
+        let mut outcomes = Vec::new();
         for service in self.config.services.clone() {
             if let Some(setup) = &service.setup {
                 let cwd = match &service.cwd {
@@ -1004,24 +1110,40 @@ impl Instance {
                     None => self.resolved.worktree.clone(),
                 };
                 let log = self.instance_dir().join(format!("{}.log", service.name));
-                eprintln!("{}: checking dependency setup", service.name);
-                match crate::timing::measure(&format!("{}: dependency setup", service.name), || {
-                    self.run_setup(&service, setup, &cwd, &log, no_cache, stopped)
-                })
-                .with_context(|| format!("{}: dependency setup failed", service.name))?
-                {
-                    SetupOutcome::Skipped => {}
-                    SetupOutcome::Installed => {}
+                if !quiet_command {
+                    eprintln!("{}: checking dependency setup", service.name);
+                }
+                let outcome =
+                    crate::timing::measure(&format!("{}: dependency setup", service.name), || {
+                        self.run_setup(
+                            &service,
+                            setup,
+                            &cwd,
+                            &log,
+                            stopped,
+                            SetupMode {
+                                no_cache,
+                                quiet_command,
+                            },
+                        )
+                    })
+                    .with_context(|| format!("{}: dependency setup failed", service.name))?;
+                match &outcome {
+                    SetupOutcome::Skipped | SetupOutcome::Installed => {}
                     SetupOutcome::Linked { hash } | SetupOutcome::Stored { hash } => {
-                        keys.push((service.name.clone(), hash));
+                        keys.push((service.name.clone(), hash.clone()));
                     }
                 }
-                eprintln!("{}: dependency setup complete", service.name);
+                if !quiet_command {
+                    eprintln!("{}: dependency setup complete", service.name);
+                }
+                outcomes.push((service, outcome));
             }
         }
         for (name, hash) in keys {
             self.entry.cache_keys.insert(name, hash);
         }
+        self.registry.record(&self.entry)?;
         // Measure after setup, before anything below can fail, when explicitly requested.
         // A requested scan also runs when setup was skipped or absent.
         if measure_footprint {
@@ -1040,14 +1162,7 @@ impl Instance {
             })?;
             self.registry.record(&self.entry)?;
         }
-        let seeded = self.seed(false)?;
-
-        for service in self.config.services.clone() {
-            self.start_service(&service, fresh)?;
-            stopped.remove(&service.name);
-        }
-
-        Ok(seeded)
+        Ok(outcomes)
     }
 
     fn start_service(&mut self, service: &crate::config::Service, fresh: bool) -> Result<()> {
@@ -1248,8 +1363,8 @@ impl Instance {
         setup: &str,
         cwd: &Path,
         log: &Path,
-        no_cache: bool,
         stopped: &mut BTreeSet<String>,
+        mode: SetupMode,
     ) -> Result<SetupOutcome> {
         let name = &service.name;
         let marker = self.instance_dir().join(format!(".setup-{name}"));
@@ -1283,7 +1398,7 @@ impl Instance {
                 Err(error) => return Err(error).context("reading venv setup path"),
             };
             let rebuild_venv = expects_venv && (!usable || !path_matches);
-            if !no_cache
+            if !mode.no_cache
                 && !rebuild_venv
                 && previous
                     .as_ref()
@@ -1299,7 +1414,7 @@ impl Instance {
             }
             .write(&marker)?;
             let install = |instance: &Self| -> Result<()> {
-                instance.run_step(&step, setup, cwd, log)?;
+                instance.run_step(&step, setup, cwd, log, mode.quiet_command)?;
                 if setup_identity(service, setup, cwd)? != identity {
                     bail!(
                         "{name}: setup changed its setup_inputs; refusing to mark setup complete"
@@ -1324,7 +1439,9 @@ impl Instance {
                 Ok(())
             };
             if rebuild_venv {
-                eprintln!("{name}: rebuilding missing, incomplete or relocated .venv");
+                if !mode.quiet_command {
+                    eprintln!("{name}: rebuilding missing, incomplete or relocated .venv");
+                }
                 self.replace_install(service, &venv, stopped, install)?;
             } else {
                 install(self)?;
@@ -1333,9 +1450,15 @@ impl Instance {
         };
 
         let store = crate::store::dir()?;
-        let hash = crate::store::key(cwd, cache, setup)?;
+        let hash = crate::store::key(cwd, cache, setup).map_err(|error| {
+            if mode.quiet_command {
+                anyhow::anyhow!("cache key could not be computed")
+            } else {
+                error
+            }
+        })?;
         let built = cwd.join(&cache.path);
-        if !no_cache
+        if !mode.no_cache
             && built.is_dir()
             && std::fs::read_to_string(&marker).ok().as_deref() == Some(hash.as_str())
         {
@@ -1345,18 +1468,20 @@ impl Instance {
             std::fs::remove_file(&marker)?;
         }
         let entry = crate::store::entry(&store, &hash);
-        eprintln!("{name}: checking dependency cache ({hash})");
+        if !mode.quiet_command {
+            eprintln!("{name}: checking dependency cache ({hash})");
+        }
         let mut lease =
             crate::timing::measure_wait(&format!("{name}: shared cache lock wait"), || {
                 crate::store::lock_key(&store, &hash, true)
             })?;
-        if no_cache || !entry.exists() {
+        if mode.no_cache || !entry.exists() {
             drop(lease);
             lease =
                 crate::timing::measure_wait(&format!("{name}: exclusive cache lock wait"), || {
                     crate::store::lock_key(&store, &hash, false)
                 })?;
-            if no_cache {
+            if mode.no_cache {
                 crate::timing::measure_wait(&format!("{name}: cache eviction"), || {
                     crate::store::evict(&store, &hash)
                 })?;
@@ -1377,7 +1502,9 @@ impl Instance {
                 );
             }
             let began = std::time::Instant::now();
-            eprintln!("{name}: linking dependencies from the store ({hash})");
+            if !mode.quiet_command {
+                eprintln!("{name}: linking dependencies from the store ({hash})");
+            }
             let result: Result<crate::store::Linked> = (|| {
                 let linked = crate::store::link_entry(&store, &hash, &staged)
                     .with_context(|| format!("linking {} from the store", built.display()))?;
@@ -1396,21 +1523,23 @@ impl Instance {
             crate::timing::measure_wait(&format!("{name}: store entry size"), || {
                 crate::store::record_bytes(&store, &hash)
             })?;
-            eprintln!(
-                "{name}: dependencies {} from the store ({hash}, {}s)",
-                match linked.method {
-                    crate::store::LinkMethod::Hardlink => "linked",
-                    crate::store::LinkMethod::Copy => "copied",
-                    crate::store::LinkMethod::Clone => "cloned",
-                },
-                began.elapsed().as_secs()
-            );
+            if !mode.quiet_command {
+                eprintln!(
+                    "{name}: dependencies {} from the store ({hash}, {}s)",
+                    match linked.method {
+                        crate::store::LinkMethod::Hardlink => "linked",
+                        crate::store::LinkMethod::Copy => "copied",
+                        crate::store::LinkMethod::Clone => "cloned",
+                    },
+                    began.elapsed().as_secs()
+                );
+            }
             std::fs::write(&marker, &hash)?;
             return Ok(SetupOutcome::Linked { hash });
         }
 
         let promoted = self.replace_install(service, &built, stopped, |instance| {
-        instance.run_step(&step, setup, cwd, log)?;
+        instance.run_step(&step, setup, cwd, log, mode.quiet_command)?;
         if crate::store::key(cwd, cache, setup)? != hash {
             bail!(
                 "{name}: setup changed its cache key files; refusing to publish dependencies under stale inputs"
@@ -1425,14 +1554,16 @@ impl Instance {
         .with_context(|| format!("storing {}", built.display()))?;
             Ok(promoted)
         })?;
-        eprintln!(
-            "{name}: dependencies stored as {hash}{}",
-            if promoted.shared {
-                ""
-            } else {
-                " (private copy)"
-            }
-        );
+        if !mode.quiet_command {
+            eprintln!(
+                "{name}: dependencies stored as {hash}{}",
+                if promoted.shared {
+                    ""
+                } else {
+                    " (private copy)"
+                }
+            );
+        }
         std::fs::write(&marker, &hash)?;
         Ok(SetupOutcome::Stored { hash })
     }
@@ -1451,11 +1582,19 @@ impl Instance {
             prepare,
             cwd,
             log,
+            false,
         )
     }
 
     /// One blocking command with its output on disk and a heartbeat on the terminal.
-    fn run_step(&self, step: &Step<'_>, command: &str, cwd: &Path, log: &Path) -> Result<()> {
+    fn run_step(
+        &self,
+        step: &Step<'_>,
+        command: &str,
+        cwd: &Path,
+        log: &Path,
+        quiet_command: bool,
+    ) -> Result<()> {
         let Step {
             service,
             kind,
@@ -1463,7 +1602,11 @@ impl Instance {
             done,
         } = *step;
         std::fs::create_dir_all(self.instance_dir())?;
-        eprintln!("{service}: {doing} ({command})");
+        if quiet_command {
+            eprintln!("{service}: {doing}");
+        } else {
+            eprintln!("{service}: {doing} ({command})");
+        }
 
         // Output goes to the service log rather than the terminal. `npm ci` and `uv sync`
         // between them emit hundreds of lines, and the port summary printed afterwards is
@@ -1485,7 +1628,13 @@ impl Instance {
             .stdout(std::process::Stdio::from(sink))
             .stderr(std::process::Stdio::from(errors))
             .spawn()
-            .with_context(|| format!("running {kind} for {service}: {command}"))?;
+            .with_context(|| {
+                if quiet_command {
+                    format!("running {kind} for {service}")
+                } else {
+                    format!("running {kind} for {service}: {command}")
+                }
+            })?;
 
         // First tick at 10s, then every 15s. The opening silence is what reads as a
         // hang, so it is the interval worth shortening.
@@ -1503,12 +1652,19 @@ impl Instance {
             }
         };
         if !status.success() {
-            bail!(
-                "{kind} for {service} failed: {command}\n\
-                 full output in {}\n{}",
-                log.display(),
-                tail(log, 30).unwrap_or_default()
-            );
+            if quiet_command {
+                bail!(
+                    "{kind} for {service} failed; full output in {}",
+                    log.display()
+                );
+            } else {
+                bail!(
+                    "{kind} for {service} failed: {command}\n\
+                     full output in {}\n{}",
+                    log.display(),
+                    tail(log, 30).unwrap_or_default()
+                );
+            }
         }
         // Closure matters as much as the ticks: a step that ends without saying so leaves
         // the reader wondering whether it finished or was skipped.

@@ -188,6 +188,11 @@ needed data, then deliberately remove and recreate that container.
                      limits 60/60, load 48.0/52.0 ok" and exits 0, or 3 when holding;
                      `up --gate` waits up to `timeout`, printing the same line.
 
+Do not write a separate `.grove.toml` to install dependencies. Use
+`grove up --setup-only` (optionally `--dry-run` first): a hand-written config hashes
+different cache inputs and misses the shared store. This uses the inherited project
+config without starting shared containers, seeds, or services.
+
   [idle]             optional; opt in to stopping forgotten instances
   stop_after         e.g. "2h". Every `grove up` for this repo first stops its sibling
                      instances nobody has touched for this long, ports kept, and says

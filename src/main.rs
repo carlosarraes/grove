@@ -134,6 +134,12 @@ enum Command {
         /// (default 25/35) when one must be built
         #[arg(long)]
         gate: bool,
+        /// Run dependency setup only (link from the store on a cache hit, install on a miss); start no shared containers, seeds or services
+        #[arg(long, conflicts_with_all = ["fresh", "expose", "expose_host"])]
+        setup_only: bool,
+        /// Report whether setup would link or install; make no changes (requires --setup-only)
+        #[arg(long, requires = "setup_only")]
+        dry_run: bool,
         /// Restart services that are already running
         #[arg(long)]
         fresh: bool,
@@ -316,6 +322,8 @@ fn main() -> Result<()> {
             up_log_child: _,
             heavy,
             gate,
+            setup_only,
+            dry_run,
             fresh,
             footprint,
             allow_main,
@@ -324,17 +332,23 @@ fn main() -> Result<()> {
             no_cache,
         }) => {
             let _up_lock = grove::instance::lock_up(&cwd)?;
-            let exposure = match expose_host {
-                Some(host) => grove::exposure::Exposure::explicit(&host)?,
-                None if expose => grove::exposure::Exposure::detect()?,
-                None => grove::exposure::Exposure::local(),
+            let exposure = if setup_only {
+                grove::exposure::Exposure::local()
+            } else {
+                match expose_host {
+                    Some(host) => grove::exposure::Exposure::explicit(&host)?,
+                    None if expose => grove::exposure::Exposure::detect()?,
+                    None => grove::exposure::Exposure::local(),
+                }
             };
             let mut instance = Instance::open(&cwd)?;
             if !allow_main {
                 instance.refuse_in_main()?;
             }
-            grove::instance::registry()?
-                .set_started_by(&instance.resolved.worktree, herdr_owner())?;
+            if !dry_run {
+                grove::instance::registry()?
+                    .set_started_by(&instance.resolved.worktree, herdr_owner())?;
+            }
             let _startup_slot = if heavy {
                 Some(grove::load::wait_for_startup(
                     &instance.config.admission.clone().unwrap_or_default(),
@@ -349,12 +363,14 @@ fn main() -> Result<()> {
                     &instance.config.admission.clone().unwrap_or_default(),
                 )?;
             }
-            instance.touch()?;
-            if let Some(idle) = &instance.config.idle {
+            if !dry_run {
+                instance.touch()?;
+            }
+            if !dry_run && let Some(idle) = &instance.config.idle {
                 enforce_idle(&instance, &idle.stop_after)?;
             }
 
-            if exposure.is_exposed() {
+            if !setup_only && exposure.is_exposed() {
                 eprintln!(
                     "warning: exposing {} on all interfaces as {}; development services and authentication bypasses may be reachable from other machines",
                     instance.resolved.slug,
@@ -362,24 +378,52 @@ fn main() -> Result<()> {
                 );
             }
 
-            // Before starting, not after: the pile-up forms one agent at a time, and this
-            // is the only moment the one adding to it is paying attention.
-            let machine = survey(Some(&instance.resolved.worktree))?;
-            if machine.crowded() {
-                eprintln!("warning: {}", machine.headline());
-                for line in machine.prescription().unwrap_or_default() {
-                    eprintln!("{line}");
+            if setup_only {
+                if dry_run {
+                    let plans = instance.setup_install_plan(no_cache);
+                    for (name, plan) in &plans {
+                        eprintln!("{}", setup_plan_line(name, plan));
+                    }
+                    eprintln!(
+                        "setup-only dry-run: {} services, 0 installed or linked",
+                        plans.len()
+                    );
+                } else {
+                    instance.render()?;
+                    let outcomes = instance.setup_only(no_cache, footprint)?;
+                    for (service, outcome) in outcomes {
+                        eprintln!("{}", setup_outcome_line(&service, outcome));
+                    }
+                    eprintln!(
+                        "setup-only: {} services set up, 0 started",
+                        instance
+                            .config
+                            .services
+                            .iter()
+                            .filter(|s| s.setup.is_some())
+                            .count()
+                    );
                 }
-            }
+            } else {
+                // Before starting, not after: the pile-up forms one agent at a time, and this
+                // is the only moment the one adding to it is paying attention.
+                let machine = survey(Some(&instance.resolved.worktree))?;
+                if machine.crowded() {
+                    eprintln!("warning: {}", machine.headline());
+                    for line in machine.prescription().unwrap_or_default() {
+                        eprintln!("{line}");
+                    }
+                }
 
-            for started in instance.resources()? {
-                eprintln!("started shared {started}");
+                for started in instance.resources()? {
+                    eprintln!("started shared {started}");
+                }
+                instance.render_for_up(exposure)?;
+                for outcome in instance.up(fresh, no_cache, footprint)? {
+                    eprintln!("{outcome}");
+                }
+                print_summary(&instance, None, &[]);
             }
-            instance.render_for_up(exposure)?;
-            for outcome in instance.up(fresh, no_cache, footprint)? {
-                eprintln!("{outcome}");
-            }
-            print_summary(&instance, None, &[]);
             Ok(())
         }
         Some(Command::Down {
@@ -1332,4 +1376,39 @@ fn print_summary(instance: &Instance, cd: Option<&Path>, notes: &[String]) {
     }
     println!("  grove run -- <your test command>");
     println!("  grove logs {first} -f");
+}
+
+fn setup_outcome_line(
+    service: &grove::config::Service,
+    outcome: grove::instance::SetupOutcome,
+) -> String {
+    use grove::instance::SetupOutcome;
+    let cache_path = service.cache.as_ref().map(|cache| cache.path.as_str());
+    match outcome {
+        SetupOutcome::Skipped => format!("{}: setup up to date, nothing to do", service.name),
+        SetupOutcome::Installed => format!("{}: no cache declared, ran setup", service.name),
+        SetupOutcome::Linked { hash } => format!(
+            "{}: cache hit, linked {} from store ({})",
+            service.name,
+            cache_path.unwrap_or("dependencies"),
+            &hash[..hash.len().min(8)]
+        ),
+        SetupOutcome::Stored { hash } => format!(
+            "{}: cache miss, installed and stored {} ({})",
+            service.name,
+            cache_path.unwrap_or("dependencies"),
+            &hash[..hash.len().min(8)]
+        ),
+    }
+}
+
+fn setup_plan_line(name: &str, plan: &grove::instance::SetupInstallPlan) -> String {
+    use grove::instance::SetupInstallPlan;
+    match plan {
+        SetupInstallPlan::NoCache => format!("{name}: no cache declared"),
+        SetupInstallPlan::LinkOnly | SetupInstallPlan::AlreadyInPlace => {
+            format!("{name}: cache hit (link-only)")
+        }
+        SetupInstallPlan::FullInstall(_) => format!("{name}: cache miss (full install)"),
+    }
 }

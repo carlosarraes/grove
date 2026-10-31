@@ -159,7 +159,7 @@ repo's own fixture or settings constructor.
 | | |
 |---|---|
 | `gate [--no-cache]` | whether `up` here would link or build dependencies, and whether load admits it; exits 0 or 3 |
-| `up [--heavy] [--gate] [--expose] [--expose-host HOST]` | render config, optionally expose opted-in services to the local network, start shared resources and services |
+| `up [--heavy] [--gate] [--footprint] [--expose] [--expose-host HOST]` | render config, optionally measure dependency footprint, expose opted-in services, and start shared resources and services |
 | `down [--purge]` | stop services; `--purge` also drops the database |
 | `down --idle 2h` \| `--all-but-this` | stop instances across the machine, keeping their ports; `--dry-run` names them first |
 | `restart [service]` | replace one service without touching the others |
@@ -172,6 +172,8 @@ repo's own fixture or settings constructor.
 | `seed [--force]` | populate the datastore; markers follow the managed container incarnation, while `--force` rebuilds dirtied data |
 | `prune` | stop and forget instances whose worktree is gone |
 | `doctor` | check everything needed to start, and say what to fix |
+
+Dependency footprint walks are opt-in: `grove up --footprint` measures after setup. Plain `grove up`, `grove ls` and `grove health` do not walk the worktree; `ls` and health read stored figures and label unmeasured instances with the flag to run next.
 
 ## Admit heavy commands by load
 
@@ -362,6 +364,9 @@ The private-dependency figures in `ls` and `health` can therefore overstate uniq
 and space reclaimable from cloned installs. Those figures are not reliable for clone trials.
 This change does not fix accounting for cloned blocks.
 
+Grove measures private-dependency footprint only when `grove up --footprint` is passed.
+`ls` and `health` read the stored figure; unmeasured instances point to this flag.
+
 ## What it doesn't do
 
 Create worktrees (it attaches to whatever it finds), sandbox anything (a service can read
@@ -406,16 +411,18 @@ PyMongo stops the seed with an error. The probe never uses `docker exec`.
 The readiness deadline is 180 seconds per resource before each seed, with attempts
 bounded to five seconds. The log reports readiness time separately from seed time.
 Skipped seeds need no probe. Grove does not replay a failed seed automatically.
+Seed logs are private (0600, directory 0700); the terminal shows status, heartbeat and the first error line only; read the log for the rest.
 An OOM or disconnect after the probe can still fail a seed.
 
 Each `[[seed]]` accepts a positive `timeout` duration, default `"20m"`, using the
 same units as `ready.timeout`. This bounds the seed command after Mongo readiness.
 When the deadline expires, Grove kills the seed's process group and fails `up`.
-The error names the seed, elapsed time, log path, last log line, and recovery steps.
+The error names the seed, elapsed time, log path, and recovery steps.
 
 Ordinary `grove health` reports available disk space and recorded instance usage,
 but labels the store size as unmeasured. It does not recursively scan the store
 before it reports health findings.
+Ports held by colima, Docker Desktop, or other recognized container forwards are reported as forwards; health never suggests killing the forwarder process.
 
 ## Resource initialization failures
 

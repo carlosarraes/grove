@@ -628,6 +628,11 @@ fn up_help_names_network_exposure_and_its_host_override() {
 
     assert!(stdout.contains("--expose"), "{stdout}");
     assert!(stdout.contains("--expose-host <HOST>"), "{stdout}");
+    assert!(stdout.contains("--footprint"), "{stdout}");
+    assert!(
+        stdout.contains("walks the worktree; off by default"),
+        "{stdout}"
+    );
     assert!(stdout.contains("local network"), "{stdout}");
     assert!(stdout.contains("default-route"), "{stdout}");
 }
@@ -1188,6 +1193,99 @@ fn list_shows_known_and_unknown_owners_in_text_and_json() {
 }
 
 #[test]
+fn seed_logs_are_private_and_secret_output_stays_in_the_log() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let cli = Cli::with_config(
+        r#"
+version = 1
+[[seed]]
+name = "private"
+command = "echo portal code ZZTESTCODE42"
+"#,
+    );
+    let wt = cli.worktree("private_seed_log");
+    let output = cli.run(&wt, &["up"]).success().get_output().clone();
+    let terminal = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!terminal.contains("ZZTESTCODE42"), "{terminal}");
+
+    let entry = registry_of(&cli).get(&wt).unwrap().unwrap();
+    let dir = entry.instance_dir.unwrap();
+    let log = dir.join("seed-private.log");
+    assert!(terminal.contains(&format!("log: {}", log.display())));
+    assert!(
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("ZZTESTCODE42")
+    );
+    assert_eq!(
+        std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(&log).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn failed_seed_shows_first_error_but_not_raw_output_and_repairs_old_log_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let cli = Cli::with_config(
+        r#"
+version = 1
+[[seed]]
+name = "broken"
+command = "echo portal code ZZTESTCODE42; echo 'Error: expected failure' >&2; exit 7"
+"#,
+    );
+    let wt = cli.worktree("private_failed_seed_log");
+    let output = cli.run(&wt, &["up"]).failure().get_output().clone();
+    let terminal = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!terminal.contains("ZZTESTCODE42"), "{terminal}");
+    assert!(
+        terminal.contains("first error: Error: expected failure"),
+        "{terminal}"
+    );
+
+    let entry = registry_of(&cli).get(&wt).unwrap().unwrap();
+    let dir = entry.instance_dir.unwrap();
+    let log = dir.join("seed-broken.log");
+    assert!(terminal.contains(&format!("full output in {}", log.display())));
+    assert!(
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("ZZTESTCODE42")
+    );
+    assert_eq!(
+        std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let rerun = cli.run(&wt, &["up"]).failure().get_output().clone();
+    let rerun_terminal = format!(
+        "{}{}",
+        String::from_utf8_lossy(&rerun.stdout),
+        String::from_utf8_lossy(&rerun.stderr)
+    );
+    assert!(!rerun_terminal.contains("ZZTESTCODE42"), "{rerun_terminal}");
+    assert_eq!(
+        std::fs::metadata(&log).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
 fn seed_timeout_fails_fast_reports_the_log_and_reaps_sleep() {
     let cli = Cli::with_config(
         r#"
@@ -1195,7 +1293,7 @@ version = 1
 [[seed]]
 name = "slow"
 timeout = "1s"
-command = "echo $$ > sleep.pid; echo seed-tail-marker; exec sleep 30"
+command = "echo $$ > sleep.pid; echo portal code ZZTESTCODE42; exec sleep 30"
 "#,
     );
     let wt = cli.worktree("seed_timeout");
@@ -1203,6 +1301,7 @@ command = "echo $$ > sleep.pid; echo seed-tail-marker; exec sleep 30"
     let output = cli.run(&wt, &["up"]).failure().get_output().clone();
     assert!(began.elapsed() < std::time::Duration::from_secs(5));
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let terminal = format!("{}{}", String::from_utf8_lossy(&output.stdout), stderr);
     let elapsed: f64 = stderr
         .split("seed slow timed out after ")
         .nth(1)
@@ -1218,13 +1317,11 @@ command = "echo $$ > sleep.pid; echo seed-tail-marker; exec sleep 30"
         .unwrap()
         .join("seed-slow.log");
     assert!(
-        stderr.contains(&format!("log: {}", log.display())),
-        "{stderr}"
+        terminal.contains(&format!("full output in {}", log.display())),
+        "{terminal}"
     );
-    assert!(
-        stderr.contains("last log line: seed-tail-marker"),
-        "{stderr}"
-    );
+    assert!(!terminal.contains("ZZTESTCODE42"), "{terminal}");
+    assert!(!terminal.contains("last log line:"), "{terminal}");
     assert!(
         stderr
             .contains("raise seeds.slow.timeout in .grove.toml, or check mongo with grove health"),
@@ -1240,6 +1337,19 @@ command = "echo $$ > sleep.pid; echo seed-tail-marker; exec sleep 30"
         "sleep {pid} survived"
     );
     assert!(!log.parent().unwrap().join(".seed-slow").exists());
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(log.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(&log).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 }
 
 #[test]
@@ -3041,7 +3151,7 @@ fn disk_bytes_of(cli: &Cli, worktree: &Path) -> Option<u64> {
 fn up_records_what_setup_put_on_disk_and_ls_shows_it() {
     let cli = Cli::with_config(SETUP_CONFIG);
     let wt = cli.worktree("feat_search");
-    cli.run(&wt, &["up"]).success();
+    cli.run(&wt, &["up", "--footprint"]).success();
 
     let bytes = disk_bytes_of(&cli, &wt).expect("measured once setup has run");
     assert!(bytes >= 2 << 20, "setup wrote 2MiB, recorded {bytes}");
@@ -3064,13 +3174,74 @@ fn up_records_what_setup_put_on_disk_and_ls_shows_it() {
     cli.run(&wt, &["down"]).success();
 }
 
-/// Walking node_modules costs seconds per worktree; on a fleet it is only affordable at
-/// the one moment the number changes, which is when setup runs.
+#[test]
+fn up_skips_the_footprint_walk_by_default() {
+    let cli = Cli::with_config(SETUP_CONFIG);
+    let wt = cli.worktree("unmeasured_setup");
+    let output = cli.run(&wt, &["up"]).success().get_output().clone();
+    let terminal = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(disk_bytes_of(&cli, &wt), None);
+    assert!(
+        !terminal.contains("measuring dependency footprint"),
+        "{terminal}"
+    );
+    assert!(
+        !terminal.contains("still measuring dependency footprint"),
+        "{terminal}"
+    );
+    let ls = cli.run(&wt, &["ls"]).success().get_output().stdout.clone();
+    let ls = String::from_utf8_lossy(&ls);
+    assert!(ls.contains("1 unmeasured (grove up --footprint)"), "{ls}");
+    cli.run(&wt, &["down"]).success();
+}
+
+/// A requested walk runs even when setup was not installed during this invocation.
+#[test]
+fn up_footprint_measures_the_worktree_when_requested() {
+    let cli = Cli::with_config(SETUP_CONFIG);
+    let wt = cli.worktree("measured_setup");
+    let output = cli
+        .run(&wt, &["up", "--footprint"])
+        .success()
+        .get_output()
+        .clone();
+    let terminal = String::from_utf8_lossy(&output.stderr);
+    assert!(disk_bytes_of(&cli, &wt).is_some());
+    assert!(
+        terminal.contains("measuring dependency footprint"),
+        "{terminal}"
+    );
+    cli.run(&wt, &["down"]).success();
+}
+
+#[test]
+fn up_footprint_measures_even_when_setup_did_not_run() {
+    let cli = Cli::new();
+    let wt = cli.worktree("measured_without_setup");
+    let output = cli
+        .run(&wt, &["up", "--footprint"])
+        .success()
+        .get_output()
+        .clone();
+    let terminal = String::from_utf8_lossy(&output.stderr);
+    assert!(disk_bytes_of(&cli, &wt).is_some());
+    assert!(
+        terminal.contains("measuring dependency footprint"),
+        "{terminal}"
+    );
+    cli.run(&wt, &["down"]).success();
+}
+
+/// An opt-in walk refreshes a stored figure; a plain up preserves it.
 #[test]
 fn an_ordinary_up_does_not_walk_node_modules_again() {
     let cli = Cli::with_config(SETUP_CONFIG);
     let wt = cli.worktree("feat_search");
-    cli.run(&wt, &["up"]).success();
+    cli.run(&wt, &["up", "--footprint"]).success();
     let first = disk_bytes_of(&cli, &wt).expect("measured");
 
     let mut blob = std::fs::OpenOptions::new()
@@ -3093,7 +3264,7 @@ fn an_ordinary_up_does_not_walk_node_modules_again() {
         .instance_dir
         .expect("instance dir");
     std::fs::remove_file(dir.join(".setup-web")).expect("forget that setup ran");
-    cli.run(&wt, &["up"]).success();
+    cli.run(&wt, &["up", "--footprint"]).success();
     let again = disk_bytes_of(&cli, &wt).expect("measured");
     assert!(
         again > first,
@@ -3109,7 +3280,7 @@ fn an_ordinary_up_does_not_walk_node_modules_again() {
 fn ls_shows_no_size_for_an_orphan() {
     let cli = Cli::with_config(SETUP_CONFIG);
     let wt = cli.worktree("feat_search");
-    cli.run(&wt, &["up"]).success();
+    cli.run(&wt, &["up", "--footprint"]).success();
     cli.run(&wt, &["down"]).success();
     std::fs::remove_dir_all(&wt).expect("delete the worktree");
 
@@ -3131,7 +3302,7 @@ fn ls_shows_no_size_for_an_orphan() {
 fn down_says_what_it_kept_and_how_to_free_it() {
     let cli = Cli::with_config(SETUP_CONFIG);
     let wt = cli.worktree("feat_search");
-    cli.run(&wt, &["up"]).success();
+    cli.run(&wt, &["up", "--footprint"]).success();
 
     let out = cli
         .run(&wt, &["down"])
@@ -3154,11 +3325,7 @@ fn down_without_a_measured_size_still_names_the_disk() {
     let cli = Cli::with_config(SETUP_CONFIG);
     let wt = cli.worktree("feat_search");
     cli.run(&wt, &["up"]).success();
-    // As an instance whose setup ran under a grove that did not measure has it.
-    let registry = registry_of(&cli);
-    let mut entry = registry.get(&wt).expect("get").expect("entry");
-    entry.disk_bytes = None;
-    registry.record(&entry).expect("record");
+    assert_eq!(disk_bytes_of(&cli, &wt), None);
 
     let out = cli
         .run(&wt, &["down"])
@@ -3196,8 +3363,8 @@ fn a_sweep_says_how_much_disk_it_left_behind() {
     let cli = Cli::with_config(SETUP_CONFIG);
     let here = cli.worktree("feat_search");
     let stale = cli.worktree("fix_login");
-    cli.run(&here, &["up"]).success();
-    cli.run(&stale, &["up"]).success();
+    cli.run(&here, &["up", "--footprint"]).success();
+    cli.run(&stale, &["up", "--footprint"]).success();
     backdate(&cli, &stale, 3 * 3600);
 
     let out = cli
@@ -3959,6 +4126,10 @@ fn health_is_quiet_on_a_clean_machine() {
     assert!(stdout.contains("ok"), "{stdout}");
     assert!(stdout.contains("instances running"), "{stdout}");
     assert!(stdout.contains("store size not measured"), "{stdout}");
+    assert!(
+        stdout.contains("1 unmeasured (grove up --footprint)"),
+        "{stdout}"
+    );
 
     cli.run(&wt, &["down"]).success();
 }
@@ -4371,7 +4542,11 @@ fn every_configured_setup_reports_completion_before_up_succeeds() {
     with_lockfile(&cli, "lockfile A\n");
     let wt = cli.worktree("complete");
     cli.run(&wt, &["up"]).success();
-    let output = cli.run(&wt, &["up"]).success().get_output().clone();
+    let output = cli
+        .run(&wt, &["up", "--footprint"])
+        .success()
+        .get_output()
+        .clone();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("backend: dependency setup complete"),
@@ -4410,7 +4585,11 @@ fn phase_durations_distinguish_warm_link_work_from_setup_and_seeds() {
     let wt = cli.worktree("warm");
     std::fs::create_dir(wt.join("node_modules")).unwrap();
     std::fs::write(wt.join("node_modules/old"), "old install").unwrap();
-    let output = cli.run(&wt, &["up"]).success().get_output().clone();
+    let output = cli
+        .run(&wt, &["up", "--footprint"])
+        .success()
+        .get_output()
+        .clone();
     let stderr = String::from_utf8_lossy(&output.stderr);
     for phase in [
         "web: setup lock wait",
@@ -4456,7 +4635,12 @@ fn phase_durations_report_failed_seeds_without_changing_the_exit_status() {
     let entry = registry_of(&cli).get(&wt).unwrap().unwrap();
     let log = entry.instance_dir.unwrap().join("seed-broken.log");
     assert!(stderr.contains(&format!("full output in {}", log.display())));
-    assert!(stderr.contains("seed-tail-marker"));
+    assert!(!stderr.contains("seed-tail-marker"));
+    assert!(
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("seed-tail-marker")
+    );
     assert!(!stderr.contains("timing: web: process start:"));
 }
 

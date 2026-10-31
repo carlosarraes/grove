@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use crate::doctor::Verdict;
 use crate::footprint::human_size;
@@ -80,6 +81,7 @@ fn listeners(entries: &[Entry]) -> Vec<Verdict> {
         .filter_map(|e| e.db_resource.as_ref())
         .map(|db| (db.port, db.name.as_str()))
         .collect();
+    let docker_containers = docker_containers();
     let mut verdicts: Vec<Verdict> = datastores
         .iter()
         .map(|(port, name)| {
@@ -87,6 +89,11 @@ fn listeners(entries: &[Entry]) -> Vec<Verdict> {
                 Verdict::Warn(format!(
                     "datastore {name} recorded on port {port} is not answering; grove up starts it"
                 ))
+            } else if let Some(owner) = listener(*port) {
+                if let Some(kind) = forwarder_kind(&owner.full_command) {
+                    return forwarder_verdict(*port, &owner, kind, &docker_containers, entries);
+                }
+                Verdict::Ok(format!("datastore {name} listening on port {port}"))
             } else {
                 Verdict::Ok(format!("datastore {name} listening on port {port}"))
             }
@@ -108,6 +115,11 @@ fn listeners(entries: &[Entry]) -> Vec<Verdict> {
     }
     verdicts.extend(strays.into_iter().map(|port| {
         let owner = listener(port);
+        if let Some(owner) = owner.as_ref()
+            && let Some(kind) = forwarder_kind(&owner.full_command)
+        {
+            return forwarder_verdict(port, owner, kind, &docker_containers, entries);
+        }
         let who = match &owner {
             Some(o) => format!(" (pid {}, {})", o.pid, o.command),
             None => String::new(),
@@ -140,6 +152,159 @@ struct Listener {
     pid: u32,
     pgid: u32,
     command: String,
+    full_command: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForwarderKind {
+    Colima,
+    Lima,
+    DockerDesktop,
+    DockerProxy,
+    Podman,
+    SshForward,
+    OrbStack,
+}
+
+impl ForwarderKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Colima => "colima",
+            Self::Lima => "lima",
+            Self::DockerDesktop => "Docker Desktop",
+            Self::DockerProxy => "docker-proxy",
+            Self::Podman => "podman",
+            Self::SshForward => "ssh -L",
+            Self::OrbStack => "OrbStack",
+        }
+    }
+}
+
+const FORWARDER_PATTERNS: &[(&[&str], ForwarderKind)] = &[
+    (&["colima"], ForwarderKind::Colima),
+    (&["_lima/", ".lima/"], ForwarderKind::Lima),
+    (&["docker-proxy"], ForwarderKind::DockerProxy),
+    (&["vpnkit", "com.docker"], ForwarderKind::DockerDesktop),
+    (&["gvproxy", "gvforwarder"], ForwarderKind::Podman),
+    (&["OrbStack", "orbstack"], ForwarderKind::OrbStack),
+];
+
+fn forwarder_kind(command: &str) -> Option<ForwarderKind> {
+    let executable = command.split_whitespace().next().unwrap_or_default();
+    if matches!(executable.rsplit('/').next(), Some("lima" | "limactl")) {
+        return Some(ForwarderKind::Lima);
+    }
+    for (patterns, kind) in FORWARDER_PATTERNS {
+        if patterns.iter().any(|pattern| command.contains(pattern)) {
+            return Some(*kind);
+        }
+    }
+    let lower = command.to_ascii_lowercase();
+    (lower.starts_with("ssh:") && lower.contains("[mux]"))
+        .then_some(ForwarderKind::SshForward)
+        .or_else(|| {
+            (lower.starts_with("ssh ")
+                && lower
+                    .split_whitespace()
+                    .any(|arg| arg.starts_with("-l") || arg.starts_with("-r")))
+            .then_some(ForwarderKind::SshForward)
+        })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PublishedContainer {
+    name: String,
+    ports: HashSet<u16>,
+}
+
+fn parse_docker_ps(text: &str) -> Vec<PublishedContainer> {
+    text.lines()
+        .filter_map(|line| {
+            let (name, ports) = line.split_once('\t')?;
+            let ports = ports
+                .split(',')
+                .filter_map(|binding| binding.split_once("->").map(|(host, _)| host.trim()))
+                .filter_map(|host| host.rsplit_once(':').map(|(_, port)| port))
+                .filter_map(|port| port.parse().ok())
+                .collect();
+            Some(PublishedContainer {
+                name: name.to_string(),
+                ports,
+            })
+        })
+        .collect()
+}
+
+fn docker_containers() -> Vec<PublishedContainer> {
+    let Ok(mut child) = Command::new("docker")
+        .args(["ps", "--format", "{{.Names}}\t{{.Ports}}"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return Vec::new();
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) | Err(_) => return Vec::new(),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Vec::new();
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+        }
+    }
+    let mut output = Vec::new();
+    use std::io::Read;
+    if child
+        .stdout
+        .take()
+        .is_none_or(|mut stdout| stdout.read_to_end(&mut output).is_err())
+    {
+        return Vec::new();
+    }
+    parse_docker_ps(&String::from_utf8_lossy(&output))
+}
+
+fn forwarder_verdict(
+    port: u16,
+    owner: &Listener,
+    kind: ForwarderKind,
+    containers: &[PublishedContainer],
+    entries: &[Entry],
+) -> Verdict {
+    let container = containers.iter().find(|c| c.ports.contains(&port));
+    match container {
+        Some(container)
+            if entries
+                .iter()
+                .filter_map(|e| e.db_resource.as_ref())
+                .any(|db| container.name == format!("grove-{}", db.name))
+                // grove names every container it runs `grove-<resource>`
+                // (resource::container_name); with no instance registered, the shared
+                // datastore still answers here.
+                || container.name.starts_with("grove-") =>
+        {
+            Verdict::Ok(format!(
+                "port {port} is held by {}'s forward to {}; that's expected",
+                kind.label(),
+                container.name
+            ))
+        }
+        Some(container) => Verdict::Warn(format!(
+            "port {port} is published by container {} via {}; inspect: docker ps --filter publish={port}",
+            container.name,
+            kind.label()
+        )),
+        None => Verdict::Warn(format!(
+            "port {port} is held by {}'s port forward (pid {}); a container behind it, not a stray server; inspect: docker ps --filter publish={port}",
+            kind.label(),
+            owner.pid
+        )),
+    }
 }
 
 /// Who holds a port, via lsof and ps — both on macOS and Linux — or None when neither
@@ -161,10 +326,12 @@ fn listener(port: u16) -> Option<Listener> {
         .ok()?;
     let line = String::from_utf8_lossy(&ps.stdout);
     let (pgid, command) = line.trim().split_once(char::is_whitespace)?;
+    let full_command = command.trim().to_string();
     Some(Listener {
         pid,
         pgid: pgid.trim().parse().ok()?,
-        command: command.trim().chars().take(60).collect(),
+        command: full_command.chars().take(60).collect(),
+        full_command,
     })
 }
 
@@ -197,21 +364,33 @@ fn disk(cwd: &Path, entries: &[Entry]) -> Verdict {
         .filter(|e| e.worktree.exists())
         .filter_map(|e| e.disk_bytes)
         .sum();
+    let unmeasured = entries
+        .iter()
+        .filter(|e| e.worktree.exists() && e.disk_bytes.is_none())
+        .count();
     let Some((total, free)) = df(cwd) else {
-        return Verdict::Warn(format!(
+        let mut what = format!(
             "could not read free space for {}; grove's instances hold {} in dependencies",
             cwd.display(),
             human_size(held)
-        ));
+        );
+        if unmeasured > 0 {
+            what.push_str(&format!(", {unmeasured} unmeasured (grove up --footprint)"));
+        }
+        return Verdict::Warn(what);
     };
     let percent = (free * 100).checked_div(total).unwrap_or(100);
-    let what = format!(
-        "{} free of {} ({percent}%) on the volume holding {}; instances hold {} in private dependencies; store size not measured",
+    let mut what = format!(
+        "{} free of {} ({percent}%) on the volume holding {}; instances hold {} in private dependencies",
         human_size(free),
         human_size(total),
         cwd.display(),
         human_size(held)
     );
+    if unmeasured > 0 {
+        what.push_str(&format!(", {unmeasured} unmeasured (grove up --footprint)"));
+    }
+    what.push_str("; store size not measured");
     if percent < 10 {
         Verdict::Fail {
             what,
@@ -503,8 +682,151 @@ pub fn json(verdicts: &[Verdict]) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::running_owner_line;
+    use super::{
+        ForwarderKind, Listener, PublishedContainer, forwarder_kind, forwarder_verdict,
+        parse_docker_ps, running_owner_line,
+    };
+    use crate::doctor::Verdict;
+    use crate::registry::{DbResource, Entry};
+    use std::collections::HashSet;
     use std::path::Path;
+
+    fn entry_with_datastore() -> Entry {
+        let mut entry: Entry = serde_json::from_value(serde_json::json!({
+            "worktree": "/tmp/grove-test",
+            "slug": "test",
+            "ports": {},
+            "db_resource": {"name":"mongo", "port":27017}
+        }))
+        .unwrap();
+        entry.db_resource = Some(DbResource {
+            name: "mongo".into(),
+            port: 27017,
+        });
+        entry
+    }
+
+    fn listener(command: &str) -> Listener {
+        Listener {
+            pid: 12,
+            pgid: 12,
+            command: command.into(),
+            full_command: command.into(),
+        }
+    }
+
+    fn published(name: &str, port: u16) -> PublishedContainer {
+        PublishedContainer {
+            name: name.into(),
+            ports: HashSet::from([port]),
+        }
+    }
+
+    fn verdict_text(verdict: Verdict) -> String {
+        match verdict {
+            Verdict::Ok(text) | Verdict::Warn(text) => text,
+            Verdict::Fail { what, fix } => format!("{what}\n{fix}"),
+        }
+    }
+
+    #[test]
+    fn classifies_supported_forwarders_by_full_command() {
+        assert_eq!(
+            forwarder_kind("ssh: /Users/me/.colima/ssh.sock [mux]"),
+            Some(ForwarderKind::Colima)
+        );
+        assert_eq!(
+            forwarder_kind("/usr/local/bin/docker-proxy --long-args"),
+            Some(ForwarderKind::DockerProxy)
+        );
+        assert_eq!(
+            forwarder_kind("ssh -N -L 27017:db:27017 host"),
+            Some(ForwarderKind::SshForward)
+        );
+        assert_eq!(forwarder_kind("/usr/bin/node server.js"), None);
+        assert_eq!(
+            forwarder_kind("/usr/bin/lima start"),
+            Some(ForwarderKind::Lima)
+        );
+        assert_eq!(forwarder_kind("/usr/bin/sublime server"), None);
+    }
+
+    #[test]
+    fn parses_docker_published_host_ports() {
+        let found = parse_docker_ps(
+            "grove-mongo\t0.0.0.0:27017->27017/tcp, [::]:27017->27017/tcp\nweb\t127.0.0.1:8080->80/tcp",
+        );
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].ports, HashSet::from([27017]));
+        assert_eq!(found[1].ports, HashSet::from([8080]));
+    }
+
+    #[test]
+    fn forwarder_to_grove_container_is_expected() {
+        assert_eq!(
+            verdict_text(forwarder_verdict(
+                27017,
+                &listener("colima"),
+                ForwarderKind::Colima,
+                &[published("grove-mongo", 27017)],
+                &[entry_with_datastore()]
+            )),
+            "port 27017 is held by colima's forward to grove-mongo; that's expected"
+        );
+    }
+
+    #[test]
+    fn forwarder_to_grove_container_is_expected_with_no_instances() {
+        assert_eq!(
+            verdict_text(forwarder_verdict(
+                27017,
+                &listener("ssh: /Users/me/.colima/_lima/colima/ssh.sock [mux]"),
+                ForwarderKind::Colima,
+                &[published("grove-mongo", 27017)],
+                &[]
+            )),
+            "port 27017 is held by colima's forward to grove-mongo; that's expected"
+        );
+    }
+
+    #[test]
+    fn forwarder_to_foreign_container_warns_with_inspect_hint() {
+        assert_eq!(
+            verdict_text(forwarder_verdict(
+                27017,
+                &listener("colima"),
+                ForwarderKind::Colima,
+                &[published("other-db", 27017)],
+                &[]
+            )),
+            "port 27017 is published by container other-db via colima; inspect: docker ps --filter publish=27017"
+        );
+    }
+
+    #[test]
+    fn unknown_forwarder_never_suggests_kill() {
+        let verdict =
+            forwarder_verdict(27017, &listener("colima"), ForwarderKind::Colima, &[], &[]);
+        let text = verdict_text(verdict);
+        assert_eq!(
+            text,
+            "port 27017 is held by colima's port forward (pid 12); a container behind it, not a stray server; inspect: docker ps --filter publish=27017"
+        );
+        assert!(!text.contains("kill"));
+    }
+
+    #[test]
+    fn plain_process_keeps_existing_kill_line() {
+        let owner = listener("node server.js");
+        assert_eq!(
+            format!(
+                "kill -TERM -{}   # its process group; no grove handle reaches it",
+                owner.pgid
+            ),
+            "kill -TERM -12   # its process group; no grove handle reaches it"
+        );
+        assert_eq!(forwarder_kind(&owner.full_command), None);
+    }
 
     #[test]
     fn running_owner_line_names_a_known_owner() {

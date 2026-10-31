@@ -3954,6 +3954,117 @@ fn install_gate_admits_a_link_only_up_at_load_that_holds_a_full_install() {
     cli.run(&b, &["down"]).success();
 }
 
+#[test]
+fn gate_accepts_another_worktree_by_path_and_worktree_option() {
+    let cli = Cli::with_config(CACHE_CONFIG);
+    let target = cli.worktree("gate_target");
+    let here = cli.worktree("gate_here");
+    let expected = cli.run(&target, &["gate"]).success();
+    let expected_stdout = String::from_utf8_lossy(&expected.get_output().stdout).to_string();
+
+    for args in [
+        vec!["gate", target.to_str().unwrap()],
+        vec!["gate", "--worktree", target.to_str().unwrap()],
+    ] {
+        let actual = cli.run(&here, &args).success();
+        assert_eq!(
+            String::from_utf8_lossy(&actual.get_output().stdout),
+            expected_stdout
+        );
+        assert_eq!(actual.get_output().status.code(), Some(0));
+    }
+
+    let busy = [("GROVE_LOAD", "48"), ("GROVE_LOAD15", "52")];
+    let expected = cli.run_env(&target, &busy, &["gate"]).code(3);
+    let expected_stdout = String::from_utf8_lossy(&expected.get_output().stdout).to_string();
+    let actual = cli
+        .run_env(
+            &here,
+            &busy,
+            &["gate", "--worktree", target.to_str().unwrap()],
+        )
+        .code(3);
+    assert_eq!(
+        String::from_utf8_lossy(&actual.get_output().stdout),
+        expected_stdout
+    );
+    assert_eq!(actual.get_output().status.code(), Some(3));
+}
+
+#[test]
+fn gate_rejects_two_target_forms_and_reports_bad_target_paths() {
+    let cli = Cli::with_config(CACHE_CONFIG);
+    let cwd = cli.worktree("gate_args");
+    let other = cli.worktree("other_target");
+
+    let conflict = cli
+        .run(
+            &cwd,
+            &[
+                "gate",
+                other.to_str().unwrap(),
+                "--worktree",
+                other.to_str().unwrap(),
+            ],
+        )
+        .failure();
+    assert!(String::from_utf8_lossy(&conflict.get_output().stderr).contains("cannot be used with"));
+
+    let missing = cwd.parent().unwrap().join("missing-worktree");
+    let missing_out = cli
+        .run(&cwd, &["gate", missing.to_str().unwrap()])
+        .failure();
+    let missing_text = String::from_utf8_lossy(&missing_out.get_output().stderr);
+    assert!(
+        missing_text.contains(&format!(
+            "no worktree at {}; pass an existing worktree path, or an instance name from `grove ls`",
+            missing.display()
+        )),
+        "{missing_text}"
+    );
+
+    let not_worktree = cli.state.path().join("ordinary-directory");
+    std::fs::create_dir(&not_worktree).unwrap();
+    let invalid = cli
+        .run(&cwd, &["gate", not_worktree.to_str().unwrap()])
+        .failure();
+    let invalid_text = String::from_utf8_lossy(&invalid.get_output().stderr);
+    assert!(
+        invalid_text.contains(&not_worktree.display().to_string()),
+        "{invalid_text}"
+    );
+    assert!(
+        invalid_text.contains("pass a git worktree path"),
+        "{invalid_text}"
+    );
+}
+
+#[test]
+fn up_setup_only_rejects_worktree_targets() {
+    let cli = Cli::with_config(CACHE_CONFIG);
+    let cwd = cli.worktree("up_target_rejection");
+    let target = cli.worktree("up_other");
+
+    for args in [
+        vec!["up", "--setup-only", "--dry-run", target.to_str().unwrap()],
+        vec![
+            "up",
+            "--setup-only",
+            "--dry-run",
+            "--worktree",
+            target.to_str().unwrap(),
+        ],
+    ] {
+        let rejected = cli.run(&cwd, &args).failure();
+        assert_eq!(rejected.get_output().status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&rejected.get_output().stderr).contains("Usage:"),
+            "{}",
+            String::from_utf8_lossy(&rejected.get_output().stderr)
+        );
+    }
+}
+
 /// `ls` reports the store from the size each entry recorded at publication and never
 /// walks it: on a 10G store under load the walk kept `ls` silent for 89s.
 #[test]

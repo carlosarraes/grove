@@ -66,11 +66,13 @@ grove down
 
 Commands act on the worktree you run them in. To look at another instance without
 leaving yours, give `status`, `doctor` or `down` its name as `grove ls` prints it, or
-its worktree path. `status` also accepts that target with `--worktree`:
+its worktree path. `status` and `gate` also accept that target with `--worktree`:
 
 ```sh
 grove status feature_branch     # read-only, from anywhere
 grove status --worktree ../other-worktree
+grove gate ../other-worktree
+grove gate --worktree feature_branch
 grove doctor ../other-worktree
 grove down feature_branch
 ```
@@ -158,7 +160,7 @@ repo's own fixture or settings constructor.
 
 | | |
 |---|---|
-| `gate [--no-cache]` | whether `up` here would link or build dependencies, and whether load admits it; exits 0 or 3 |
+| `gate [NAME] [--worktree NAME\|PATH] [--no-cache]` | whether `up` for this instance would link or build dependencies, and whether load admits it; exits 0 or 3 |
 | `up [--heavy] [--gate] [--footprint] [--expose] [--expose-host HOST] [--setup-only] [--dry-run]` | render config, optionally measure dependency footprint, expose opted-in services, and start shared resources and services; `--setup-only` runs dependency setup without starting anything, while `--dry-run` reports cache decisions without changes |
 | `down [--purge]` | stop services; `--purge` also drops the database |
 | `down --idle 2h` \| `--all-but-this` | stop instances across the machine, keeping their ports; `--dry-run` names them first |
@@ -212,9 +214,9 @@ This flag provides neither FIFO ordering nor a slot reservation.
 
 ## Gate installs by load
 
-`grove gate` decides, from the same cache key `up` uses, whether `up` would only link
-dependency trees the store already holds or would have to build one, and judges the
-1- and 15-minute load against that kind's limits:
+`grove gate [NAME]` (or `grove gate --worktree NAME|PATH`) decides, from the same cache
+key `up` uses, whether `up` would only link dependency trees the store already holds or
+would have to build one, and judges the 1- and 15-minute load against that kind's limits:
 
 ```
 load gate: link-only (lockfile matches store), limits 60/60, load 48.0/52.0 ok

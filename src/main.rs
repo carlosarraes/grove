@@ -105,10 +105,10 @@ impl Machine {
     version,
     about,
     disable_help_subcommand = true,
-    after_help = "Commands act on the worktree you run them in. `status`, `doctor` and `down` \
+    after_help = "Commands act on the worktree you run them in. `status`, `doctor`, `down` and `gate` \
                   also take an instance name as `grove ls` shows it, or a worktree path: \
-                  `grove status feature_branch`. For `status`, use `--worktree` as an alias \
-                  for the positional target."
+                  `grove status feature_branch`. `--worktree` is an alias for the positional \
+                  target on `status` and `gate`."
 )]
 struct Cli {
     /// Emit the .grove.toml schema and worked examples, then exit
@@ -191,6 +191,12 @@ enum Command {
     /// Whether `up` here would link or build dependencies, and whether load admits it now;
     /// exits 0 when admitted, 3 when holding
     Gate {
+        /// Instance name as `grove ls` shows it, or a worktree path [default: the worktree you are in]
+        #[arg(conflicts_with = "worktree")]
+        name: Option<String>,
+        /// Instance name as `grove ls` shows it, or a worktree path
+        #[arg(long, value_name = "NAME|PATH", conflicts_with = "name")]
+        worktree: Option<String>,
         /// Judge as `up --no-cache` would: always a full install
         #[arg(long)]
         no_cache: bool,
@@ -304,8 +310,12 @@ fn main() -> Result<()> {
             println!();
             Ok(())
         }
-        Some(Command::Gate { no_cache }) => {
-            let instance = Instance::open(&cwd)?;
+        Some(Command::Gate {
+            name,
+            worktree,
+            no_cache,
+        }) => {
+            let instance = Instance::open(&target(name.as_deref().or(worktree.as_deref()), &cwd)?)?;
             let install = instance.install_plan(no_cache);
             let verdict = grove::load::judge(
                 &install,
@@ -943,6 +953,11 @@ fn target(name: Option<&str>, cwd: &Path) -> Result<PathBuf> {
     let path = cwd.join(name);
     if path.is_dir() {
         return Ok(path);
+    }
+    if name.contains('/') || name.starts_with('.') || name.starts_with('~') {
+        bail!(
+            "no worktree at {name}; pass an existing worktree path, or an instance name from `grove ls`"
+        );
     }
     bail!(
         "no instance named `{name}` on this machine, and no directory by that name; `grove ls` lists instances"

@@ -92,7 +92,7 @@ fn git(cwd: &Path, args: &[&str]) -> Result<String> {
 
     if !out.status.success() {
         bail!(
-            "not a git repository: {}\n{}",
+            "not a git repository: {}; pass a git worktree path\n{}",
             cwd.display(),
             String::from_utf8_lossy(&out.stderr).trim()
         );

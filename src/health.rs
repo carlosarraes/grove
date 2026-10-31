@@ -282,7 +282,11 @@ fn forwarder_verdict(
             if entries
                 .iter()
                 .filter_map(|e| e.db_resource.as_ref())
-                .any(|db| container.name == format!("grove-{}", db.name)) =>
+                .any(|db| container.name == format!("grove-{}", db.name))
+                // grove names every container it runs `grove-<resource>`
+                // (resource::container_name); with no instance registered, the shared
+                // datastore still answers here.
+                || container.name.starts_with("grove-") =>
         {
             Verdict::Ok(format!(
                 "port {port} is held by {}'s forward to {}; that's expected",
@@ -766,6 +770,20 @@ mod tests {
                 ForwarderKind::Colima,
                 &[published("grove-mongo", 27017)],
                 &[entry_with_datastore()]
+            )),
+            "port 27017 is held by colima's forward to grove-mongo; that's expected"
+        );
+    }
+
+    #[test]
+    fn forwarder_to_grove_container_is_expected_with_no_instances() {
+        assert_eq!(
+            verdict_text(forwarder_verdict(
+                27017,
+                &listener("ssh: /Users/me/.colima/_lima/colima/ssh.sock [mux]"),
+                ForwarderKind::Colima,
+                &[published("grove-mongo", 27017)],
+                &[]
             )),
             "port 27017 is held by colima's forward to grove-mongo; that's expected"
         );

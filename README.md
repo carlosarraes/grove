@@ -159,7 +159,7 @@ repo's own fixture or settings constructor.
 | | |
 |---|---|
 | `gate [--no-cache]` | whether `up` here would link or build dependencies, and whether load admits it; exits 0 or 3 |
-| `up [--heavy] [--gate] [--footprint] [--expose] [--expose-host HOST]` | render config, optionally measure dependency footprint, expose opted-in services, and start shared resources and services |
+| `up [--heavy] [--gate] [--footprint] [--expose] [--expose-host HOST] [--setup-only] [--dry-run]` | render config, optionally measure dependency footprint, expose opted-in services, and start shared resources and services; `--setup-only` runs dependency setup without starting anything, while `--dry-run` reports cache decisions without changes |
 | `down [--purge]` | stop services; `--purge` also drops the database |
 | `down --idle 2h` \| `--all-but-this` | stop instances across the machine, keeping their ports; `--dry-run` names them first |
 | `restart [service]` | replace one service without touching the others |
@@ -174,6 +174,8 @@ repo's own fixture or settings constructor.
 | `doctor` | check everything needed to start, and say what to fix |
 
 Dependency footprint walks are opt-in: `grove up --footprint` measures after setup. Plain `grove up`, `grove ls` and `grove health` do not walk the worktree; `ls` and health read stored figures and label unmeasured instances with the flag to run next.
+
+Do not write a separate `.grove.toml` to install dependencies. Use `grove up --setup-only` (optionally `--dry-run` first): a hand-written config hashes different cache inputs and misses the shared store. Dry-run reports per-service cache hit, cache miss, or no cache declared without installing or linking anything. Setup-only uses the inherited project config and normal cache logic, linking a stored tree on a hit and installing and storing it on a miss, without starting shared containers, seeds, or services. Combine it with `--no-cache` to rebuild cached dependencies or `--footprint` to measure the resulting dependency footprint.
 
 ## Admit heavy commands by load
 
@@ -222,6 +224,7 @@ load gate: full install (frontend lockfile not in store, 1a2b…), limits 25/35,
 It exits 0 when admitted and 3 when holding. `grove up --gate` prints the same line
 and waits for admission (up to `[admission] timeout`) before installing anything.
 Limits are `[admission] full_install = [25, 35]` and `link_only = [60, 60]` by default.
+To apply the same cache decision without starting the stack, run `grove up --setup-only`.
 
 ## Limit concurrent startup
 

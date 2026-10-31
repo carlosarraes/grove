@@ -416,6 +416,7 @@ The error names the seed, elapsed time, log path, last log line, and recovery st
 Ordinary `grove health` reports available disk space and recorded instance usage,
 but labels the store size as unmeasured. It does not recursively scan the store
 before it reports health findings.
+Ports held by colima, Docker Desktop, or other recognized container forwards are reported as forwards; health never suggests killing the forwarder process.
 
 ## Resource initialization failures
 

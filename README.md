@@ -77,6 +77,8 @@ grove doctor ../other-worktree
 grove down feature_branch
 ```
 
+`status` reads an existing instance from the registry without reallocating its ports.
+
 An unknown name fails and points at `grove ls`. `logs`, `restart`, `run` and `seed` already
 take a service or a command as their argument, so run those inside the worktree.
 

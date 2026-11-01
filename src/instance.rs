@@ -483,6 +483,36 @@ impl Instance {
         Ok(instance)
     }
 
+    /// Resolve a worktree for status without waiting for the registry writer or
+    /// reallocating ports that an existing instance already owns.
+    pub fn open_for_status(cwd: &Path) -> Result<Self> {
+        let resolved = resolve::resolve(cwd)?;
+        let config = config::load_for(&resolved.worktree, &resolved.main_worktree)?;
+        let registry = registry()?;
+        let existing = registry.get(&resolved.worktree)?;
+        let was_missing = existing.is_none();
+        let entry = match existing {
+            Some(entry) => entry,
+            None => registry.reserve(&resolved, &config.ports.names)?,
+        };
+        let target_exposure = entry.exposure.clone();
+        let mut instance = Instance {
+            resolved,
+            config,
+            entry,
+            registry,
+            state_dir: state_dir()?,
+            recently_created_resources: BTreeSet::new(),
+            target_exposure,
+        };
+        if was_missing {
+            let dir = instance.instance_dir();
+            instance.entry.instance_dir = Some(dir);
+            instance.registry.record(&instance.entry)?;
+        }
+        Ok(instance)
+    }
+
     /// Record that work is happening here, so a later `grove down --idle` can tell this
     /// instance from one nobody has opened since Tuesday.
     pub fn touch(&self) -> Result<()> {

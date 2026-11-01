@@ -7548,6 +7548,46 @@ fn status_during_a_running_up_says_wait_not_run_grove_up() {
     assert!(row.contains("starting"), "{ls}");
 }
 
+#[test]
+fn status_of_an_existing_instance_does_not_wait_for_the_registry_writer() {
+    let cli = Cli::with_config(SETUP_ONLY_CONFIG);
+    let wt = cli.worktree("status_lock");
+    cli.run(&wt, &["status"]).success();
+
+    let lock_path = cli.state.path().join("registry.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_path)
+        .unwrap();
+    lock.lock().unwrap();
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("grove"))
+        .arg("status")
+        .current_dir(&wt)
+        .env("GROVE_STATE_DIR", cli.state.path())
+        .env("GROVE_PORT_RANGE", cli.port_range())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("status waited for the registry writer");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    lock.unlock().unwrap();
+}
+
 /// `grove ls | head` closes the pipe before grove is done printing. That is the reader
 /// saying it has enough, not an error: no panic text, no failure code.
 #[test]

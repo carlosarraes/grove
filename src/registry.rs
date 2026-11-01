@@ -278,11 +278,11 @@ impl Registry {
     }
 
     pub fn get(&self, worktree: &Path) -> Result<Option<Entry>> {
-        self.with_lock(|state| Ok(state.instances.get(&key(worktree)).cloned()))
+        Ok(self.read()?.instances.get(&key(worktree)).cloned())
     }
 
     pub fn list(&self) -> Result<Vec<Entry>> {
-        self.with_lock(|state| Ok(state.instances.values().cloned().collect()))
+        Ok(self.read()?.instances.into_values().collect())
     }
 
     pub fn release(&self, worktree: &Path) -> Result<()> {

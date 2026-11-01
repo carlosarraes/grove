@@ -497,7 +497,8 @@ fn main() -> Result<()> {
             worktree,
             json,
         }) => {
-            let instance = Instance::open(&target(name.as_deref().or(worktree.as_deref()), &cwd)?)?;
+            let instance =
+                Instance::open_for_status(&target(name.as_deref().or(worktree.as_deref()), &cwd)?)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&status_json(&instance))?);
             } else {

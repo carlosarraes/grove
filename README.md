@@ -65,8 +65,8 @@ grove down
 ```
 
 Commands act on the worktree you run them in. To look at another instance without
-leaving yours, give `status`, `doctor` or `down` its name as `grove ls` prints it, or
-its worktree path. `status` and `gate` also accept that target with `--worktree`:
+leaving yours, give `ls`, `status`, `doctor` or `down` its name as `grove ls` prints it, or
+its worktree path. `ls`, `status` and `gate` also accept that target with `--worktree`:
 
 ```sh
 grove status feature_branch     # read-only, from anywhere

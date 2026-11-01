@@ -2708,6 +2708,57 @@ fn ls_json_carries_what_an_agent_needs_to_decide() {
     cli.run(&wt, &["down"]).success();
 }
 
+#[test]
+fn ls_filters_by_name_and_worktree_path() {
+    let cli = Cli::new();
+    let selected = cli.worktree("feat_search");
+    let sibling = cli.worktree("feat_other");
+    cli.run(&selected, &["up"]).success();
+    cli.run(&sibling, &["up"]).success();
+    let elsewhere = cli.state.path().to_path_buf();
+
+    let by_name = cli
+        .run(&elsewhere, &["ls", "feat_search"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let by_path = cli
+        .run(
+            &elsewhere,
+            &["ls", "--json", "--worktree", selected.to_str().unwrap()],
+        )
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let text = String::from_utf8_lossy(&by_name);
+    assert!(text.contains("feat_search"), "{text}");
+    assert!(!text.contains("feat_other"), "{text}");
+    let parsed: serde_json::Value = serde_json::from_slice(&by_path).unwrap();
+    assert_eq!(parsed["instances"].as_array().unwrap().len(), 1, "{parsed}");
+    assert_eq!(parsed["instances"][0]["slug"], "feat_search");
+
+    cli.run(&selected, &["down"]).success();
+    cli.run(&sibling, &["down"]).success();
+}
+
+#[test]
+fn ls_unknown_target_points_at_grove_ls() {
+    let cli = Cli::new();
+    let wt = cli.worktree("feat_search");
+    let err = cli
+        .run(&wt, &["ls", "--worktree", "mon_nope"])
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let err = String::from_utf8_lossy(&err);
+    assert!(err.contains("no instance named `mon_nope`"), "{err}");
+    assert!(err.contains("`grove ls` lists instances"), "{err}");
+}
+
 /// The point of `--idle` over `prune`: a forgotten box is one you want back tomorrow, and
 /// the URL an agent wrote down has to still work when it comes back.
 #[test]

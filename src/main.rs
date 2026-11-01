@@ -105,10 +105,10 @@ impl Machine {
     version,
     about,
     disable_help_subcommand = true,
-    after_help = "Commands act on the worktree you run them in. `status`, `doctor`, `down` and `gate` \
+    after_help = "Commands act on the worktree you run them in. `ls`, `status`, `doctor`, `down` and `gate` \
                   also take an instance name as `grove ls` shows it, or a worktree path: \
                   `grove status feature_branch`. `--worktree` is an alias for the positional \
-                  target on `status` and `gate`."
+                  target on `ls`, `status` and `gate`."
 )]
 struct Cli {
     /// Emit the .grove.toml schema and worked examples, then exit
@@ -210,6 +210,12 @@ enum Command {
     /// Every instance on this machine
     #[command(visible_alias = "list", alias = "instances")]
     Ls {
+        /// Instance name as `grove ls` shows it, or a worktree path
+        #[arg(conflicts_with = "worktree")]
+        name: Option<String>,
+        /// Instance name as `grove ls` shows it, or a worktree path
+        #[arg(long, value_name = "NAME|PATH", conflicts_with = "name")]
+        worktree: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -508,11 +514,22 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Some(Command::Ls { json }) => {
+        Some(Command::Ls {
+            name,
+            worktree,
+            json,
+        }) => {
             let registry = grove::instance::registry()?;
             // Listing is a read. Reaping here would discard a deleted worktree's pids
             // without stopping its services, leaving processes grove can never reach.
             let mut entries = registry.list()?;
+            if let Some(ask) = name.as_deref().or(worktree.as_deref()) {
+                let requested = target(Some(ask), &cwd)?;
+                entries.retain(|entry| entry.worktree == requested || entry.slug == ask);
+                if entries.is_empty() {
+                    bail!("no listed instance for `{ask}`; `grove ls` lists instances");
+                }
+            }
             let now = grove::registry::now();
 
             // Most neglected first. Eighteen rows with the stale ones scattered through

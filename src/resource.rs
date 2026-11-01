@@ -319,6 +319,12 @@ pub fn args_drift(resource: &Resource, container: &ContainerObservation) -> Opti
     if resource.args.is_empty() || container.cmd.as_deref() == Some(resource.args.as_slice()) {
         return None;
     }
+    if container.cmd.as_ref().is_some_and(|cmd| {
+        cmd.windows(resource.args.len())
+            .any(|window| window == resource.args)
+    }) {
+        return None;
+    }
     let actual = container
         .cmd
         .as_ref()

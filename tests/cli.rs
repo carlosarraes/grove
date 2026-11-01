@@ -5968,16 +5968,27 @@ fn cancelling_heavy_admission_never_starts_the_child() {
     assert!(!wt.join("ran").exists());
 }
 
-fn stopped_resource_fixture(port: u16, image: &str, bindings: serde_json::Value) -> Cli {
-    let cli = Cli::with_fake_docker(
-        &resource_seed_config(port, "echo seed >> seeded.log"),
-        "stopped-resource",
-    );
+fn stopped_resource_fixture(
+    port: u16,
+    image: &str,
+    bindings: serde_json::Value,
+    args: &str,
+) -> Cli {
+    let config = resource_seed_config(port, "echo seed >> seeded.log");
+    let config = if args.is_empty() {
+        config
+    } else {
+        config.replace(
+            &format!("image = \"{image}\""),
+            &format!("image = \"{image}\"\n{args}"),
+        )
+    };
+    let cli = Cli::with_fake_docker(&config, "stopped-resource");
     let docker = cli.docker.as_ref().expect("docker");
     let inspect = serde_json::json!([{
         "Id": "stopped-resource",
         "State": {"Running": false, "ExitCode": 137},
-        "Config": {"Image": image},
+        "Config": {"Image": image, "Cmd": if args.is_empty() { serde_json::Value::Null } else { serde_json::json!(["--replSet", "rs0", "--wiredTigerCacheSizeGB", "0.5"]) }},
         "HostConfig": {"Ulimits": [], "PortBindings": bindings}
     }]);
     std::fs::write(&docker.inspect, inspect.to_string()).expect("inspect fixture");
@@ -6013,7 +6024,12 @@ fn up_restarts_a_compatible_stopped_resource_without_recreating_it() {
     let bindings = serde_json::json!({format!("{port}/tcp"): [
         {"HostIp": "", "HostPort": port.to_string()}
     ]});
-    let cli = stopped_resource_fixture(port, "mongo:8", bindings);
+    let cli = stopped_resource_fixture(
+        port,
+        "mongo:8",
+        bindings,
+        "args = [\"--replSet\", \"rs0\"]\n",
+    );
     let wt = cli.worktree("resource_recovery");
     cli.run(&wt, &["up"]).success();
     let root = cli.state.path().to_path_buf();
@@ -6069,7 +6085,7 @@ fn up_refuses_stopped_resources_with_a_different_image_or_port_binding() {
             serde_json::json!({"0/tcp": [{"HostIp":"192.0.2.1", "HostPort":"0"}]}),
         ),
     ] {
-        let cli = stopped_resource_fixture(0, image, bindings);
+        let cli = stopped_resource_fixture(0, image, bindings, "");
         let wt = cli.worktree("resource_mismatch");
         let result = cli.run(&wt, &["up"]).failure();
         let stderr = String::from_utf8_lossy(&result.get_output().stderr);
@@ -6092,6 +6108,7 @@ fn failed_resource_restart_does_not_create_a_replacement() {
         serde_json::json!({
             "0/tcp": [{"HostIp":"", "HostPort":"0"}]
         }),
+        "",
     );
     std::fs::write(cli.state.path().join("fail-start"), "fail").expect("failure mode");
     let wt = cli.worktree("resource_start_failure");
@@ -6286,7 +6303,7 @@ fn unrecorded_venv_rebuilds_once_and_failed_rebuild_restores_it() {
 
 #[test]
 fn resource_inspect_failure_never_creates_or_starts_a_container() {
-    let cli = stopped_resource_fixture(0, "mongo:8", serde_json::json!({}));
+    let cli = stopped_resource_fixture(0, "mongo:8", serde_json::json!({}), "");
     cli.docker.as_ref().unwrap().set_unreadable_inspect();
     let wt = cli.worktree("inspect_failure");
     cli.run(&wt, &["up"]).failure();
@@ -6305,6 +6322,7 @@ fn running_resource_reports_progress_waiting_for_its_port_without_starting_again
         port,
         "mongo:8",
         serde_json::json!({format!("{port}/tcp"): [{"HostIp":"127.0.0.1", "HostPort":port.to_string()}]}),
+        "",
     );
     let docker = cli.docker.as_ref().unwrap();
     let mut fixture: serde_json::Value =
@@ -6855,6 +6873,10 @@ fn matching_args_and_an_image_default_command_are_not_drift() {
         (
             "args = [\"--replSet\", \"rs0\"]\n",
             serde_json::json!(["--replSet", "rs0"]),
+        ),
+        (
+            "args = [\"--replSet\", \"rs0\"]\n",
+            serde_json::json!(["--replSet", "rs0", "--wiredTigerCacheSizeGB", "0.5"]),
         ),
         ("", serde_json::json!(["mongod"])),
     ] {

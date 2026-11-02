@@ -241,8 +241,14 @@ enum Command {
     },
     /// Stop a service and start it again; all of them if none is named
     Restart { service: Option<String> },
-    /// Stop and forget instances whose worktree no longer exists
+    /// Stop and forget all orphaned instances, or only the selected orphans
     Prune {
+        /// Instance names as `grove ls` shows them, or recorded worktree paths
+        #[arg(value_name = "NAME")]
+        names: Vec<String>,
+        /// Select by recorded worktree path (repeatable); selected prune skips the shared store sweep
+        #[arg(long = "worktree", value_name = "PATH", action = clap::ArgAction::Append)]
+        worktrees: Vec<String>,
         /// Also drop their databases
         #[arg(long)]
         purge: bool,
@@ -757,12 +763,52 @@ fn main() -> Result<()> {
             print_summary(&instance, None, &[]);
             Ok(())
         }
-        Some(Command::Prune { purge, dry_run }) => {
+        Some(Command::Prune {
+            names,
+            worktrees,
+            purge,
+            dry_run,
+        }) => {
             let registry = grove::instance::registry()?;
+            let selectors: Vec<String> = names.into_iter().chain(worktrees).collect();
+            let selected = !selectors.is_empty();
 
             // A dry run must not reap: `reap` removes the entries as it returns them, so
             // rehearsing with it would be the destructive act it exists to avoid.
-            let orphans: Vec<Entry> = if dry_run {
+            let orphans: Vec<Entry> = if selected {
+                let entries = registry.list()?;
+                let mut chosen = std::collections::BTreeMap::new();
+                for selector in &selectors {
+                    let selected_path = Path::new(selector);
+                    let selected_path = if selected_path.is_absolute() {
+                        selected_path.to_path_buf()
+                    } else {
+                        cwd.join(selected_path)
+                    };
+                    let matches: Vec<&Entry> = entries
+                        .iter()
+                        .filter(|entry| entry.slug == *selector || entry.worktree == selected_path)
+                        .collect();
+                    let entry = match matches.as_slice() {
+                        [entry] => *entry,
+                        [] => bail!(
+                            "no instance named or recorded at `{selector}`; `grove ls` lists instances"
+                        ),
+                        several => bail!(
+                            "{} instances match `{selector}`; select a worktree path instead",
+                            several.len()
+                        ),
+                    };
+                    if entry.worktree.exists() {
+                        bail!(
+                            "`{selector}` still has its worktree at {}; `grove down` stops it",
+                            entry.worktree.display()
+                        );
+                    }
+                    chosen.insert(entry.worktree.clone(), entry.clone());
+                }
+                chosen.into_values().collect()
+            } else if dry_run {
                 registry
                     .list()?
                     .into_iter()
@@ -784,13 +830,19 @@ fn main() -> Result<()> {
                 .flat_map(|e| e.cache_keys.values().cloned())
                 .collect();
             let store = grove::store::dir()?;
-            let planned_swept = grove::store::unreferenced(&store, &referenced)?;
+            let planned_swept = if selected {
+                Vec::new()
+            } else {
+                grove::store::unreferenced(&store, &referenced)?
+            };
             let stale_temp_count = planned_swept
                 .iter()
                 .filter(|name| name.rsplit_once(".tmp-").is_some())
                 .count();
             let stale_temp_bytes = grove::store::stale_temp_bytes(&store, &planned_swept)?;
-            let swept = if dry_run {
+            let swept = if selected {
+                Vec::new()
+            } else if dry_run {
                 planned_swept.clone()
             } else {
                 grove::store::gc(&store, &referenced)?
@@ -806,6 +858,9 @@ fn main() -> Result<()> {
                 if !dry_run {
                     for handle in orphan.services.values() {
                         grove::supervise::stop(handle)?;
+                    }
+                    if selected {
+                        registry.release(&orphan.worktree)?;
                     }
                 }
                 let ports: Vec<String> = orphan
@@ -854,6 +909,9 @@ fn main() -> Result<()> {
                         );
                     }
                 }
+            }
+            if selected {
+                println!("store sweep skipped; store entries are shared");
             }
             // Once, not once per orphan: eighteen "left in place" lines said eighteen
             // times what one line with the number in it says better.

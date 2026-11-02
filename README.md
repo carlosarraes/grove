@@ -174,7 +174,7 @@ repo's own fixture or settings constructor.
 | `run -- <cmd>` | run a command with this instance's environment overlaid |
 | `logs [service] [--since-restart] [-n N]` | what a service printed |
 | `seed [--force]` | populate the datastore; markers follow the managed container incarnation, while `--force` rebuilds dirtied data |
-| `prune` | stop and forget instances whose worktree is gone |
+| `prune [NAME...] [--worktree PATH]... [--dry-run] [--purge]` | stop and forget all instances whose worktree is gone, or only the selected orphaned instances by `grove ls` name or recorded path; selected prune skips the shared store sweep |
 | `doctor` | check everything needed to start, and say what to fix |
 
 Dependency footprint walks are opt-in: `grove up --footprint` measures after setup. Plain `grove up`, `grove ls` and `grove health` do not walk the worktree; `ls` and health read stored figures and label unmeasured instances with the flag to run next.

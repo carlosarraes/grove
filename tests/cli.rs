@@ -2189,6 +2189,109 @@ fn prune_says_so_when_there_is_nothing_to_reclaim() {
         .stdout(predicates::str::contains("nothing"));
 }
 
+#[test]
+fn prune_by_name_reclaims_only_the_selected_orphan() {
+    let cli = Cli::new();
+    let first = cli.worktree("deleted_first");
+    let second = cli.worktree("deleted_second");
+    for wt in [&first, &second] {
+        cli.run(wt, &["up"]).success();
+        cli.run(wt, &["down"]).success();
+        std::fs::remove_dir_all(wt).expect("delete the worktree");
+    }
+
+    let out = cli
+        .run(&cli.fx.main, &["prune", "deleted_first"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&out);
+    assert!(stdout.contains("deleted_first"), "{stdout}");
+    assert!(!stdout.contains("deleted_second"), "{stdout}");
+    assert!(registry_of(&cli).get(&first).expect("get").is_none());
+    assert!(registry_of(&cli).get(&second).expect("get").is_some());
+
+    let remaining = cli
+        .run(&cli.fx.main, &["prune", "--dry-run"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(String::from_utf8_lossy(&remaining).contains("deleted_second"));
+}
+
+#[test]
+fn prune_rejects_live_selector_before_reclaiming_any_orphan() {
+    let cli = Cli::new();
+    let live = cli.worktree("live_instance");
+    let orphan = cli.worktree("already_orphaned");
+    cli.run(&live, &["up"]).success();
+    cli.run(&orphan, &["up"]).success();
+    cli.run(&orphan, &["down"]).success();
+    std::fs::remove_dir_all(&orphan).expect("delete orphan worktree");
+
+    let output = cli.run(&cli.fx.main, &["prune", "live_instance"]).failure();
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    assert!(
+        stderr.contains("`live_instance` still has its worktree at"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("grove down"), "{stderr}");
+    assert!(registry_of(&cli).get(&orphan).expect("get").is_some());
+
+    cli.run(&live, &["down"]).success();
+}
+
+#[test]
+fn prune_rejects_unknown_selector_without_reclaiming_orphans() {
+    let cli = Cli::new();
+    let orphan = cli.worktree("already_orphaned");
+    cli.run(&orphan, &["up"]).success();
+    cli.run(&orphan, &["down"]).success();
+    std::fs::remove_dir_all(&orphan).expect("delete orphan worktree");
+
+    let output = cli
+        .run(&cli.fx.main, &["prune", "does_not_exist"])
+        .failure();
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    assert!(stderr.contains("does_not_exist"), "{stderr}");
+    assert!(stderr.contains("`grove ls`"), "{stderr}");
+    assert!(registry_of(&cli).get(&orphan).expect("get").is_some());
+}
+
+#[test]
+fn prune_dry_run_with_selector_lists_only_that_orphan() {
+    let cli = Cli::new();
+    let first = cli.worktree("dry_run_first");
+    let second = cli.worktree("dry_run_second");
+    for wt in [&first, &second] {
+        cli.run(wt, &["up"]).success();
+        cli.run(wt, &["down"]).success();
+        std::fs::remove_dir_all(wt).expect("delete the worktree");
+    }
+
+    let out = cli
+        .run(
+            &cli.fx.main,
+            &[
+                "prune",
+                "--worktree",
+                first.to_str().expect("worktree path"),
+                "--dry-run",
+            ],
+        )
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&out);
+    assert!(stdout.contains("dry_run_first"), "{stdout}");
+    assert!(!stdout.contains("dry_run_second"), "{stdout}");
+    assert!(registry_of(&cli).get(&first).expect("get").is_some());
+    assert!(registry_of(&cli).get(&second).expect("get").is_some());
+}
+
 /// `ls` used to reap, which discarded the pids of a deleted worktree's services without
 /// stopping them — leaving processes on the machine that grove could never reach again.
 /// Listing is a read; reclaiming belongs to `prune`.

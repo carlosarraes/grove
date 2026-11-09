@@ -957,7 +957,7 @@ impl Instance {
             eprintln!("seed {}: running (log: {})", seed.name, log.display());
             crate::timing::measure(&format!("seed {}", seed.name), || {
                 let status = crate::timing::with_heartbeat(
-                    std::time::Duration::from_secs(15),
+                    crate::timing::heartbeat_interval(),
                     |elapsed| {
                         let log_status = std::fs::metadata(&log).ok().and_then(|metadata| {
                             let modified = metadata.modified().ok()?;
@@ -1235,7 +1235,7 @@ impl Instance {
             eprintln!("measuring dependency footprint");
             self.entry.disk_bytes = crate::timing::measure("dependency footprint", || {
                 Ok(crate::timing::with_heartbeat(
-                    std::time::Duration::from_secs(15),
+                    crate::timing::heartbeat_interval(),
                     |elapsed| {
                         eprintln!(
                             "still measuring dependency footprint ({}s)",

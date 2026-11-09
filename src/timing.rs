@@ -29,13 +29,13 @@ fn format_progress(phase: &str, elapsed: Duration) -> String {
     format!("{phase}: still waiting ({}s)", elapsed.as_secs())
 }
 
-/// `GROVE_HEARTBEAT_SECS` exists for the test suite; 15s otherwise.
+/// `GROVE_HEARTBEAT_SECS` exists for the test suite; 5s otherwise.
 pub(crate) fn heartbeat_interval() -> Duration {
     let secs = std::env::var("GROVE_HEARTBEAT_SECS")
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|secs| secs.is_finite() && *secs > 0.0)
-        .unwrap_or(15.0);
+        .unwrap_or(5.0);
     Duration::from_secs_f64(secs)
 }
 

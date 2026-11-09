@@ -76,12 +76,17 @@ pub struct Linked {
 /// recreated as symlinks. Never followed: `node_modules/.bin` is relative links into the
 /// tree itself, and a link followed here would become a copy that drifts.
 pub fn link_tree(from: &Path, to: &Path) -> Result<Linked> {
-    let mut linked = Linked {
-        method: LinkMethod::Hardlink,
-        files: 0,
-    };
-    link_dir(from, to, &mut linked, &AtomicU64::new(0))?;
-    Ok(linked)
+    let progress = AtomicU64::new(0);
+    crate::timing::with_heartbeat(
+        crate::timing::heartbeat_interval(),
+        |elapsed| {
+            eprintln!(
+                "{}",
+                format_link_heartbeat(progress.load(Ordering::Relaxed), elapsed)
+            )
+        },
+        || link_tree_counting(from, to, &progress),
+    )
 }
 
 /// `link_tree`, publishing the running file count to `progress` for a heartbeat.
@@ -565,5 +570,23 @@ mod tests {
         assert!(chain.contains("linking /worktree/node_modules/package/file.js"));
         assert!(!chain.contains("volume is full"));
         assert!(!chain.contains("free disk space"));
+    }
+}
+
+fn format_link_heartbeat(files: u64, elapsed: std::time::Duration) -> String {
+    format!(
+        "frontend files: still linking, {files} files ({}s)",
+        elapsed.as_secs()
+    )
+}
+
+#[cfg(test)]
+mod progress_tests {
+    #[test]
+    fn link_heartbeat_reports_count_and_elapsed() {
+        assert_eq!(
+            super::format_link_heartbeat(123, std::time::Duration::from_secs(5)),
+            "frontend files: still linking, 123 files (5s)"
+        );
     }
 }

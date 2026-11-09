@@ -7100,6 +7100,49 @@ fn resource_init_stops_waiting_when_the_container_exits() {
 }
 
 #[test]
+fn resource_init_reports_container_exit_for_non_connection_errors() {
+    let rig = InitResourceRig::new();
+    std::fs::write(rig.cli.docker.as_ref().unwrap().inspect.as_path(), "[]").unwrap();
+    let root = rig.cli.state.path().to_path_buf();
+    let docker = &rig.cli.docker.as_ref().unwrap().program;
+    let body = std::fs::read_to_string(docker).unwrap();
+    std::fs::write(
+        docker,
+        body.replace(
+            "if [ -f \"$root/fail-init\" ]; then echo 'initialization deliberately failed' >&2; exit 42; fi",
+            "if [ -f \"$root/fail-init\" ]; then sleep 0.2; echo 'initialization deliberately failed' >&2; exit 42; fi",
+        ),
+    )
+    .unwrap();
+    let killer = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !root.join("init-attempts").exists() {
+            assert!(std::time::Instant::now() < deadline, "init never ran");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let path = root.join("docker-inspect.json");
+        let mut inspect: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        inspect[0]["State"]["Running"] = false.into();
+        inspect[0]["State"]["ExitCode"] = 125.into();
+        std::fs::write(path, inspect.to_string()).unwrap();
+    });
+    let wt = rig.cli.worktree("init_non_connection_container_exits");
+
+    let output = rig.cli.run(&wt, &["up"]).failure().get_output().clone();
+    killer.join().unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("initialization deliberately failed"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("exited with code 125"), "{stderr}");
+    assert!(stderr.contains("docker logs --tail 50"), "{stderr}");
+    assert!(!wt.join("seed-ran").exists());
+}
+
+#[test]
 fn a_real_resource_init_error_fails_without_waiting() {
     let rig = InitResourceRig::new();
     let wt = rig.cli.worktree("init_real_error");

@@ -11,7 +11,7 @@ version = 1
 [[resource]]
 name = "mongo"
 kind = "docker-shared"
-image = "mongo:8.0.23"
+image = "mongo:8.0.30"
 args = ["--replSet", "rs0"]
 port = {port}
 init = "rs.initiate()"
@@ -70,7 +70,7 @@ fn an_absent_datastore_is_started_from_its_declared_image() {
 
     let line = argv.join(" ");
     assert!(line.starts_with("run -d"), "{line}");
-    assert!(line.contains("mongo:8.0.23"), "{line}");
+    assert!(line.contains("mongo:8.0.30"), "{line}");
     assert!(
         line.contains(&format!("{port}:{port}")),
         "must publish the declared port: {line}"
@@ -96,7 +96,7 @@ fn docker_flags_precede_the_image_and_container_arguments_follow_it() {
 
     let image = argv
         .iter()
-        .position(|a| a == "mongo:8.0.23")
+        .position(|a| a == "mongo:8.0.30")
         .expect("image");
     let repl = argv.iter().position(|a| a == "--replSet").expect("replSet");
     let publish = argv.iter().position(|a| a == "-p").expect("publish");

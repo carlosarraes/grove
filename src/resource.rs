@@ -257,7 +257,7 @@ fn run_init(resource: &Resource, id: &str, init: &str) -> Result<()> {
         || loop {
             match docker(&argv) {
                 Ok(_) => return Ok(()),
-                Err(error) if is_not_listening(&format!("{error:#}")) => {
+                Err(error) => {
                     if let Some(code) = exited(id) {
                         return Err(error).with_context(|| {
                             format!(
@@ -267,6 +267,9 @@ fn run_init(resource: &Resource, id: &str, init: &str) -> Result<()> {
                                 container_name(resource)
                             )
                         });
+                    }
+                    if !is_not_listening(&format!("{error:#}")) {
+                        return Err(error);
                     }
                     let waited = began.elapsed();
                     if waited >= INIT_READY_TIMEOUT {
@@ -280,7 +283,6 @@ fn run_init(resource: &Resource, id: &str, init: &str) -> Result<()> {
                     }
                     std::thread::sleep(Duration::from_millis(500));
                 }
-                Err(error) => return Err(error),
             }
         },
     )
@@ -670,15 +672,39 @@ fn docker(argv: &[String]) -> Result<String> {
         bail!(
             "docker {}: {}",
             argv.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
+            docker_error_message(
+                &String::from_utf8_lossy(&out.stderr),
+                &String::from_utf8_lossy(&out.stdout)
+            )
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+fn docker_error_message<'a>(stderr: &'a str, stdout: &'a str) -> &'a str {
+    let stderr = stderr.trim();
+    if !stderr.is_empty() {
+        stderr
+    } else {
+        let stdout = stdout.trim();
+        if stdout.is_empty() {
+            "no output"
+        } else {
+            stdout
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_inspect;
+    use super::{docker_error_message, parse_inspect};
+
+    #[test]
+    fn docker_failure_uses_stderr_then_stdout_then_empty_message() {
+        assert_eq!(docker_error_message("error", "result"), "error");
+        assert_eq!(docker_error_message("  ", " result\n"), "result");
+        assert_eq!(docker_error_message("", ""), "no output");
+    }
 
     #[test]
     fn inspect_reads_identity_state_exit_and_nofile() {

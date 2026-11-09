@@ -47,7 +47,7 @@ VITE_PROXY_TARGET = "http://localhost:{{ port.backend }}"
 [[resource]]
 name = "mongo"
 kind = "docker-shared"
-image = "mongo:8.0.23"
+image = "mongo:8.0.30"
 args = ["--replSet", "rs0"]
 port = 27017
 init = "try { const r = rs.initiate(); if (r.ok !== 1) throw r; } catch (e) { if (e.code !== 23) { printjson(e); quit(1); } }"

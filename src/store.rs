@@ -1,5 +1,5 @@
 //! One copy of what `setup` produces per set of inputs, shared into every worktree by
-//! hardlink. npm copies bytes on every install; uv links files out of a cache. This is
+//! hardlinks or macOS directory clones. npm copies bytes on every install; uv links files out of a cache. This is
 //! the uv model for any tool: the declared key files decide the tree, the store holds
 //! it once, and a worktree is a private set of names over shared blocks.
 
@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use crate::config::Cache;
@@ -209,23 +209,48 @@ pub fn link_entry(store: &Path, hash: &str, to: &Path) -> Result<Linked> {
             .context("invalid store inventory")
     })?;
     let progress = AtomicU64::new(0);
+    #[cfg(target_os = "macos")]
+    let cloning = AtomicBool::new(macos_clone_enabled());
+    #[cfg(not(target_os = "macos"))]
+    let cloning = AtomicBool::new(false);
     let mut linked = crate::timing::measure(&format!("cache {hash}: tree creation"), || {
         // 5s typical on the Mac, 197s once at load 53 with no output in between.
         crate::timing::with_heartbeat(
             crate::timing::heartbeat_interval(),
             |elapsed| {
-                eprintln!(
-                    "cache {hash}: still linking, {} of {count} files ({}s)",
-                    progress.load(Ordering::Relaxed),
-                    elapsed.as_secs()
-                )
+                if cloning.load(Ordering::Relaxed) {
+                    eprintln!(
+                        "cache {hash}: still cloning {count} files ({}s)",
+                        elapsed.as_secs()
+                    );
+                } else {
+                    eprintln!(
+                        "cache {hash}: still linking, {} of {count} files ({}s)",
+                        progress.load(Ordering::Relaxed),
+                        elapsed.as_secs()
+                    );
+                }
             },
             || {
                 #[cfg(target_os = "macos")]
-                if std::env::var_os("GROVE_MACOS_CLONE").as_deref()
-                    == Some(std::ffi::OsStr::new("1"))
-                {
-                    return clone_tree(&entry(store, hash), to);
+                if cloning.load(Ordering::Relaxed) {
+                    let from = entry(store, hash);
+                    if !from.symlink_metadata()?.is_dir() {
+                        bail!("cache tree {} is not a directory", from.display());
+                    }
+                    match clone_tree(&from, to) {
+                        Ok(linked) => return Ok(linked),
+                        Err(err) => {
+                            match to.symlink_metadata() {
+                                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                                _ => return Err(err),
+                            }
+                            eprintln!(
+                                "cache {hash}: directory clone failed ({err:#}); falling back to per-file hardlinks"
+                            );
+                            cloning.store(false, Ordering::Relaxed);
+                        }
+                    }
                 }
                 link_tree_counting(&entry(store, hash), to, &progress)
             },
@@ -247,13 +272,15 @@ pub fn link_entry(store: &Path, hash: &str, to: &Path) -> Result<Linked> {
 }
 
 #[cfg(target_os = "macos")]
+fn macos_clone_enabled() -> bool {
+    std::env::var_os("GROVE_MACOS_CLONE").as_deref() != Some(std::ffi::OsStr::new("0"))
+}
+
+#[cfg(target_os = "macos")]
 fn clone_tree(from: &Path, to: &Path) -> Result<Linked> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    if !from.symlink_metadata()?.is_dir() {
-        bail!("cache tree {} is not a directory", from.display());
-    }
     let source = CString::new(from.as_os_str().as_bytes())?;
     let destination = CString::new(to.as_os_str().as_bytes())?;
     const CLONE_NOFOLLOW: u32 = 1;
@@ -262,11 +289,7 @@ fn clone_tree(from: &Path, to: &Path) -> Result<Linked> {
     if result != 0 {
         return Err(contextualize_store_link_error(
             std::io::Error::last_os_error(),
-            format!(
-                "cloning {} to {} (GROVE_MACOS_CLONE=1)",
-                from.display(),
-                to.display()
-            ),
+            format!("cloning {} to {}", from.display(), to.display()),
             to,
         ));
     }

@@ -4417,6 +4417,7 @@ fn a_long_link_from_the_store_reports_progress() {
         .env("GROVE_CACHE_DIR", cli.state.path().join("store"))
         .env("GROVE_PORT_RANGE", cli.port_range())
         .env("GROVE_HEARTBEAT_SECS", "0.0002")
+        .env("GROVE_MACOS_CLONE", "0")
         .assert()
         .success()
         .get_output()
@@ -4433,7 +4434,7 @@ fn a_long_link_from_the_store_reports_progress() {
 }
 
 /// The whole point: the second worktree on a lockfile pays nothing for its dependencies.
-/// Names are private per worktree, blocks are shared — the inode says which.
+/// macOS clones isolate writes; other platforms share the store inode.
 #[test]
 fn a_second_worktree_on_the_same_lockfile_links_instead_of_installing() {
     let cli = Cli::with_config(CACHE_CONFIG);
@@ -4446,22 +4447,45 @@ fn a_second_worktree_on_the_same_lockfile_links_instead_of_installing() {
 
     let out = cli.run(&b, &["up"]).success().get_output().stderr.clone();
     let stderr = String::from_utf8_lossy(&out).into_owned();
+    #[cfg(not(target_os = "macos"))]
     assert!(stderr.contains("linked from the store"), "{stderr}");
+    #[cfg(target_os = "macos")]
+    assert!(
+        stderr.contains("dependencies cloned from the store"),
+        "{stderr}"
+    );
     assert_eq!(installs(&cli), 1, "the second worktree ran setup again");
 
     use std::os::unix::fs::MetadataExt;
     let blob_a = a.join("node_modules/blob").metadata().expect("a's blob");
     let blob_b = b.join("node_modules/blob").metadata().expect("b's blob");
-    assert_eq!(
-        blob_a.ino(),
-        blob_b.ino(),
-        "the two worktrees hold different blocks"
-    );
-    assert!(
-        blob_b.nlink() >= 3,
-        "store + two worktrees, got nlink {}",
-        blob_b.nlink()
-    );
+    #[cfg(not(target_os = "macos"))]
+    {
+        assert_eq!(
+            blob_a.ino(),
+            blob_b.ino(),
+            "the two worktrees hold different blocks"
+        );
+        assert!(
+            blob_b.nlink() >= 3,
+            "store + two worktrees, got nlink {}",
+            blob_b.nlink()
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        assert_ne!(blob_a.ino(), blob_b.ino());
+        let original = std::fs::read(a.join("node_modules/blob")).unwrap();
+        std::fs::write(b.join("node_modules/blob"), "private change").unwrap();
+        assert_eq!(
+            std::fs::read(a.join("node_modules/blob")).unwrap(),
+            original
+        );
+        assert_eq!(
+            a.join("node_modules/blob").metadata().unwrap().len(),
+            blob_a.len()
+        );
+    }
 
     cli.run(&a, &["down"]).success();
     cli.run(&b, &["down"]).success();
@@ -5539,9 +5563,31 @@ fn clone_trial_isolates_writes_and_preserves_links_modes_and_replacement() {
     }
     let normal = cli.worktree("default");
     cli.run(&normal, &["up"]).success();
-    assert_eq!(
+    assert_ne!(
         seed.join("node_modules/blob").metadata().unwrap().ino(),
         normal.join("node_modules/blob").metadata().unwrap().ino()
+    );
+    let hardlinked = cli.worktree("opt_out");
+    let output = Command::cargo_bin("grove")
+        .unwrap()
+        .current_dir(&hardlinked)
+        .env("GROVE_STATE_DIR", cli.state.path())
+        .env("GROVE_CACHE_DIR", cli.state.path().join("store"))
+        .env("GROVE_PORT_RANGE", cli.port_range())
+        .env("GROVE_MACOS_CLONE", "0")
+        .arg("up")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("linked from the store"), "{stderr}");
+    assert_eq!(
+        seed.join("node_modules/blob").metadata().unwrap().ino(),
+        hardlinked
+            .join("node_modules/blob")
+            .metadata()
+            .unwrap()
+            .ino()
     );
     assert_eq!(installs(&cli), 1);
 }

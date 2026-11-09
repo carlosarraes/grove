@@ -355,27 +355,31 @@ The result describes the moment after the timeout, not the whole startup interva
 `grove doctor` warns when a setup command has neither `setup_inputs` nor `cache`.
 A readiness probe without an explicit `timeout` remains a configuration error.
 
-## Opt-in macOS clone trial
+## macOS directory clones
 
-On macOS, `GROVE_MACOS_CLONE=1 grove up` clones a warm cache entry into the staging directory.
-The flag is off by default. Linux ignores it and retains hardlinks.
-Cold installs and cache publication retain the existing path.
-A matching setup marker still skips setup, so the flag alone does not replace an existing install.
+On macOS, `grove up` restores warm cache entries with APFS directory cloning by default.
+Clones have separate inodes and isolate writes from the store and other worktrees while
+sharing blocks through copy-on-write. Set `GROVE_MACOS_CLONE=0` to opt out and use per-file
+hardlinks. Only the exact value `0` disables cloning; unset, empty, and all other values enable it.
+Linux ignores this variable and always uses hardlinks. Cold installs and cache publication
+also retain hardlinks. A matching setup marker still skips setup, so changing the variable
+alone does not replace an existing install.
 
-The trial uses APFS directory cloning. Apple discourages this API for directory trees:
+Grove uses directory `clonefile` with `CLONE_NOFOLLOW`, preserving symlinks without following them.
+Apple discourages this API for directory trees:
 see [clonefile](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/man/man2/clonefile.2).
-Unsupported volumes and clone errors fail setup and preserve the previous install.
-Unset the flag to use the normal path. Grove does not silently retry with another strategy.
+If cloning fails and the destination was not created, Grove prints a warning and falls back
+to per-file hardlinks. If a destination exists after failure, setup fails and preserves the
+previous install. Hardlink restores share inodes and do not isolate writes.
 
-The clone must pass the existing inventory count before replacement. This count detects
-missing entries, but does not verify file names or contents. Grove preserves symlinks without following them.
+After cloning, Grove recounts files and checks the stored inventory before replacing the
+install. This detects missing entries, but does not verify file names or contents.
 Cleanup of the old install stays synchronous. Cleanup errors warn and retain the backup.
 
-Disk accounting has a known trial limitation. Grove detects shared hardlinks, but cannot
-distinguish APFS clone blocks from private blocks through that check.
-The private-dependency figures in `ls` and `health` can therefore overstate unique disk use
-and space reclaimable from cloned installs. Those figures are not reliable for clone trials.
-This change does not fix accounting for cloned blocks.
+Disk accounting has a known limitation: Grove detects shared hardlinks, but cannot
+distinguish APFS clone extents from private blocks through that check. Unique-byte and
+reclaimable-space figures in `ls`, `health`, and `clean` can therefore overstate cloned
+installs. This change does not fix accounting for cloned blocks.
 
 Grove measures private-dependency footprint only when `grove up --footprint` is passed.
 `ls` and `health` read the stored figure; unmeasured instances point to this flag.

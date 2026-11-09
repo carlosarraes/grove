@@ -69,8 +69,8 @@ setup = "npm ci"
 command = "npm run dev -- --port {{ port.frontend }} --strictPort"
 ready = { http = "http://localhost:{{ port.frontend }}/", timeout = "180s" }
 
-# Every worktree on this lockfile shares one node_modules, hardlinked out of grove's
-# store. Only the first pays for the install; the rest link it in seconds.
+# Only the first worktree on this lockfile pays for the install. Warm restores use
+# write-isolated macOS directory clones in seconds; Linux uses per-file hardlinks.
 [service.cache]
 path = "node_modules"
 key = ["package-lock.json"]
@@ -218,8 +218,9 @@ config without starting shared containers, seeds, or services.
   ready.timeout      how long to wait, e.g. "180s"
   cache.path         what setup leaves behind, relative to cwd (node_modules)
   cache.key          the files that decide it, relative to cwd (package-lock.json).
-                     Worktrees whose key files match byte for byte share one copy,
-                     hardlinked from grove's store; a changed lockfile is a new copy.
+                     Worktrees whose key files match byte for byte share one copy
+                     from grove's store (macOS directory clones, Linux hardlinks);
+                     a changed lockfile is a new copy.
                      Only the first worktree on a lockfile pays for the install.
                      Ordinary up refreshes existing worktrees when these inputs change.
                      Concurrent readers share an entry; replacement and GC wait for them.

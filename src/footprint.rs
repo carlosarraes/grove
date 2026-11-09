@@ -46,6 +46,11 @@ pub fn measure(worktree: &Path) -> Option<u64> {
     Some(total)
 }
 
+/// Private allocated blocks across the entire checkout that removing it can reclaim.
+pub fn unique_reclaimable(root: &Path) -> u64 {
+    walk(root, Sharing::PrivateOnly, &mut HashSet::new())
+}
+
 /// Bytes under a tree grove owns outright — a store entry — counting every block once.
 pub fn tree_size(root: &Path) -> u64 {
     walk(root, Sharing::CountOnce, &mut HashSet::new())

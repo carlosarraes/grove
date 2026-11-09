@@ -105,10 +105,11 @@ impl Machine {
     version,
     about,
     disable_help_subcommand = true,
-    after_help = "Commands act on the worktree you run them in. `ls`, `status`, `doctor`, `down` and `gate` \
-                  also take an instance name as `grove ls` shows it, or a worktree path: \
+    after_help = "Worktree commands act on the worktree you run them in. `ls`, `health`, `prune` and \
+                  `clean` are machine-wide. `ls`, `status`, `doctor`, `down`, `gate`, `prune` and \
+                  `clean` accept instance names as `grove ls` shows them, or worktree paths: \
                   `grove status feature_branch`. `--worktree` is an alias for the positional \
-                  target on `ls`, `status` and `gate`."
+                  target on `ls`, `status` and `gate`; it is repeatable on `prune` and `clean`."
 )]
 struct Cli {
     /// Emit the .grove.toml schema and worked examples, then exit
@@ -241,6 +242,21 @@ enum Command {
     },
     /// Stop a service and start it again; all of them if none is named
     Restart { service: Option<String> },
+    /// Remove idle grove-linked git worktrees (dry-run by default); prune forgets orphaned instances
+    Clean {
+        /// Instance names as `grove ls` shows them, or recorded worktree paths
+        #[arg(value_name = "NAME")]
+        names: Vec<String>,
+        /// Select by recorded worktree path (repeatable)
+        #[arg(long = "worktree", value_name = "PATH", action = clap::ArgAction::Append)]
+        worktrees: Vec<String>,
+        /// Delete eligible worktrees; without this flag clean is a dry run
+        #[arg(long, conflicts_with = "dry_run")]
+        yes: bool,
+        /// Explicit dry run (the default); change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Stop and forget all orphaned instances, or only the selected orphans
     Prune {
         /// Instance names as `grove ls` shows them, or recorded worktree paths
@@ -762,6 +778,15 @@ fn main() -> Result<()> {
             instance.up(false, false, false, &[])?;
             print_summary(&instance, None, &[]);
             Ok(())
+        }
+        Some(Command::Clean {
+            names,
+            worktrees,
+            yes,
+            dry_run: _,
+        }) => {
+            let selectors: Vec<String> = names.into_iter().chain(worktrees).collect();
+            grove::clean::run(&cwd, &selectors, yes)
         }
         Some(Command::Prune {
             names,

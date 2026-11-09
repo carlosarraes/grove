@@ -7985,3 +7985,228 @@ fn down_stops_an_up_that_is_still_running_before_tearing_down() {
     let again = String::from_utf8_lossy(&again.get_output().stdout).into_owned();
     assert!(!again.contains("grove up (pid"), "{again}");
 }
+
+fn clean_linked(cli: &Cli, name: &str, upstream: bool) -> std::path::PathBuf {
+    let wt = cli.worktree(name);
+    cli.run(&wt, &["status"]).success();
+    if upstream {
+        let remote = cli.state.path().join(format!("{name}.git"));
+        common::git(&cli.fx.main, &["init", "--bare", remote.to_str().unwrap()]);
+        common::git(&wt, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        common::git(&wt, &["push", "-u", "origin", name]);
+    }
+    wt
+}
+
+#[test]
+fn clean_defaults_to_dry_run_and_skips_no_upstream() {
+    let cli = Cli::new();
+    let wt = clean_linked(&cli, "no_upstream", false);
+    cli.run(&cli.fx.main, &["clean"])
+        .success()
+        .stdout(predicates::str::contains("no upstream"));
+    assert!(wt.exists());
+    // Even an eligible tree survives the default and explicit dry run.
+    common::git(&wt, &["branch", "--set-upstream-to=main"]);
+    for args in [&["clean"][..], &["clean", "--dry-run"][..]] {
+        cli.run(&cli.fx.main, args)
+            .success()
+            .stdout(predicates::str::contains("would free"));
+        assert!(wt.exists());
+    }
+}
+
+#[test]
+fn clean_yes_removes_worktree_and_releases_registry() {
+    let cli = Cli::new();
+    let wt = clean_linked(&cli, "idle_clean", true);
+    cli.run(&cli.fx.main, &["clean", "--yes"])
+        .success()
+        .stdout(predicates::str::contains("removed, freed"));
+    assert!(!wt.exists());
+    assert!(
+        !common::git(&cli.fx.main, &["worktree", "list", "--porcelain"])
+            .contains(wt.to_str().unwrap())
+    );
+    let registry = grove::registry::Registry::at(cli.state.path().join("registry.json"));
+    assert!(registry.get(&wt).unwrap().is_none());
+    assert!(registry.get(&cli.fx.main).unwrap().is_none());
+}
+
+#[test]
+fn clean_skips_dirty_worktrees() {
+    let cli = Cli::new();
+    let wt = clean_linked(&cli, "dirty_clean", true);
+    std::fs::write(wt.join("uncommitted"), "keep me").unwrap();
+    for args in [&["clean"][..], &["clean", "--yes"][..]] {
+        cli.run(&cli.fx.main, args)
+            .success()
+            .stdout(predicates::str::contains("uncommitted changes"));
+        assert!(wt.exists());
+    }
+}
+
+// A separate test process supplies GROVE_STATE_DIR without mutating the parallel suite's env.
+#[test]
+fn clean_lock_holder() {
+    let Some(wt) = std::env::var_os("GROVE_CLEAN_LOCK_TREE") else {
+        return;
+    };
+    let _lock = grove::instance::lock_up(Path::new(&wt)).unwrap();
+    println!("locked");
+    use std::io::Write;
+    std::io::stdout().flush().unwrap();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).unwrap();
+}
+
+#[test]
+fn clean_skips_locked_worktree() {
+    use std::io::{BufRead, Write};
+    use std::process::Stdio;
+    let cli = Cli::new();
+    let wt = clean_linked(&cli, "locked_clean", false);
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "clean_lock_holder", "--nocapture"])
+        .env("GROVE_STATE_DIR", cli.state.path())
+        .env("GROVE_CLEAN_LOCK_TREE", &wt)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    loop {
+        if lines
+            .next()
+            .expect("lock holder exited")
+            .unwrap()
+            .ends_with("locked")
+        {
+            break;
+        }
+    }
+    let output = cli.run(&cli.fx.main, &["clean"]);
+    child.stdin.take().unwrap().write_all(b"done\n").unwrap();
+    assert!(child.wait().unwrap().success());
+    output
+        .success()
+        .stdout(predicates::str::contains("instance lock"));
+    assert!(wt.exists());
+}
+
+#[test]
+fn clean_skips_open_files() {
+    let cli = Cli::new();
+    let wt = clean_linked(&cli, "open_clean", false);
+    let _file = std::fs::File::open(wt.join("README.md")).unwrap();
+    cli.run(&cli.fx.main, &["clean", "--yes"])
+        .success()
+        .stdout(predicates::str::contains("open files (pid"));
+    assert!(wt.exists());
+}
+
+#[test]
+fn clean_freed_bytes_exclude_hardlinks() {
+    let cli = Cli::new();
+    let wt = clean_linked(&cli, "bytes_clean", true);
+    let deps = wt.join("node_modules");
+    std::fs::create_dir(&deps).unwrap();
+    std::fs::write(deps.join("private"), vec![1u8; 1024 * 1024]).unwrap();
+    let shared = cli.state.path().join("shared");
+    std::fs::write(&shared, vec![2u8; 1024 * 1024]).unwrap();
+    std::fs::hard_link(&shared, deps.join("shared")).unwrap();
+    let bytes = grove::footprint::unique_reclaimable(&wt);
+    assert!((1024 * 1024..1200 * 1024).contains(&bytes), "{bytes}");
+    let size = grove::footprint::human_size(bytes);
+    cli.run(&cli.fx.main, &["clean"])
+        .success()
+        .stdout(predicates::str::contains(format!("would free {size}")));
+    cli.run(&cli.fx.main, &["clean", "--yes"])
+        .success()
+        .stdout(predicates::str::contains(format!("removed, freed {size}")));
+    assert!(!wt.exists());
+    assert!(shared.exists());
+}
+
+#[test]
+fn clean_refuses_when_lsof_is_missing() {
+    let cli = Cli::new();
+    let wt = clean_linked(&cli, "missing_lsof", true);
+    let bin = cli.state.path().join("only-git");
+    std::fs::create_dir(&bin).unwrap();
+    let git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|p| p.join("git"))
+        .find(|p| p.is_file())
+        .unwrap();
+    std::os::unix::fs::symlink(git, bin.join("git")).unwrap();
+    Command::cargo_bin("grove")
+        .unwrap()
+        .current_dir(&cli.fx.main)
+        .env("GROVE_STATE_DIR", cli.state.path())
+        .env("PATH", &bin)
+        .args(["clean", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "lsof not found; refusing to delete",
+        ));
+    assert!(wt.exists());
+}
+
+#[test]
+fn clean_skips_running_stack() {
+    let cli = Cli::new();
+    let wt = cli.worktree("running_clean");
+    cli.run(&wt, &["up"]).success();
+    cli.run(&cli.fx.main, &["clean", "--yes"])
+        .success()
+        .stdout(predicates::str::contains("running stack"));
+    assert!(wt.exists());
+}
+
+#[test]
+fn clean_unknown_selector_reclaims_nothing() {
+    let cli = Cli::new();
+    let wt = clean_linked(&cli, "selected_clean", true);
+    cli.run(
+        &cli.fx.main,
+        &["clean", "selected_clean", "unknown", "--yes"],
+    )
+    .failure()
+    .stderr(predicates::str::contains("no instance named"));
+    assert!(wt.exists());
+}
+
+#[test]
+fn clean_never_removes_primary_or_unlinked_worktree() {
+    let cli = Cli::new();
+    cli.run(&cli.fx.main, &["status"]).success();
+    let unlinked = cli.fx.add_worktree("unlinked_clean");
+    cli.run(&cli.fx.main, &["clean", "--yes"])
+        .success()
+        .stdout(predicates::str::contains("primary worktree"));
+    assert!(cli.fx.main.exists());
+    assert!(unlinked.exists());
+}
+
+#[test]
+fn clean_skips_unpushed_commits() {
+    let cli = Cli::new();
+    let wt = clean_linked(&cli, "unpushed_clean", true);
+    std::fs::write(wt.join("README.md"), "not pushed\n").unwrap();
+    common::git(&wt, &["add", "README.md"]);
+    common::git(&wt, &["commit", "-m", "local commit"]);
+    cli.run(&cli.fx.main, &["clean", "--yes"])
+        .success()
+        .stdout(predicates::str::contains("unpushed commits"));
+    assert!(wt.exists());
+}
+
+#[test]
+fn clean_yes_conflicts_with_explicit_dry_run() {
+    let cli = Cli::new();
+    let wt = clean_linked(&cli, "conflicting_clean", false);
+    cli.run(&cli.fx.main, &["clean", "--yes", "--dry-run"])
+        .failure();
+    assert!(wt.exists());
+}

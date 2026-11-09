@@ -1,3 +1,4 @@
+pub mod clean;
 pub mod config;
 pub mod doctor;
 pub mod exposure;

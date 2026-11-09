@@ -1488,6 +1488,7 @@ impl Instance {
                 && previous
                     .as_ref()
                     .is_some_and(|receipt| receipt.complete && receipt.identity == identity)
+                && !venv_lock_drifted(cwd, name)
             {
                 return Ok(SetupOutcome::Skipped);
             }
@@ -1546,6 +1547,7 @@ impl Instance {
         if !mode.no_cache
             && built.is_dir()
             && std::fs::read_to_string(&marker).ok().as_deref() == Some(hash.as_str())
+            && !venv_lock_drifted(cwd, name)
         {
             return Ok(SetupOutcome::Skipped);
         }
@@ -1949,6 +1951,26 @@ pub fn parse_duration(text: &str) -> Result<std::time::Duration> {
         .checked_mul(multiplier)
         .with_context(|| format!("{text:?} is too large a duration"))?;
     Ok(std::time::Duration::from_millis(milliseconds))
+}
+
+fn venv_lock_drifted(cwd: &Path, name: &str) -> bool {
+    if !cwd.join("uv.lock").exists() || !cwd.join(".venv").is_dir() {
+        return false;
+    }
+    let drifted = match std::process::Command::new("uv")
+        .args(["sync", "--frozen", "--check"])
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(status) => !status.success(),
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    };
+    if drifted {
+        eprintln!("{name}: .venv does not match uv.lock; rerunning setup");
+    }
+    drifted
 }
 
 /// Only local Python environments participate in relocation recovery.

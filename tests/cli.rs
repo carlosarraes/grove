@@ -5634,6 +5634,136 @@ fn input_setup_runs(wt: &Path) -> usize {
         .count()
 }
 
+fn input_setup_with_venv_config() -> String {
+    INPUT_SETUP_CONFIG.replace(
+        "echo installed >> installs",
+        "mkdir -p .venv/bin; touch .venv/pyvenv.cfg; printf '#!/bin/sh\\nexit 0\\n' > .venv/bin/python; chmod +x .venv/bin/python; echo installed >> installs",
+    )
+}
+
+#[test]
+fn setup_receipt_checks_uv_lock_before_skipping() {
+    use std::os::unix::fs::PermissionsExt;
+    for drifted in [false, true] {
+        let cli = Cli::with_config(&input_setup_with_venv_config());
+        let wt = input_setup_worktree(&cli);
+        cli.run(&wt, &["up", "--setup-only"]).success();
+        assert_eq!(input_setup_runs(&wt), 1);
+        let uv = cli.state.path().join("uv");
+        std::fs::write(
+            &uv,
+            format!(
+                "#!/bin/sh\nfrozen=0\ncheck=0\nfor arg in \"$@\"; do\ncase \"$arg\" in --frozen) frozen=1;; --check) check=1;; esac\ndone\nif [ \"$frozen$check\" = 11 ]; then echo checked >> uv-checks; exit {}; fi\nexit 0\n",
+                i32::from(drifted)
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&uv, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = cli
+            .run(&wt, &["up", "--setup-only"])
+            .success()
+            .get_output()
+            .clone();
+        assert_eq!(input_setup_runs(&wt), if drifted { 2 } else { 1 });
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("web: .venv does not match uv.lock; rerunning setup"),
+            drifted
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join("backend/uv-checks")).unwrap(),
+            "checked\n"
+        );
+    }
+}
+
+#[test]
+fn cached_setup_checks_uv_lock_before_skipping() {
+    use std::os::unix::fs::PermissionsExt;
+    let config = input_setup_with_venv_config()
+        .replace("setup_inputs = [\"uv.lock\", \"pyproject.toml\"]", "")
+        + "\n[service.cache]\npath = \".venv\"\nkey = [\"uv.lock\"]\n";
+    let cli = Cli::with_config(&config);
+    let wt = input_setup_worktree(&cli);
+    cli.run(&wt, &["up", "--setup-only"]).success();
+    let uv = cli.state.path().join("uv");
+    for drifted in [false, true] {
+        std::fs::write(
+            &uv,
+            format!(
+                "#!/bin/sh\n[ \"$*\" = 'sync --frozen --check' ] || exit 2\necho checked >> uv-checks\nexit {}\n",
+                i32::from(drifted)
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&uv, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = cli
+            .run(&wt, &["up", "--setup-only"])
+            .success()
+            .get_output()
+            .clone();
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("web: .venv does not match uv.lock; rerunning setup"),
+            drifted
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(wt.join("backend/uv-checks")).unwrap(),
+        "checked\nchecked\n"
+    );
+}
+
+#[test]
+fn setup_receipt_still_skips_when_uv_is_not_on_path() {
+    let cli = Cli::with_config(&input_setup_with_venv_config());
+    let wt = input_setup_worktree(&cli);
+    cli.run(&wt, &["up", "--setup-only"]).success();
+    let empty_path = tempfile::tempdir().unwrap();
+    let mut command = Command::cargo_bin("grove").expect("binary");
+    let output = command
+        .current_dir(&wt)
+        .env("GROVE_STATE_DIR", cli.state.path())
+        .env("GROVE_CACHE_DIR", cli.state.path().join("store"))
+        .env("GROVE_PORT_RANGE", cli.port_range())
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", empty_path.path().display()),
+        )
+        .args(["up", "--setup-only"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert_eq!(input_setup_runs(&wt), 1);
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(".venv does not match uv.lock"));
+}
+
+#[test]
+fn uncached_setup_output_explains_the_grove_dependency_cache() {
+    let cli = Cli::with_config(INPUT_SETUP_CONFIG);
+    let wt = input_setup_worktree(&cli);
+    for (args, expected) in [
+        (
+            vec!["up", "--setup-only", "--dry-run"],
+            "web: will run setup (no grove dependency cache)",
+        ),
+        (
+            vec!["up", "--setup-only"],
+            "web: ran setup (no grove dependency cache)",
+        ),
+    ] {
+        let output = cli.run(&wt, &args).success().get_output().clone();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(text.contains(expected), "{text}");
+        assert!(!text.contains("no cache declared"), "{text}");
+    }
+}
+
 #[test]
 fn setup_inputs_rerun_only_when_declared_inputs_or_command_change() {
     let cli = Cli::with_config(INPUT_SETUP_CONFIG);

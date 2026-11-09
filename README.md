@@ -179,7 +179,7 @@ repo's own fixture or settings constructor.
 
 Dependency footprint walks are opt-in: `grove up --footprint` measures after setup. Plain `grove up`, `grove ls` and `grove health` do not walk the worktree; `ls` and health read stored figures and label unmeasured instances with the flag to run next.
 
-Do not write a separate `.grove.toml` to install dependencies. Use `grove up --setup-only` (optionally `--dry-run` first): a hand-written config hashes different cache inputs and misses the shared store. Dry-run reports per-service cache hit, cache miss, or no cache declared without installing or linking anything. Setup-only uses the inherited project config and normal cache logic, linking a stored tree on a hit and installing and storing it on a miss, without starting shared containers, seeds, or services. Combine it with `--no-cache` to rebuild cached dependencies or `--footprint` to measure the resulting dependency footprint.
+Do not write a separate `.grove.toml` to install dependencies. Use `grove up --setup-only` (optionally `--dry-run` first): a hand-written config hashes different cache inputs and misses the shared store. Dry-run reports per-service cache hit, cache miss, or `will run setup (no grove dependency cache)` without installing or linking anything. Setup-only uses the inherited project config and normal cache logic, linking a stored tree on a hit and installing and storing it on a miss, without starting shared containers, seeds, or services. Combine it with `--no-cache` to rebuild cached dependencies or `--footprint` to measure the resulting dependency footprint.
 
 ## Admit heavy commands by load
 
@@ -299,7 +299,8 @@ setup_inputs = ["uv.lock", "pyproject.toml"]
 Paths are relative to the service's `cwd`. Grove reruns setup when the command,
 file names or file contents change. Without `setup_inputs`, the command supplies
 its identity. Missing or unreadable inputs fail setup. Setup that fails or changes
-its inputs does not receive a completed receipt.
+its inputs does not receive a completed receipt. When `uv` is available, Grove also
+reruns setup when an existing `.venv` does not match `uv.lock`.
 
 Uncached setup records whether it produced a local Python venv. Grove requires
 `.venv/pyvenv.cfg`, an executable `.venv/bin/python`, and a matching directory in

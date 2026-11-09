@@ -1489,7 +1489,9 @@ fn setup_outcome_line(
     let cache_path = service.cache.as_ref().map(|cache| cache.path.as_str());
     match outcome {
         SetupOutcome::Skipped => format!("{}: setup up to date, nothing to do", service.name),
-        SetupOutcome::Installed => format!("{}: no cache declared, ran setup", service.name),
+        SetupOutcome::Installed => {
+            format!("{}: ran setup (no grove dependency cache)", service.name)
+        }
         SetupOutcome::Linked { hash } => format!(
             "{}: cache hit, linked {} from store ({})",
             service.name,
@@ -1508,7 +1510,7 @@ fn setup_outcome_line(
 fn setup_plan_line(name: &str, plan: &grove::instance::SetupInstallPlan) -> String {
     use grove::instance::SetupInstallPlan;
     match plan {
-        SetupInstallPlan::NoCache => format!("{name}: no cache declared"),
+        SetupInstallPlan::NoCache => format!("{name}: will run setup (no grove dependency cache)"),
         SetupInstallPlan::LinkOnly | SetupInstallPlan::AlreadyInPlace => {
             format!("{name}: cache hit (link-only)")
         }

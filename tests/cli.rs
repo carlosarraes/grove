@@ -8299,3 +8299,23 @@ fn clean_yes_conflicts_with_explicit_dry_run() {
         .failure();
     assert!(wt.exists());
 }
+
+#[test]
+fn setup_only_preserves_idle_sibling() {
+    let config = CONFIG.replace("[ports]", "[idle]\nstop_after = \"1h\"\n\n[ports]");
+    let cli = Cli::with_config(&config);
+    let stale = cli.worktree("idle_sibling");
+    let fresh = cli.worktree("setup_dependencies");
+    cli.run(&stale, &["up"]).success();
+    backdate(&cli, &stale, 3 * 3600);
+    for args in [
+        vec!["up", "--setup-only", "--dry-run"],
+        vec!["up", "--setup-only"],
+    ] {
+        cli.run(&fresh, &args).success();
+        assert!(registry_of(&cli).get(&stale).unwrap().unwrap().is_running());
+    }
+    cli.run(&fresh, &["up"]).success();
+    assert!(!registry_of(&cli).get(&stale).unwrap().unwrap().is_running());
+    cli.run(&fresh, &["down"]).success();
+}

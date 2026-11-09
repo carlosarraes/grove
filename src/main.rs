@@ -414,7 +414,10 @@ fn main() -> Result<()> {
             if !dry_run {
                 instance.touch()?;
             }
-            if !dry_run && let Some(idle) = &instance.config.idle {
+            if !setup_only
+                && !dry_run
+                && let Some(idle) = &instance.config.idle
+            {
                 enforce_idle(&instance, &idle.stop_after)?;
             }
 

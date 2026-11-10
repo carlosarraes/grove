@@ -150,6 +150,51 @@ fn remove_path(path: &Path) -> Result<()> {
     .with_context(|| format!("removing {}", path.display()))
 }
 
+fn copy_install(from: &Path, to: &Path) -> Result<()> {
+    let metadata = from.symlink_metadata()?;
+    if metadata.is_symlink() {
+        std::os::unix::fs::symlink(std::fs::read_link(from)?, to)?;
+    } else if metadata.is_dir() {
+        std::fs::create_dir(to)?;
+        for item in std::fs::read_dir(from)? {
+            let item = item?;
+            copy_install(&item.path(), &to.join(item.file_name()))?;
+        }
+        // Apply directory permissions after populating potentially read-only trees.
+        std::fs::set_permissions(to, metadata.permissions())?;
+    } else if metadata.is_file() {
+        std::fs::copy(from, to)?;
+    } else {
+        bail!("unsupported dependency file type at {}", from.display());
+    }
+    Ok(())
+}
+
+fn move_install(from: &Path, to: &Path) -> Result<()> {
+    match std::fs::rename(from, to) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {}
+        Err(error) => return Err(error.into()),
+    }
+    if let Err(error) = copy_install(from, to)
+        .with_context(|| format!("copying {} to {}", from.display(), to.display()))
+    {
+        if to.symlink_metadata().is_ok()
+            && let Err(cleanup) = remove_path(to)
+        {
+            return Err(error.context(format!("partial copy cleanup failed: {cleanup:#}")));
+        }
+        return Err(error);
+    }
+    remove_path(from).with_context(|| {
+        format!(
+            "copy complete at {}; could not remove source {}",
+            to.display(),
+            from.display()
+        )
+    })
+}
+
 /// Restore the previous install if setup or publication fails.
 struct InstallChange {
     path: PathBuf,
@@ -163,9 +208,8 @@ impl InstallChange {
             bail!("unfinished dependency backup at {}", backup.display());
         }
         if path.symlink_metadata().is_ok() {
-            std::fs::rename(path, &backup).with_context(|| {
-                format!("moving {} to {}; the install and Grove state directory must be on the same filesystem", path.display(), backup.display())
-            })?;
+            move_install(path, &backup)
+                .with_context(|| format!("moving {} to {}", path.display(), backup.display()))?;
         }
         Ok(Self {
             path: path.to_owned(),
@@ -201,7 +245,7 @@ impl InstallChange {
             remove_path(&self.path)?;
         }
         if self.backup.symlink_metadata().is_ok() {
-            std::fs::rename(&self.backup, &self.path).with_context(|| {
+            move_install(&self.backup, &self.path).with_context(|| {
                 format!(
                     "restoring {} from {}",
                     self.path.display(),
@@ -2057,6 +2101,163 @@ fn bounded_database_name(name: &str) -> String {
         end -= 1;
     }
     format!("{}_{hash:016x}", &name[..end])
+}
+
+#[cfg(test)]
+mod install_change_tests {
+    use super::InstallChange;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::path::Path;
+
+    fn make_install(path: &Path) {
+        std::fs::create_dir_all(path.join("bin")).unwrap();
+        std::fs::write(path.join("bin/python3"), "previous interpreter").unwrap();
+        std::fs::write(path.join("pyvenv.cfg"), "previous config").unwrap();
+        symlink("python3", path.join("bin/python")).unwrap();
+        symlink("missing", path.join("bin/dangling")).unwrap();
+        symlink("/usr/bin/python3", path.join("bin/system-python")).unwrap();
+        symlink("bin", path.join("linked-bin")).unwrap();
+        for (relative, mode) in [
+            ("", 0o751),
+            ("bin", 0o750),
+            ("bin/python3", 0o751),
+            ("pyvenv.cfg", 0o440),
+        ] {
+            std::fs::set_permissions(path.join(relative), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        }
+    }
+
+    fn assert_install(path: &Path) {
+        assert_eq!(
+            std::fs::read(path.join("bin/python3")).unwrap(),
+            b"previous interpreter"
+        );
+        assert_eq!(
+            std::fs::read(path.join("pyvenv.cfg")).unwrap(),
+            b"previous config"
+        );
+        for (relative, target) in [
+            ("bin/python", "python3"),
+            ("bin/dangling", "missing"),
+            ("bin/system-python", "/usr/bin/python3"),
+            ("linked-bin", "bin"),
+        ] {
+            assert_eq!(
+                std::fs::read_link(path.join(relative)).unwrap(),
+                Path::new(target)
+            );
+        }
+        for (relative, mode) in [
+            ("", 0o751),
+            ("bin", 0o750),
+            ("bin/python3", 0o751),
+            ("pyvenv.cfg", 0o440),
+        ] {
+            assert_eq!(
+                std::fs::metadata(path.join(relative))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                mode
+            );
+        }
+    }
+
+    #[test]
+    fn backup_install_between_worktree_and_temp_filesystems() {
+        let worktree = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let path = worktree.path().join(".venv");
+        let backup = state.path().join("backend-backup");
+        make_install(&path);
+
+        let change = InstallChange::begin(&path, backup.clone()).unwrap();
+
+        assert!(!path.exists());
+        assert_install(&backup);
+        change.commit("backend");
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn rollback_install_between_temp_and_worktree_filesystems() {
+        let worktree = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let path = worktree.path().join(".venv");
+        let backup = state.path().join("backend-backup");
+        make_install(&backup);
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("partial-install"), "failed setup").unwrap();
+        let mut change = InstallChange {
+            path: path.clone(),
+            backup: backup.clone(),
+            committed: false,
+        };
+
+        change.rollback().unwrap();
+
+        assert_install(&path);
+        assert!(!path.join("partial-install").exists());
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn file_and_dangling_symlink_installs_survive_backup_and_drop() {
+        let worktree = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let state = tempfile::tempdir().unwrap();
+        for is_symlink in [false, true] {
+            let path = worktree.path().join("install");
+            let backup = state.path().join("backup");
+            if is_symlink {
+                symlink("missing-install", &path).unwrap();
+            } else {
+                std::fs::write(&path, "old install").unwrap();
+            }
+
+            let change = InstallChange::begin(&path, backup.clone()).unwrap();
+            assert!(path.symlink_metadata().is_err());
+            assert!(backup.symlink_metadata().is_ok());
+            drop(change);
+
+            assert!(backup.symlink_metadata().is_err());
+            if is_symlink {
+                assert_eq!(
+                    std::fs::read_link(&path).unwrap(),
+                    Path::new("missing-install")
+                );
+            } else {
+                assert_eq!(std::fs::read(&path).unwrap(), b"old install");
+            }
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_cross_device_copy_retains_install_and_removes_partial_backup() {
+        let worktree = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let state = tempfile::tempdir().unwrap();
+        if std::fs::metadata(worktree.path()).unwrap().dev()
+            == std::fs::metadata(state.path()).unwrap().dev()
+        {
+            eprintln!(
+                "cross-device copy failure test requires worktree and temp on different filesystems"
+            );
+            return;
+        }
+        let path = worktree.path().join(".venv");
+        let backup = state.path().join("backup");
+        make_install(&path);
+        let _socket = std::os::unix::net::UnixListener::bind(path.join("socket")).unwrap();
+
+        let error = InstallChange::begin(&path, backup.clone()).err().unwrap();
+
+        assert!(format!("{error:#}").contains("unsupported dependency file type"));
+        assert_install(&path);
+        assert!(path.join("socket").symlink_metadata().is_ok());
+        assert!(backup.symlink_metadata().is_err());
+    }
 }
 
 #[cfg(test)]

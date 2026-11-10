@@ -274,7 +274,8 @@ path and continues startup.
 
 Retained backups live under the instance state directory,
 in `dependency-backups/`, outside the worktree. Git cannot stage them with `git add -A`.
-The install and state directory must share a filesystem for the atomic backup move.
+Backup and restore use atomic renames on the same filesystem. Across filesystems,
+Grove copies the install, preserving symlinks and permissions, before removing the source.
 Grove rejects a state directory inside the worktree for cached dependency replacement.
 
 Before replacement, Grove stops the service that owns the cached install, if Grove

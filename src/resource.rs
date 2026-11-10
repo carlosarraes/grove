@@ -262,14 +262,12 @@ fn run_init(resource: &Resource, id: &str, init: &str) -> Result<()> {
                         return Ok(());
                     }
                     if let Some(code) = exited(id) {
-                        return Err(error).with_context(|| {
-                            format!(
-                                "`{}` exited with code {code} before it accepted connections; \
-                                 `docker logs --tail 50 {}` shows why",
-                                resource.name,
-                                container_name(resource)
-                            )
-                        });
+                        return Err(error).context(died(
+                            resource,
+                            id,
+                            code,
+                            "before it accepted connections",
+                        ));
                     }
                     if !is_not_listening(&format!("{error:#}")) {
                         return Err(error);
@@ -291,15 +289,113 @@ fn run_init(resource: &Resource, id: &str, init: &str) -> Result<()> {
     )
 }
 
+/// How much of a dead container's log an error carries: enough to show a fassert and the
+/// lines leading to it, short enough to stay above the fold.
+const DEATH_LOG_LINES: usize = 20;
+
+/// The error for a managed container that stopped while grove waited on it, carrying its
+/// own last log lines. Under `up` the container is usually already restarted or removed by
+/// the time someone reads the error, and with it the only record of why.
+fn died(resource: &Resource, target: &str, code: i64, when: &str) -> String {
+    let name = container_name(resource);
+    let killed = if code == 137 {
+        " (killed: often out of memory)"
+    } else {
+        ""
+    };
+    let tail = match docker_output_unmonitored(&[
+        "logs".to_string(),
+        "--tail".to_string(),
+        DEATH_LOG_LINES.to_string(),
+        target.to_string(),
+    ]) {
+        Ok(out) if out.status.success() => {
+            // Docker replays the container's stdout and stderr on its own two streams;
+            // which one a datastore logs to varies, so both are kept.
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let lines: Vec<&str> = text.lines().collect();
+            let start = lines.len().saturating_sub(DEATH_LOG_LINES);
+            if lines.is_empty() {
+                "  (no output)".to_string()
+            } else {
+                lines[start..]
+                    .iter()
+                    .map(|line| format!("  {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        }
+        Ok(out) => format!(
+            "  (docker logs failed: {})",
+            docker_error_message(
+                &String::from_utf8_lossy(&out.stderr),
+                &String::from_utf8_lossy(&out.stdout)
+            )
+        ),
+        Err(error) => format!("  (docker logs failed: {error:#})"),
+    };
+    format!(
+        "`{}` exited with code {code}{killed} {when}; last {DEATH_LOG_LINES} lines of container \
+         {name} (`docker logs --tail 50 {name}` for more):\n{tail}",
+        resource.name
+    )
+}
+
+/// A managed container to fail fast on while something waits for its datastore. Without
+/// one, a wait on a dead mongod polls a port (which a Colima or Docker Desktop forwarder
+/// may still accept) until its timeout.
+pub struct Sentinel<'a> {
+    resource: &'a Resource,
+}
+
+impl<'a> Sentinel<'a> {
+    /// Watch the container grove starts for `resource`, which must be running from here on.
+    fn started(resource: &'a Resource) -> Self {
+        Sentinel { resource }
+    }
+
+    /// Watch `resource` for a wait that did not just start it. None when grove manages no
+    /// container for it, or when its stopped one is not what answers the port: something
+    /// outside grove provides the datastore, and that container dying is not news.
+    pub fn arm(resource: &'a Resource) -> Result<Option<Self>> {
+        let sentinel = Sentinel { resource };
+        match inspect_container(&container_name(resource)) {
+            None => Ok(None),
+            Some(container) if container.running => Ok(Some(sentinel)),
+            Some(_) if is_reachable(resource.port) => Ok(None),
+            Some(_) => sentinel
+                .check("before grove up could reach it")
+                .map(|()| None),
+        }
+    }
+
+    /// Fail with the container's name, exit code and last log lines once it has stopped.
+    pub fn check(&self, when: &str) -> Result<()> {
+        let name = container_name(self.resource);
+        match exited(&name) {
+            Some(code) => bail!(died(self.resource, &name, code, when)),
+            None => Ok(()),
+        }
+    }
+}
+
 /// The exit code of a container Docker reports as stopped. Anything short of that
 /// answer, including Docker failing to say, keeps the wait going.
 fn exited(id: &str) -> Option<i64> {
-    let out = docker_output_unmonitored(&["inspect".to_string(), id.to_string()]).ok()?;
+    let container = inspect_container(id)?;
+    (!container.running).then_some(container.exit_code)
+}
+
+fn inspect_container(target: &str) -> Option<ContainerObservation> {
+    let out = docker_output_unmonitored(&["inspect".to_string(), target.to_string()]).ok()?;
     if !out.status.success() {
         return None;
     }
-    let container = parse_inspect(&String::from_utf8_lossy(&out.stdout)).ok()??;
-    (!container.running).then_some(container.exit_code)
+    parse_inspect(&String::from_utf8_lossy(&out.stdout)).ok()?
 }
 
 /// The `--port N` or `--port=N` mongod is given in `args`; mongosh's default otherwise.
@@ -495,12 +591,23 @@ fn wait_reachable(resource: &Resource) -> Result<()> {
             resource.name, resource.port
         ),
         || {
-            for _ in 0..100 {
+            let sentinel = Sentinel::started(resource);
+            let when = "while grove up was waiting for its port";
+            let began = std::time::Instant::now();
+            let mut checked = began;
+            while began.elapsed() < Duration::from_secs(10) {
+                // A forwarder can answer for a dead container, so an answer alone is
+                // not proof: the container has to still be running too.
                 if is_reachable(resource.port) {
-                    return Ok(());
+                    return sentinel.check(when);
+                }
+                if checked.elapsed() >= Duration::from_millis(500) {
+                    sentinel.check(when)?;
+                    checked = std::time::Instant::now();
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
+            sentinel.check(when)?;
             bail!(
                 "`{}` was started but never answered on port {}",
                 resource.name,

@@ -975,10 +975,16 @@ impl Instance {
                     crate::timing::measure(
                         &format!("seed {}: Mongo readiness", seed.name),
                         || {
+                            let sentinel = crate::resource::Sentinel::arm(resource)?;
                             crate::mongo::wait_ready(
                                 resource.port,
                                 &cwd,
                                 std::time::Duration::from_secs(180),
+                                || match &sentinel {
+                                    Some(sentinel) => sentinel
+                                        .check("while the seed was waiting for a writable primary"),
+                                    None => Ok(()),
+                                },
                             )
                         },
                     )?;

@@ -19,9 +19,19 @@ except errors.PyMongoError:
     sys.exit(1)
 "#;
 
+/// How often a wait asks whether the container it waits on is still alive. A probe can
+/// hang for its whole budget against a forwarder whose mongod is gone.
+const ALIVE_EVERY: Duration = Duration::from_secs(1);
+
 /// Use the seed's local venv when present, otherwise the existing host Mongo shell.
 /// The deadline includes all attempts and reaps a probe that exceeds its budget.
-pub fn wait_ready(port: u16, cwd: &Path, timeout: Duration) -> Result<()> {
+/// `alive` fails the wait at once, even mid-probe, when the datastore's container stops.
+pub fn wait_ready(
+    port: u16,
+    cwd: &Path,
+    timeout: Duration,
+    alive: impl Fn() -> Result<()>,
+) -> Result<()> {
     let began = Instant::now();
     let python = cwd.join(".venv/bin/python");
     let use_python = python
@@ -31,14 +41,17 @@ pub fn wait_ready(port: u16, cwd: &Path, timeout: Duration) -> Result<()> {
         "Mongo on 127.0.0.1:{port}: waiting for a writable primary (timeout {:.0}s)",
         timeout.as_secs_f64()
     );
-    let mut next_notice = Duration::from_secs(15);
+    let every = crate::timing::heartbeat_interval();
+    let mut next_notice = every;
+    let mut last_alive_check = began;
+    alive()?;
     loop {
         if began.elapsed() >= next_notice {
             eprintln!(
-                "Mongo on 127.0.0.1:{port}: still waiting ({:.0}s)",
-                began.elapsed().as_secs_f64()
+                "Mongo on 127.0.0.1:{port}: still waiting ({}s)",
+                began.elapsed().as_secs()
             );
-            next_notice += Duration::from_secs(15);
+            next_notice = began.elapsed() + every;
         }
         let remaining = timeout.saturating_sub(began.elapsed());
         if remaining.is_zero() {
@@ -75,6 +88,14 @@ pub fn wait_ready(port: u16, cwd: &Path, timeout: Duration) -> Result<()> {
             if let Some(status) = child.try_wait()? {
                 break Some(status);
             }
+            if last_alive_check.elapsed() >= ALIVE_EVERY {
+                last_alive_check = Instant::now();
+                if let Err(died) = alive() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(died);
+                }
+            }
             if attempt.elapsed() >= budget || began.elapsed() >= timeout {
                 let _ = child.kill();
                 child
@@ -96,6 +117,10 @@ pub fn wait_ready(port: u16, cwd: &Path, timeout: Duration) -> Result<()> {
                     python.display()
                 );
             }
+        }
+        if last_alive_check.elapsed() >= ALIVE_EVERY {
+            last_alive_check = Instant::now();
+            alive()?;
         }
         std::thread::sleep(Duration::from_millis(500).min(timeout.saturating_sub(began.elapsed())));
     }

@@ -6594,6 +6594,7 @@ case "$1" in
   inspect) cat "$GROVE_DOCKER_INSPECT" ;;
   start)
     if [ -f "$root/fail-start" ]; then echo 'start failed deliberately' >&2; exit 42; fi
+    s=$(sed 's/"Running":false/"Running":true/' "$GROVE_DOCKER_INSPECT"); printf '%s' "$s" > "$GROVE_DOCKER_INSPECT"
     touch "$root/start-requested"
     i=0
     while [ ! -f "$root/port-ready" ] && [ "$i" -lt 500 ]; do
@@ -7020,6 +7021,7 @@ case "$1" in
  inspect) cat "$GROVE_DOCKER_INSPECT" ;;
  start|run)
   if [ "$1" = run ]; then echo init-container; fi
+  s=$(sed 's/"Running":false/"Running":true/' "$GROVE_DOCKER_INSPECT"); printf '%s' "$s" > "$GROVE_DOCKER_INSPECT"
   touch "$root/start-requested"
   if [ -f "$root/delay-port" ]; then exit 0; fi
   i=0
@@ -7027,6 +7029,7 @@ case "$1" in
    sleep 0.01; i=$((i + 1))
   done
   test -f "$root/port-ready" ;;
+ logs) cat "$root/docker.log" ;;
  exec)
   echo attempt >> "$root/init-attempts"
   echo "$*" >> "$root/init-argv"
@@ -7333,6 +7336,7 @@ fn resource_init_stops_waiting_when_the_container_exits() {
     std::fs::remove_file(rig.cli.state.path().join("fail-init")).unwrap();
     std::fs::write(rig.cli.state.path().join("refuse-init"), "100000").unwrap();
     let root = rig.cli.state.path().to_path_buf();
+    write_container_log(&root);
     let killer = std::thread::spawn(move || {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while !root.join("init-attempts").exists() {
@@ -7358,7 +7362,182 @@ fn resource_init_stops_waiting_when_the_container_exits() {
         "{stderr}"
     );
     assert!(stderr.contains("docker logs --tail 50"), "{stderr}");
+    assert_carries_log_tail(&stderr);
     assert!(began.elapsed() < std::time::Duration::from_secs(20));
+    assert!(!wt.join("seed-ran").exists());
+}
+
+/// Thirty numbered lines in the fake container's log, so an error can be checked for
+/// carrying the last twenty and not the rest.
+fn write_container_log(root: &Path) {
+    let lines: String = (1..=30)
+        .map(|n| format!("mongod log line {n:02}\n"))
+        .collect();
+    std::fs::write(root.join("docker.log"), lines).unwrap();
+}
+
+fn assert_carries_log_tail(stderr: &str) {
+    assert!(
+        stderr.contains("last 20 lines of container grove-mongo"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("mongod log line 11"), "{stderr}");
+    assert!(stderr.contains("mongod log line 30"), "{stderr}");
+    assert!(!stderr.contains("mongod log line 10"), "{stderr}");
+}
+
+/// Mark the fake container stopped with `code` once `ready` exists under `root`.
+fn kill_container_when(root: &Path, ready: &'static str, code: i64) -> std::thread::JoinHandle<()> {
+    let root = root.to_path_buf();
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !root.join(ready).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{ready} never appeared"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let path = root.join("docker-inspect.json");
+        let mut inspect: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        inspect[0]["State"]["Running"] = false.into();
+        inspect[0]["State"]["ExitCode"] = code.into();
+        std::fs::write(path, inspect.to_string()).unwrap();
+    })
+}
+
+/// The shared mongod on the mac died with 133 (a WiredTiger fassert). A death while `up`
+/// waits for the port it just started must end the wait with the reason, not a timeout.
+#[test]
+fn up_stops_waiting_for_a_resource_port_when_its_container_exits() {
+    let rig = InitResourceRig::with_delayed_port(true);
+    let root = rig.cli.state.path().to_path_buf();
+    write_container_log(&root);
+    let killer = kill_container_when(&root, "start-requested", 133);
+    let wt = rig.cli.worktree("port_wait_container_exits");
+    let began = std::time::Instant::now();
+
+    let output = rig.cli.run(&wt, &["up"]).failure().get_output().clone();
+    killer.join().unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`mongo` exited with code 133 while grove up was waiting for its port"),
+        "{stderr}"
+    );
+    assert_carries_log_tail(&stderr);
+    assert!(!stderr.contains("never answered on port"), "{stderr}");
+    assert!(
+        began.elapsed() < std::time::Duration::from_secs(8),
+        "waited out the timeout"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("grove: ready"));
+}
+
+/// A VM forwarder (Colima's ssh, Docker Desktop's vpnkit) can accept on the host port after
+/// the container behind it has exited, so an answering port is not proof of life.
+#[test]
+fn an_answering_port_does_not_hide_a_resource_container_that_exited() {
+    let reservation = TcpListener::bind("127.0.0.1:0").expect("reserve port");
+    let port = reservation.local_addr().expect("address").port();
+    let bindings = serde_json::json!({format!("{port}/tcp"): [
+        {"HostIp": "", "HostPort": port.to_string()}
+    ]});
+    let cli = stopped_resource_fixture(port, "mongo:8", bindings, "");
+    let docker = cli.docker.as_ref().expect("docker");
+    let script = std::fs::read_to_string(&docker.program).unwrap();
+    // `start` succeeds but the container is dead again by the time grove looks.
+    let script = script
+        .lines()
+        .filter(|line| !line.contains(r#"s/"Running":false/"Running":true/"#))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace(
+            "  inspect) cat",
+            "  logs) cat \"$root/docker.log\" ;;\n  inspect) cat",
+        );
+    std::fs::write(&docker.program, script + "\n").unwrap();
+    let root = cli.state.path().to_path_buf();
+    write_container_log(&root);
+    drop(reservation);
+    let (stop, stopped) = std::sync::mpsc::channel::<()>();
+    let server = {
+        let root = root.clone();
+        std::thread::spawn(move || {
+            while !root.join("start-requested").exists() {
+                if stopped
+                    .recv_timeout(std::time::Duration::from_millis(10))
+                    .is_ok()
+                {
+                    return;
+                }
+            }
+            let _listener = TcpListener::bind(("127.0.0.1", port)).expect("forwarder");
+            std::fs::write(root.join("port-ready"), "ready").expect("ready");
+            let _ = stopped.recv_timeout(std::time::Duration::from_secs(15));
+        })
+    };
+    let wt = cli.worktree("forwarded_dead_resource");
+
+    let result = cli.run(&wt, &["up"]);
+    let _ = stop.send(());
+    server.join().expect("server");
+    let output = result.failure().get_output().clone();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`mongo` exited with code 137 (killed: often out of memory) while grove up was waiting for its port"),
+        "{stderr}"
+    );
+    assert_carries_log_tail(&stderr);
+    assert!(!wt.join("seeded.log").exists());
+}
+
+/// Seed readiness waited 180s on a mongod that was already dead.
+#[test]
+fn seed_mongo_wait_stops_when_the_container_exits() {
+    use std::os::unix::fs::PermissionsExt;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listen");
+    let port = listener.local_addr().expect("address").port();
+    let cli = Cli::with_fake_docker(&resource_seed_config(port, "touch seed-ran"), "live-mongo");
+    let root = cli.state.path().to_path_buf();
+    write_container_log(&root);
+    // Reachable but never a writable primary: the probe keeps failing, and records that it ran.
+    let client = root.join("mongosh");
+    std::fs::write(
+        &client,
+        format!(
+            "#!/bin/sh
+touch '{}'
+exit 1
+",
+            root.join("probed").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let killer = kill_container_when(&root, "probed", 133);
+    let wt = cli.worktree("seed_container_exits");
+    let began = std::time::Instant::now();
+
+    let output = cli.run(&wt, &["up"]).failure().get_output().clone();
+    killer.join().unwrap();
+    drop(listener);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "`mongo` exited with code 133 while the seed was waiting for a writable primary"
+        ),
+        "{stderr}"
+    );
+    assert_carries_log_tail(&stderr);
+    assert!(
+        began.elapsed() < std::time::Duration::from_secs(20),
+        "waited out the timeout"
+    );
     assert!(!wt.join("seed-ran").exists());
 }
 

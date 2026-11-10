@@ -149,11 +149,44 @@ fn mongo_readiness_bounds_failed_and_hung_clients() {
         std::fs::write(&python, body).unwrap();
         std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
         let began = Instant::now();
-        let result = grove::mongo::wait_ready(27017, cwd.path(), Duration::from_millis(250));
+        let result =
+            grove::mongo::wait_ready(27017, cwd.path(), Duration::from_millis(250), || Ok(()));
         assert!(result.is_err(), "unready client must not pass");
         assert!(
             began.elapsed() < Duration::from_secs(2),
             "hung probe exceeded the total deadline"
         );
     }
+}
+
+/// A probe against a forwarder whose mongod is gone can hang for its whole budget; the
+/// container dying has to cut it short rather than wait for the next attempt.
+#[test]
+fn mongo_readiness_ends_mid_probe_when_the_container_dies() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+    let cwd = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(cwd.path().join(".venv/bin")).unwrap();
+    let python = cwd.path().join(".venv/bin/python");
+    std::fs::write(&python, "#!/bin/sh\nexec sleep 60\n").unwrap();
+    std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let calls = std::cell::Cell::new(0);
+    let began = Instant::now();
+    let result = grove::mongo::wait_ready(27017, cwd.path(), Duration::from_secs(60), || {
+        calls.set(calls.get() + 1);
+        if calls.get() > 1 {
+            anyhow::bail!("`mongo` exited with code 133")
+        }
+        Ok(())
+    });
+    let error = format!(
+        "{:#}",
+        result.expect_err("a dead container must end the wait")
+    );
+    assert!(error.contains("exited with code 133"), "{error}");
+    assert!(
+        began.elapsed() < Duration::from_secs(4),
+        "waited {:?} on a hung probe",
+        began.elapsed()
+    );
 }

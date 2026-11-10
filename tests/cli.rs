@@ -4502,14 +4502,16 @@ fn gate_accepts_another_worktree_by_path_and_worktree_option() {
     let cli = Cli::with_config(CACHE_CONFIG);
     let target = cli.worktree("gate_target");
     let here = cli.worktree("gate_here");
-    let expected = cli.run(&target, &["gate"]).success();
+    // Forced: the real load average under a parallel test run can hold a full install.
+    let calm = [("GROVE_LOAD", "1"), ("GROVE_LOAD15", "1")];
+    let expected = cli.run_env(&target, &calm, &["gate"]).success();
     let expected_stdout = String::from_utf8_lossy(&expected.get_output().stdout).to_string();
 
     for args in [
         vec!["gate", target.to_str().unwrap()],
         vec!["gate", "--worktree", target.to_str().unwrap()],
     ] {
-        let actual = cli.run(&here, &args).success();
+        let actual = cli.run_env(&here, &calm, &args).success();
         assert_eq!(
             String::from_utf8_lossy(&actual.get_output().stdout),
             expected_stdout

@@ -1766,19 +1766,20 @@ impl Instance {
                 }
             })?;
 
-        // First tick at 10s, then every 15s. The opening silence is what reads as a
-        // hang, so it is the interval worth shortening.
+        // Same cadence as every other wait in `up`: a QA agent killed a 30s boot at 25s
+        // because the stretch before the first tick read as a hang.
         let began = std::time::Instant::now();
-        let mut next_tick = 10u64;
+        let every = crate::timing::heartbeat_interval();
+        let mut next_tick = every;
         let status = loop {
             if let Some(status) = child.try_wait()? {
                 break status;
             }
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            let elapsed = began.elapsed().as_secs();
+            std::thread::sleep(std::time::Duration::from_millis(200).min(every));
+            let elapsed = began.elapsed();
             if elapsed >= next_tick {
-                eprintln!("{service}: still {doing} ({elapsed}s)");
-                next_tick = elapsed + 15;
+                eprintln!("{service}: still {doing} ({}s)", elapsed.as_secs());
+                next_tick = elapsed + every;
             }
         };
         if !status.success() {

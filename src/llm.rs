@@ -171,7 +171,7 @@ needed data, then deliberately remove and recreate that container.
     max_load         positive finite number; omit to use available core count
     timeout          positive duration, default "10m"; covers admission only
                      Both wait for one-minute load strictly below max_load and report
-                     waiting every 15s. Plain run and up do not wait. Timeout or invalid
+                     waiting every 5s. Plain run and up do not wait. Timeout or invalid
                      load fails before starting work.
                      run --heavy polls every 2s. It reserves no capacity; use Ferry for shared slots.
                      up --heavy polls every 200ms, reserving one of two startup slots
@@ -186,7 +186,8 @@ needed data, then deliberately remove and recreate that container.
                      up only links. Both averages must be under the limits. `grove
                      gate` prints e.g. "load gate: link-only (lockfile matches store),
                      limits 60/60, load 48.0/52.0 ok" and exits 0, or 3 when holding;
-                     `up --gate` waits up to `timeout`, printing the same line.
+                     `up --gate` waits up to `timeout`, printing the same line with
+                     ": still waiting (Ns of TIMEOUT)" every 5s while it holds.
 
 Do not write a separate `.grove.toml` to install dependencies. Use
 `grove up --setup-only` (optionally `--dry-run` first): a hand-written config hashes

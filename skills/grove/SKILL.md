@@ -18,7 +18,9 @@ grove up
 ```
 
 It starts the services in the background and returns once each answers, printing a URL
-per service. Use those URLs — the repo's documented ports belong to the main checkout,
+per service and, last, `grove: ready <instance> (Ns)`. Until then every wait prints a
+`... still waiting (Ns)` line at least every 5s, so a quiet terminal means a hang, not a
+slow boot; failure exits non-zero without the ready line. Use those URLs — the repo's documented ports belong to the main checkout,
 not to this instance.
 
 Re-running `up` is safe, and is the cheapest way to recover from a service that died. The

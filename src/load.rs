@@ -143,8 +143,8 @@ pub fn judge(
     }
 }
 
-/// Hold `up` until the gate for `install` admits it, printing the gate on entry and every
-/// 15s while it holds.
+/// Hold `up` until the gate for `install` admits it, printing the gate on entry and at
+/// every heartbeat while it holds.
 pub fn wait_for_install_gate(
     install: &Install,
     config: &crate::config::Admission,
@@ -169,14 +169,18 @@ pub fn wait_for_install_gate(
         }
         if elapsed >= heartbeat {
             eprintln!(
-                "{} ({:.0}s of {})",
+                "{}: still waiting ({}s of {})",
                 verdict.line,
-                elapsed.as_secs_f64(),
+                elapsed.as_secs(),
                 config.timeout
             );
-            heartbeat = elapsed + Duration::from_secs(15);
+            heartbeat = elapsed + crate::timing::heartbeat_interval();
         }
-        std::thread::sleep(Duration::from_secs(2).min(timeout - elapsed));
+        std::thread::sleep(
+            Duration::from_secs(2)
+                .min(timeout - elapsed)
+                .min(heartbeat.saturating_sub(elapsed)),
+        );
     }
 }
 
@@ -230,7 +234,7 @@ fn wait_with_samples(
                 elapsed.as_secs_f64(),
                 config.timeout
             );
-            heartbeat = elapsed + Duration::from_secs(15);
+            heartbeat = elapsed + crate::timing::heartbeat_interval();
         }
         std::thread::sleep(
             Duration::from_secs(2)
@@ -307,7 +311,7 @@ pub fn wait_for_startup(config: &crate::config::Admission) -> anyhow::Result<std
                     elapsed.as_secs_f64(),
                     config.timeout
                 );
-                heartbeat = elapsed + Duration::from_secs(15);
+                heartbeat = elapsed + crate::timing::heartbeat_interval();
             }
             std::thread::sleep(Duration::from_millis(200).min(timeout.saturating_sub(elapsed)));
         }

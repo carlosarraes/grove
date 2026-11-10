@@ -1645,6 +1645,81 @@ fn service_readiness_reports_progress_while_the_service_starts() {
     );
 }
 
+/// QA agents killed `grove up --gate` at 25s of a 30s boot. Progress has to reach the
+/// terminal while `up` is still waiting, through the up-log tee, not when it exits.
+#[test]
+fn up_progress_reaches_the_terminal_before_up_finishes_and_ends_with_ready() {
+    use std::io::BufRead;
+    let cli = Cli::with_config(&CONFIG.replace(
+        "python3 -u -m http.server",
+        "sleep 2; exec python3 -u -m http.server",
+    ));
+    let wt = cli.worktree("streamed_progress");
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("grove"))
+        .args(["up", "--gate"])
+        .current_dir(&wt)
+        .env("GROVE_STATE_DIR", cli.state.path())
+        .env("GROVE_CACHE_DIR", cli.state.path().join("store"))
+        .env("PATH", cli.client_path())
+        .env("GROVE_PORT_RANGE", cli.port_range())
+        .env("GROVE_HEARTBEAT_SECS", "0.2")
+        .env("GROVE_LOAD", "0")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn up");
+    let stderr = child.stderr.take().unwrap();
+    let (lines, received) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stderr).lines() {
+            let _ = lines.send(line.unwrap());
+        }
+    });
+    let mut seen = Vec::new();
+    loop {
+        let line = received
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap_or_else(|_| panic!("no readiness progress: {seen:?}"));
+        let beat = line.contains("web: readiness: still waiting (");
+        seen.push(line);
+        if beat {
+            break;
+        }
+    }
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "progress arrived only after up exited: {seen:?}"
+    );
+    let output = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    assert!(output.status.success(), "{seen:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout
+            .lines()
+            .last()
+            .is_some_and(|line| line.starts_with("grove: ready streamed_progress (")),
+        "{stdout}"
+    );
+    cli.run(&wt, &["down"]).success();
+}
+
+#[test]
+fn a_slow_setup_reports_progress_at_the_heartbeat() {
+    let cli = Cli::with_config("version = 1\n[[service]]\nname = 'web'\nsetup = 'sleep 0.5'\n");
+    let wt = cli.worktree("setup_progress");
+    let output = cli
+        .run_env(&wt, &[("GROVE_HEARTBEAT_SECS", "0.05")], &["up"])
+        .success()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("web: still installing dependencies (0s)"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn instance_and_setup_locks_report_progress_while_another_up_holds_them() {
     for (file, phase) in [
@@ -4351,8 +4426,20 @@ fn install_gate_admits_a_link_only_up_at_load_that_holds_a_full_install() {
             && out.contains("limits 25/35, load 48.0/52.0 over, holding"),
         "{out}"
     );
-    let held = cli.run_env(&a, &busy, &["up", "--gate"]).failure();
+    let held = cli
+        .run_env(
+            &a,
+            &[busy[0], busy[1], ("GROVE_HEARTBEAT_SECS", "0.05")],
+            &["up", "--gate"],
+        )
+        .failure();
     assert!(text(&held).contains("timed out"), "{}", text(&held));
+    assert!(
+        text(&held).contains("over, holding: still waiting (0s of 1s)"),
+        "a hold must keep saying what it waits on: {}",
+        text(&held)
+    );
+    assert!(!text(&held).contains("grove: ready"), "{}", text(&held));
     assert_eq!(installs(&cli), 0, "a held up must not install");
 
     // Under the full-install limits it builds and publishes.
@@ -4362,6 +4449,12 @@ fn install_gate_admits_a_link_only_up_at_load_that_holds_a_full_install() {
         text(&up).contains("load gate: full install") && text(&up).contains("10.0/20.0 ok"),
         "{}",
         text(&up)
+    );
+    let stdout = String::from_utf8_lossy(&up.get_output().stdout).into_owned();
+    let ready = stdout.lines().last().unwrap_or_default();
+    assert!(
+        ready.starts_with("grove: ready gate_full (") && ready.ends_with("s)"),
+        "the last line must say the instance is ready: {stdout}"
     );
     assert_eq!(installs(&cli), 1);
 

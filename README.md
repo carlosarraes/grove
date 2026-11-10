@@ -11,6 +11,8 @@ instance  checkout_redesign
 frontend  http://localhost:24310
 backend   http://localhost:24311
 database  app_checkout_redesign
+...
+grove: ready checkout_redesign (31s)
 ```
 
 ## The problem
@@ -203,7 +205,7 @@ timeout = "10m"
 The threshold must be positive and finite. The timeout must be greater than zero.
 
 Grove samples every two seconds and prints the load, threshold, and elapsed wait.
-It prints another wait message every 15 seconds, then reports admission or timeout.
+It prints another wait message every 5 seconds, then reports admission or timeout.
 Timeout or an unreadable load fails without a child process. Ctrl-C cancels the wait.
 The timeout applies to admission, not command execution.
 
@@ -231,7 +233,8 @@ load gate: full install (frontend lockfile not in store, 1a2b…), limits 25/35,
 ```
 
 It exits 0 when admitted and 3 when holding. `grove up --gate` prints the same line
-and waits for admission (up to `[admission] timeout`) before installing anything.
+and waits for admission (up to `[admission] timeout`) before installing anything,
+repeating it with `: still waiting (Ns of TIMEOUT)` every 5 seconds while it holds.
 Limits are `[admission] full_install = [25, 35]` and `link_only = [60, 60]` by default.
 To apply the same cache decision without starting the stack, run `grove up --setup-only`.
 
@@ -250,7 +253,7 @@ Instance/log bookkeeping can happen before admission. Resources and services can
 
 The slot stays held through resource initialization, dependency setup, seeds and
 service readiness. The gate does not change readiness timeouts. It polls every 200 ms,
-reports waiting every 15 seconds, and has no FIFO guarantee. Load can rise after
+reports waiting every 5 seconds, and has no FIFO guarantee. Load can rise after
 admission. This gate does not limit the number of running stacks.
 
 OS locks release when startup returns or the worker exits, including failure and

@@ -378,6 +378,7 @@ fn main() -> Result<()> {
             no_cache,
             services,
         }) => {
+            let began = std::time::Instant::now();
             let _up_lock = grove::instance::lock_up(&cwd)?;
             let exposure = if setup_only {
                 grove::exposure::Exposure::local()
@@ -476,6 +477,13 @@ fn main() -> Result<()> {
                     eprintln!("{outcome}");
                 }
                 print_summary(&instance, None, &[]);
+                // Last, and only here: an agent waiting on `up` needs one line that
+                // means "done and serving", distinct from every progress line before it.
+                println!(
+                    "\ngrove: ready {} ({}s)",
+                    instance.resolved.slug,
+                    began.elapsed().as_secs()
+                );
             }
             Ok(())
         }

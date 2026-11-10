@@ -104,6 +104,43 @@ impl Entry {
     pub fn is_running(&self) -> bool {
         self.services.values().any(crate::supervise::is_alive)
     }
+
+    /// Why grove can no longer act on this instance's worktree, or None while it can.
+    /// The one definition `ls`, `prune`, `health` and the commands that resolve a worktree
+    /// all share, so they cannot disagree about what `grove prune` will reclaim.
+    pub fn orphaned(&self) -> Option<Orphan> {
+        if !self.worktree.exists() {
+            Some(Orphan::Gone)
+        } else if !crate::resolve::is_worktree(&self.worktree) {
+            Some(Orphan::NotGit)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_orphaned(&self) -> bool {
+        self.orphaned().is_some()
+    }
+}
+
+/// How an instance lost its worktree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Orphan {
+    /// The directory is gone.
+    Gone,
+    /// The directory survived `git worktree remove` as a husk — typically a dev server
+    /// rewrote `node_modules/.vite` after git deleted the tree — so nothing that needs git
+    /// can resolve it.
+    NotGit,
+}
+
+impl std::fmt::Display for Orphan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Orphan::Gone => "no longer exists",
+            Orphan::NotGit => "is no longer a git worktree",
+        })
+    }
 }
 
 /// An age as a person would say it, for a column read at a glance while deciding what to
@@ -292,14 +329,14 @@ impl Registry {
         })
     }
 
-    /// Drop entries whose worktree is gone, so a deleted worktree stops holding ports.
+    /// Drop orphaned entries (see [`Entry::orphaned`]), so a deleted worktree stops holding ports.
     /// Returns what was dropped, so callers can report it rather than reclaiming silently.
     pub fn reap(&self) -> Result<Vec<Entry>> {
         self.with_lock(|state| {
             let gone: Vec<String> = state
                 .instances
                 .iter()
-                .filter(|(_, e)| !e.worktree.exists())
+                .filter(|(_, e)| e.is_orphaned())
                 .map(|(k, _)| k.clone())
                 .collect();
             Ok(gone

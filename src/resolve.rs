@@ -50,6 +50,24 @@ fn fnv1a(s: &std::ffi::OsStr) -> u32 {
     hash
 }
 
+/// Whether `path` is the root of a git worktree, judged from its `.git` alone so that
+/// listing many instances never spawns git. A linked worktree's `.git` is a file naming
+/// its admin directory; one whose admin directory is gone fails `git` just as a missing
+/// `.git` does.
+pub fn is_worktree(path: &Path) -> bool {
+    let dot_git = path.join(".git");
+    if dot_git.is_dir() {
+        return true;
+    }
+    let Ok(pointer) = std::fs::read_to_string(&dot_git) else {
+        return false;
+    };
+    pointer
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:"))
+        .is_some_and(|gitdir| path.join(gitdir.trim()).is_dir())
+}
+
 pub fn resolve(cwd: &Path) -> Result<Resolved> {
     let stdout = git(cwd, &["worktree", "list", "--porcelain"])?;
     let main_worktree = stdout
@@ -99,4 +117,27 @@ fn git(cwd: &Path, args: &[&str]) -> Result<String> {
     }
 
     String::from_utf8(out.stdout).context("git emitted non-UTF-8 output")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_worktree_is_judged_by_its_dot_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(!is_worktree(root), "a husk with no .git");
+
+        std::fs::create_dir(root.join("admin")).unwrap();
+        std::fs::write(root.join(".git"), "gitdir: admin\n").unwrap();
+        assert!(is_worktree(root), "a relative pointer to an admin dir");
+
+        std::fs::write(root.join(".git"), "gitdir: /nonexistent/worktrees/x\n").unwrap();
+        assert!(!is_worktree(root), "a pointer whose admin dir is gone");
+
+        std::fs::remove_file(root.join(".git")).unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        assert!(is_worktree(root), "a main checkout");
+    }
 }

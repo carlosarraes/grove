@@ -2179,6 +2179,174 @@ fn prune_reclaims_instances_whose_worktree_is_gone() {
     cli.run(&alive, &["down"]).success();
 }
 
+/// What a merged PR left on the mac: `git worktree remove` ran, then a dev server wrote
+/// its prebundle cache back, so the directory exists but is no git worktree.
+fn leave_husk(cli: &Cli, wt: &Path) {
+    common::git(
+        &cli.fx.main,
+        &["worktree", "remove", "--force", wt.to_str().unwrap()],
+    );
+    std::fs::create_dir_all(wt.join("node_modules/.vite/deps")).expect("husk");
+    std::fs::write(wt.join("node_modules/.vite/deps/_metadata.json"), "{}").expect("husk file");
+}
+
+#[test]
+fn a_husk_worktree_is_listed_and_reported_as_orphaned() {
+    let cli = Cli::new();
+    let husk = cli.worktree("qa_husk");
+    let live = cli.worktree("feat_search");
+    cli.run(&husk, &["up"]).success();
+    cli.run(&husk, &["down"]).success();
+    cli.run(&live, &["up"]).success();
+    leave_husk(&cli, &husk);
+
+    let listed = String::from_utf8_lossy(&cli.run(&live, &["ls"]).success().get_output().stdout)
+        .into_owned();
+    let row = |slug: &str| {
+        listed
+            .lines()
+            .find(|line| line.starts_with(slug))
+            .unwrap_or_else(|| panic!("no {slug} row: {listed}"))
+            .to_string()
+    };
+    assert!(row("qa_husk").contains("orphaned"), "{listed}");
+    assert!(row("feat_search").contains("running"), "{listed}");
+    assert!(
+        listed.contains("1 orphaned") && listed.contains("`grove prune`"),
+        "{listed}"
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(
+        &cli.run(&live, &["ls", "--json"])
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("ls json");
+    let orphaned = |slug: &str| {
+        json["instances"]
+            .as_array()
+            .expect("instances")
+            .iter()
+            .find(|i| i["slug"] == slug)
+            .unwrap_or_else(|| panic!("no {slug}: {json}"))["orphaned"]
+            .clone()
+    };
+    assert_eq!(orphaned("qa_husk"), serde_json::json!(true), "{json}");
+    assert_eq!(orphaned("feat_search"), serde_json::json!(false), "{json}");
+
+    // Asked by name, from anywhere, including from inside the husk itself.
+    for cwd in [&live, &husk, &husk.join("node_modules")] {
+        let status = cli.run(cwd, &["status", "qa_husk"]).success();
+        let out = String::from_utf8_lossy(&status.get_output().stdout).into_owned();
+        let err = String::from_utf8_lossy(&status.get_output().stderr).into_owned();
+        assert!(
+            out.contains("orphaned")
+                && out.contains("is no longer a git worktree")
+                && out.contains("grove prune qa_husk"),
+            "{out}{err}"
+        );
+        assert!(!err.contains("not a git repository"), "{err}");
+    }
+    let out = cli
+        .run(&husk.join("node_modules"), &["status"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(
+        String::from_utf8_lossy(&out).contains("grove prune qa_husk"),
+        "{}",
+        String::from_utf8_lossy(&out)
+    );
+    let status: serde_json::Value = serde_json::from_slice(
+        &cli.run(&live, &["status", "qa_husk", "--json"])
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("status json");
+    assert_eq!(status["orphaned"], true, "{status}");
+    assert_eq!(status["fix"], "grove prune qa_husk", "{status}");
+
+    // `prune` used to send this to `down`, which then failed on the same git resolve.
+    let down = cli.run(&live, &["down", "qa_husk"]).failure();
+    let err = String::from_utf8_lossy(&down.get_output().stderr).into_owned();
+    assert!(
+        err.contains("orphaned") && err.contains("`grove prune qa_husk`"),
+        "{err}"
+    );
+    assert!(!err.contains("not a git repository"), "{err}");
+
+    let health = cli.run(&live, &["health"]);
+    let health = String::from_utf8_lossy(&health.get_output().stdout).into_owned();
+    assert!(
+        health.contains("1 orphaned instance: qa_husk") && health.contains("grove prune"),
+        "{health}"
+    );
+
+    assert!(registry_of(&cli).get(&husk).expect("get").is_some());
+    cli.run(&live, &["down"]).success();
+}
+
+#[test]
+fn prune_reclaims_a_husk_left_after_git_removed_the_worktree() {
+    let cli = Cli::new();
+    let husk = cli.worktree("qa_husk");
+    let live = cli.worktree("feat_search");
+    cli.run(&husk, &["up"]).success();
+    cli.run(&live, &["up"]).success();
+    let port: u16 = std::fs::read_to_string(husk.join("backend/.env.local"))
+        .expect("env")
+        .lines()
+        .find_map(|l| l.strip_prefix("API_URL=http://localhost:"))
+        .expect("API_URL")
+        .parse()
+        .expect("port");
+    assert!(
+        ureq::get(format!("http://127.0.0.1:{port}/"))
+            .call()
+            .is_ok()
+    );
+    // Services still up when git removed the tree: prune must stop them, not just forget.
+    leave_husk(&cli, &husk);
+
+    let dry = cli.run(&live, &["prune", "--dry-run"]).success();
+    let dry = String::from_utf8_lossy(&dry.get_output().stdout).into_owned();
+    assert!(
+        dry.contains("would reclaim") && dry.contains("qa_husk"),
+        "{dry}"
+    );
+    assert!(!dry.contains("feat_search"), "{dry}");
+    assert!(registry_of(&cli).get(&husk).expect("get").is_some());
+
+    let rejected = cli.run(&cli.fx.main, &["prune", "feat_search"]).failure();
+    let err = String::from_utf8_lossy(&rejected.get_output().stderr).into_owned();
+    assert!(
+        err.contains("`feat_search` still has its worktree at") && err.contains("grove down"),
+        "{err}"
+    );
+
+    let pruned = cli.run(&cli.fx.main, &["prune", "qa_husk"]).success();
+    let out = String::from_utf8_lossy(&pruned.get_output().stdout).into_owned();
+    assert!(out.contains("qa_husk"), "{out}");
+    assert!(registry_of(&cli).get(&husk).expect("get").is_none());
+    assert!(registry_of(&cli).get(&live).expect("get").is_some());
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    assert!(
+        ureq::get(format!("http://127.0.0.1:{port}/"))
+            .call()
+            .is_err(),
+        "the husk's service is still listening on {port}"
+    );
+    assert!(
+        husk.join("node_modules/.vite/deps/_metadata.json").exists(),
+        "prune must not delete files it did not create"
+    );
+
+    cli.run(&live, &["down"]).success();
+}
+
 #[test]
 fn prune_says_so_when_there_is_nothing_to_reclaim() {
     let cli = Cli::new();

@@ -125,8 +125,8 @@ fn listeners(entries: &[Entry]) -> Vec<Verdict> {
             None => String::new(),
         };
         let reserved_by = match reserved.get(&port) {
-            Some(e) if !e.worktree.exists() => {
-                format!("; reserved by {}, whose worktree is gone", e.slug)
+            Some(e) if e.is_orphaned() => {
+                format!("; reserved by {}, which is orphaned", e.slug)
             }
             Some(e) => format!("; reserved by {} (stopped)", e.slug),
             None => "; not a port grove reserved".to_string(),
@@ -338,7 +338,7 @@ fn listener(port: u16) -> Option<Listener> {
 fn orphans(entries: &[Entry]) -> Verdict {
     let gone: Vec<&str> = entries
         .iter()
-        .filter(|e| !e.worktree.exists())
+        .filter(|e| e.is_orphaned())
         .map(|e| e.slug.as_str())
         .collect();
     if gone.is_empty() {
@@ -346,7 +346,7 @@ fn orphans(entries: &[Entry]) -> Verdict {
     }
     Verdict::Fail {
         what: format!(
-            "{} orphaned instance{}: {} — their worktrees are gone and their ports stay reserved",
+            "{} orphaned instance{}: {} — their worktrees are gone or no longer git worktrees, and their ports stay reserved",
             gone.len(),
             if gone.len() == 1 { "" } else { "s" },
             some_of(&gone)
@@ -361,12 +361,12 @@ fn orphans(entries: &[Entry]) -> Verdict {
 fn disk(cwd: &Path, entries: &[Entry]) -> Verdict {
     let held: u64 = entries
         .iter()
-        .filter(|e| e.worktree.exists())
+        .filter(|e| !e.is_orphaned())
         .filter_map(|e| e.disk_bytes)
         .sum();
     let unmeasured = entries
         .iter()
-        .filter(|e| e.worktree.exists() && e.disk_bytes.is_none())
+        .filter(|e| !e.is_orphaned() && e.disk_bytes.is_none())
         .count();
     let Some((total, free)) = df(cwd) else {
         let mut what = format!(
@@ -445,7 +445,7 @@ fn store_state(entries: &[Entry]) -> Result<Vec<Verdict>> {
     let count = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
     let referenced: HashSet<String> = entries
         .iter()
-        .filter(|e| e.worktree.exists())
+        .filter(|e| !e.is_orphaned())
         .flat_map(|e| e.cache_keys.values().cloned())
         .collect();
     let stray = store::unreferenced(&dir, &referenced)

@@ -288,7 +288,7 @@ isolated session if needed.
 `grove clean` removes idle grove-linked git worktrees, with dry-run as the default;
 pass `--yes` to delete. It skips primary, locked, running, open-file, dirty, and
 unpushed trees, requires an upstream and lsof, and reports unique private blocks.
-`grove prune` instead stops and forgets orphaned instances whose worktree is gone.
+`grove prune` instead stops and forgets orphaned instances whose worktree is gone or no longer a git worktree.
 
 ## Postgres and containerised stacks
 

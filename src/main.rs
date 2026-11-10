@@ -528,8 +528,21 @@ fn main() -> Result<()> {
             worktree,
             json,
         }) => {
-            let instance =
-                Instance::open_for_status(&target(name.as_deref().or(worktree.as_deref()), &cwd)?)?;
+            let worktree = match locate(name.as_deref().or(worktree.as_deref()), &cwd)? {
+                Target::Worktree(path) => path,
+                Target::Orphan(entry, prune) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&orphan_status_json(&entry, &prune))?
+                        );
+                    } else {
+                        print_orphan_status(&entry, &prune);
+                    }
+                    return Ok(());
+                }
+            };
+            let instance = Instance::open_for_status(&worktree)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&status_json(&instance))?);
             } else {
@@ -549,7 +562,10 @@ fn main() -> Result<()> {
             // without stopping its services, leaving processes grove can never reach.
             let mut entries = registry.list()?;
             if let Some(ask) = name.as_deref().or(worktree.as_deref()) {
-                let requested = target(Some(ask), &cwd)?;
+                let requested = match locate(Some(ask), &cwd)? {
+                    Target::Worktree(path) => path,
+                    Target::Orphan(entry, _) => entry.worktree.clone(),
+                };
                 entries.retain(|entry| entry.worktree == requested || entry.slug == ask);
                 if entries.is_empty() {
                     bail!("no listed instance for `{ask}`; `grove ls` lists instances");
@@ -609,7 +625,7 @@ fn main() -> Result<()> {
                     "INSTANCE", "STATE", "IDLE", "SIZE", "PORTS"
                 );
             }
-            let orphans = entries.iter().filter(|e| !e.worktree.exists()).count();
+            let orphans = entries.iter().filter(|e| e.is_orphaned()).count();
             let mut failed = 0;
             for (entry, ports) in entries.iter().zip(&port_labels) {
                 // Ask the processes, not the record. A recorded pid says only that a
@@ -620,7 +636,7 @@ fn main() -> Result<()> {
                     .values()
                     .filter(|h| grove::supervise::is_alive(h))
                     .count();
-                let state = if !entry.worktree.exists() {
+                let state = if entry.is_orphaned() {
                     format!("orphaned ({live})")
                 } else if live > 0 {
                     format!("running ({live})")
@@ -657,7 +673,7 @@ fn main() -> Result<()> {
             }
             if orphans > 0 {
                 println!(
-                    "\n{orphans} orphaned — their worktree is gone. `grove prune` stops them."
+                    "\n{orphans} orphaned — their worktree is gone or no longer a git worktree. `grove prune` stops them."
                 );
             }
             if failed > 0 {
@@ -827,7 +843,7 @@ fn main() -> Result<()> {
                             several.len()
                         ),
                     };
-                    if entry.worktree.exists() {
+                    if !entry.is_orphaned() {
                         bail!(
                             "`{selector}` still has its worktree at {}; `grove down` stops it",
                             entry.worktree.display()
@@ -840,7 +856,7 @@ fn main() -> Result<()> {
                 registry
                     .list()?
                     .into_iter()
-                    .filter(|e| !e.worktree.exists())
+                    .filter(|e| e.is_orphaned())
                     .collect()
             } else {
                 // Stop the services before dropping the entry: once it is gone the pids go
@@ -854,7 +870,7 @@ fn main() -> Result<()> {
             let referenced: std::collections::HashSet<String> = registry
                 .list()?
                 .iter()
-                .filter(|e| e.worktree.exists())
+                .filter(|e| !e.is_orphaned())
                 .flat_map(|e| e.cache_keys.values().cloned())
                 .collect();
             let store = grove::store::dir()?;
@@ -1037,24 +1053,46 @@ fn main() -> Result<()> {
     }
 }
 
+/// What a command was pointed at: a worktree it can resolve, or an orphaned instance that
+/// only the registry still knows about.
+enum Target {
+    Worktree(PathBuf),
+    Orphan(Box<Entry>, String),
+}
+
 /// The worktree a command acts on: the one it runs in, or the one named by an instance
 /// name as `grove ls` prints it, or by a path. A name is looked up before a path, so
 /// `grove status backend` inside a repo means the instance, not the `backend/` folder.
 fn target(name: Option<&str>, cwd: &Path) -> Result<PathBuf> {
-    let Some(name) = name else {
-        return Ok(cwd.to_path_buf());
-    };
-    let matches: Vec<Entry> = grove::instance::registry()?
-        .list()?
-        .into_iter()
-        .filter(|e| e.slug == name)
-        .collect();
-    match matches.as_slice() {
-        [entry] if entry.worktree.exists() => return Ok(entry.worktree.clone()),
-        [entry] => bail!(
-            "instance `{name}` was at {}, which no longer exists; `grove prune` forgets it",
-            entry.worktree.display()
+    match locate(name, cwd)? {
+        Target::Worktree(path) => Ok(path),
+        Target::Orphan(entry, prune) => bail!(
+            "instance `{}` is orphaned: its worktree {} {}; `{prune}` stops what it left running and forgets it",
+            entry.slug,
+            entry.worktree.display(),
+            entry
+                .orphaned()
+                .map_or_else(String::new, |orphan| orphan.to_string()),
         ),
+    }
+}
+
+/// Like [`target`], but an orphan is an answer rather than an error, for the commands that
+/// can report on one.
+fn locate(name: Option<&str>, cwd: &Path) -> Result<Target> {
+    let entries = grove::instance::registry()?.list()?;
+    let Some(name) = name else {
+        return Ok(at_path(cwd, &entries));
+    };
+    let matches: Vec<&Entry> = entries.iter().filter(|e| e.slug == name).collect();
+    match matches.as_slice() {
+        [entry] if entry.is_orphaned() => {
+            return Ok(Target::Orphan(
+                Box::new((*entry).clone()),
+                prune_command(entry, &entries),
+            ));
+        }
+        [entry] => return Ok(Target::Worktree(entry.worktree.clone())),
         [] => {}
         several => bail!(
             "{} instances are named `{name}`; pass the worktree path instead:\n{}",
@@ -1068,7 +1106,7 @@ fn target(name: Option<&str>, cwd: &Path) -> Result<PathBuf> {
     }
     let path = cwd.join(name);
     if path.is_dir() {
-        return Ok(path);
+        return Ok(at_path(&path, &entries));
     }
     if name.contains('/') || name.starts_with('.') || name.starts_with('~') {
         bail!(
@@ -1078,6 +1116,46 @@ fn target(name: Option<&str>, cwd: &Path) -> Result<PathBuf> {
     bail!(
         "no instance named `{name}` on this machine, and no directory by that name; `grove ls` lists instances"
     )
+}
+
+/// A directory inside an orphan's husk resolves to no git worktree, and git's own error
+/// would send the reader looking for a typo. The innermost recorded instance holding the
+/// path decides, so a live worktree is never mistaken for an orphan around it.
+fn at_path(path: &Path, entries: &[Entry]) -> Target {
+    let real = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let holder = entries
+        .iter()
+        .filter(|e| path.starts_with(&e.worktree) || real.starts_with(&e.worktree))
+        .max_by_key(|e| e.worktree.components().count());
+    // Only the directories between `path` and the orphan's root: above it, a dotfiles
+    // repo in $HOME would count as a worktree and hide every orphan.
+    let nested_worktree = |entry: &Entry| {
+        let inside = if real.starts_with(&entry.worktree) {
+            real.as_path()
+        } else {
+            path
+        };
+        inside
+            .ancestors()
+            .take_while(|dir| *dir != entry.worktree)
+            .any(grove::resolve::is_worktree)
+    };
+    match holder {
+        Some(entry) if entry.is_orphaned() && !nested_worktree(entry) => {
+            Target::Orphan(Box::new(entry.clone()), prune_command(entry, entries))
+        }
+        _ => Target::Worktree(path.to_path_buf()),
+    }
+}
+
+/// The exact command that reclaims `entry`: by name when the name is unambiguous, which is
+/// how `grove ls` shows it, and by path otherwise.
+fn prune_command(entry: &Entry, entries: &[Entry]) -> String {
+    if entries.iter().filter(|e| e.slug == entry.slug).count() == 1 {
+        format!("grove prune {}", entry.slug)
+    } else {
+        format!("grove prune --worktree {}", entry.worktree.display())
+    }
 }
 
 /// A service older than the newest edit is serving code you have already changed. Without
@@ -1252,7 +1330,7 @@ fn kept_line(instance: &Instance) -> Option<String> {
 /// The stored figure, but only while the directory it describes exists. An orphan's
 /// blocks went with its worktree, and reporting them would count disk already returned.
 fn disk_of(entry: &Entry) -> Option<u64> {
-    entry.disk_bytes.filter(|_| entry.worktree.exists())
+    entry.disk_bytes.filter(|_| !entry.is_orphaned())
 }
 
 /// Stored private-dependency sizes and how many instances grove has not measured.
@@ -1260,7 +1338,7 @@ fn disk_footer(entries: &[Entry]) -> Option<String> {
     let measured: Vec<u64> = entries.iter().filter_map(disk_of).collect();
     let unmeasured = entries
         .iter()
-        .filter(|e| e.worktree.exists() && e.disk_bytes.is_none())
+        .filter(|e| !e.is_orphaned() && e.disk_bytes.is_none())
         .count();
     if measured.is_empty() && unmeasured == 0 {
         return None;
@@ -1317,7 +1395,7 @@ fn ls_json(entries: &[Entry], now: u64, machine: &Machine) -> serde_json::Value 
                 "slug": e.slug,
                 "worktree": e.worktree,
                 "running": e.is_running(),
-                "orphaned": !e.worktree.exists(),
+                "orphaned": e.is_orphaned(),
                 "idle_seconds": e.idle_seconds(now),
                 "exposed": e.exposure.is_exposed(),
                 "public_host": e.exposure.public_host(),
@@ -1429,6 +1507,64 @@ fn status_json(instance: &Instance) -> serde_json::Value {
             "error": last.error(),
             "log": last.log,
         })),
+    })
+}
+
+/// `status` for an instance whose worktree is gone or left behind as a husk: what the
+/// registry still holds for it, and the one command that clears it.
+fn print_orphan_status(entry: &Entry, prune: &str) {
+    println!("instance  {}", entry.slug);
+    println!(
+        "orphaned  worktree {} {}",
+        entry.worktree.display(),
+        entry
+            .orphaned()
+            .map_or_else(String::new, |orphan| orphan.to_string())
+    );
+    if !entry.ports.is_empty() {
+        let ports: Vec<String> = entry
+            .ports
+            .iter()
+            .map(|(name, port)| format!("{name}={port}"))
+            .collect();
+        println!("reserved  {}", ports.join(" "));
+    }
+    if let Some(db) = &entry.db_name {
+        println!("database  {db}");
+    }
+    let live: Vec<&str> = entry
+        .services
+        .iter()
+        .filter(|(_, handle)| grove::supervise::is_alive(handle))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if !live.is_empty() {
+        println!("running   {}", live.join(" "));
+    }
+    println!();
+    println!("  {prune}   # stops what it left running and forgets the instance");
+}
+
+fn orphan_status_json(entry: &Entry, prune: &str) -> serde_json::Value {
+    let services: serde_json::Map<String, serde_json::Value> = entry
+        .services
+        .iter()
+        .map(|(name, handle)| {
+            (
+                name.clone(),
+                serde_json::json!({ "running": grove::supervise::is_alive(handle) }),
+            )
+        })
+        .collect();
+    serde_json::json!({
+        "slug": entry.slug,
+        "worktree": entry.worktree,
+        "orphaned": true,
+        "orphan_reason": entry.orphaned().map(|orphan| orphan.to_string()),
+        "fix": prune,
+        "ports": entry.ports,
+        "database": entry.db_name,
+        "services": services,
     })
 }
 

@@ -1363,14 +1363,13 @@ impl Instance {
                     let tail = tail(&log, 30).unwrap_or_default();
                     // A worktree deleted mid-up makes the service fail on whatever it
                     // reads next, so its own output points the reader the wrong way.
-                    let gone = if self.resolved.worktree.exists() {
-                        String::new()
-                    } else {
-                        format!(
-                            "\nthe worktree {} no longer exists: something removed it while \
+                    let gone = match self.entry.orphaned() {
+                        None => String::new(),
+                        Some(orphan) => format!(
+                            "\nthe worktree {} {orphan}: something removed it while \
                              grove up was running, so the output below is a symptom",
                             self.resolved.worktree.display()
-                        )
+                        ),
                     };
                     match why {
                         // Spelled out rather than wrapped: "never became ready" reads as

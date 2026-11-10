@@ -175,10 +175,10 @@ repo's own fixture or settings constructor.
 | `logs [service] [--since-restart] [-n N]` | what a service printed |
 | `seed [--force]` | populate the datastore; markers follow the managed container incarnation, while `--force` rebuilds dirtied data |
 | `clean [NAME...] [--worktree PATH]... [--yes] [--dry-run]` | remove idle git worktrees recorded by grove; dry-run by default, delete only with `--yes` |
-| `prune [NAME...] [--worktree PATH]... [--dry-run] [--purge]` | stop and forget all instances whose worktree is gone, or only the selected orphaned instances by `grove ls` name or recorded path; selected prune skips the shared store sweep |
+| `prune [NAME...] [--worktree PATH]... [--dry-run] [--purge]` | stop and forget all instances whose worktree is gone or no longer a git worktree, or only the selected orphaned instances by `grove ls` name or recorded path; selected prune skips the shared store sweep |
 | `doctor` | check everything needed to start, and say what to fix |
 
-`grove clean` removes existing grove-linked git worktrees; `grove prune` stops and forgets orphaned instances whose worktree is already gone. Clean is machine-wide and defaults to a dry run (`--dry-run` is explicit); pass `--yes` to remove eligible trees without forcing git or dropping databases. Names and repeatable `--worktree PATH` select registry entries; unknown selectors reclaim nothing. Unregistered worktrees are never touched.
+`grove clean` removes existing grove-linked git worktrees; `grove prune` stops and forgets orphaned instances whose worktree is already gone or left behind as a non-git husk. Clean is machine-wide and defaults to a dry run (`--dry-run` is explicit); pass `--yes` to remove eligible trees without forcing git or dropping databases. Names and repeatable `--worktree PATH` select registry entries; unknown selectors reclaim nothing. Unregistered worktrees are never touched.
 
 Clean reports each tree and skips primary checkouts, held instance locks, running `grove up` runs or stacks, open files, uncommitted changes, branches without upstreams, and unpushed commits. It requires `lsof` and refuses deletion when it is missing. Sizes count unique `nlink == 1` allocated blocks across the whole checkout using the same private-block method as `--footprint`, excluding virtualenv directories containing `pyvenv.cfg` and never following symlinks. These are reclaimable bytes, not `du` totals that include shared hardlinks. With `--yes`, safety checks run again before removal; a git removal failure stops further removals.
 

@@ -258,6 +258,9 @@ fn run_init(resource: &Resource, id: &str, init: &str) -> Result<()> {
             match docker(&argv) {
                 Ok(_) => return Ok(()),
                 Err(error) => {
+                    if is_mongo_already_initialized(&format!("{error:#}")) {
+                        return Ok(());
+                    }
                     if let Some(code) = exited(id) {
                         return Err(error).with_context(|| {
                             format!(
@@ -313,6 +316,20 @@ fn mongod_port(args: &[String]) -> Option<String> {
 fn is_not_listening(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     error.contains("econnrefused") || error.contains("connection refused")
+}
+
+fn is_mongo_already_initialized(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("already initialized")
+        || error.contains("alreadyinitialized")
+        || ["code: 23", "code:23"].iter().any(|marker| {
+            error.match_indices(marker).any(|(offset, marker)| {
+                error
+                    .as_bytes()
+                    .get(offset + marker.len())
+                    .is_none_or(|byte| !byte.is_ascii_digit())
+            })
+        })
 }
 
 /// Configured args the managed container is not running with. No configured args
@@ -697,13 +714,111 @@ fn docker_error_message<'a>(stderr: &'a str, stdout: &'a str) -> &'a str {
 
 #[cfg(test)]
 mod tests {
-    use super::{docker_error_message, parse_inspect};
+    use super::{docker_error_message, ensure, is_mongo_already_initialized, parse_inspect};
+    use crate::config::{Resource, ResourceKind};
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn ensure_with_init_error(message: &str) -> (anyhow::Result<super::EnsureResult>, bool) {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "grove-resource-init-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let docker = root.join("docker");
+        std::fs::write(
+            &docker,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\n  inspect) printf '%s' '[{{\"Id\":\"container-id\",\"State\":{{\"Running\":true,\"ExitCode\":0}},\"Config\":{{\"Image\":\"mongo:8.0\"}},\"HostConfig\":{{\"Ulimits\":[],\"PortBindings\":{{\"27017/tcp\":[{{\"HostIp\":\"127.0.0.1\",\"HostPort\":\"27017\"}}]}}}}}}]' ;;\n  exec) echo '{}' >&2; exit 1 ;;\n  *) exit 1 ;;\nesac\n",
+                message
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let resource = Resource {
+            name: "mongo".to_string(),
+            kind: ResourceKind::DockerShared,
+            image: Some("mongo:8.0".to_string()),
+            args: Vec::new(),
+            port: 27017,
+            init: Some("rs.initiate()".to_string()),
+            db_name: None,
+        };
+        let key = resource
+            .name
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let pending = root.join("resources").join(key).join("pending-init.json");
+        std::fs::create_dir_all(pending.parent().unwrap()).unwrap();
+        std::fs::write(&pending, "\"container-id\"").unwrap();
+
+        let previous_state = std::env::var_os("GROVE_STATE_DIR");
+        let previous_docker = std::env::var_os("GROVE_DOCKER");
+        unsafe {
+            std::env::set_var("GROVE_STATE_DIR", &root);
+            std::env::set_var("GROVE_DOCKER", &docker);
+        }
+        let result = ensure(&resource);
+        unsafe {
+            if let Some(value) = previous_state {
+                std::env::set_var("GROVE_STATE_DIR", value);
+            } else {
+                std::env::remove_var("GROVE_STATE_DIR");
+            }
+            if let Some(value) = previous_docker {
+                std::env::set_var("GROVE_DOCKER", value);
+            } else {
+                std::env::remove_var("GROVE_DOCKER");
+            }
+        }
+        let pending_exists = pending.exists();
+        std::fs::remove_dir_all(root).unwrap();
+        (result, pending_exists)
+    }
+
+    #[test]
+    fn ensure_clears_pending_after_mongo_already_initialized() {
+        let (result, pending_exists) =
+            ensure_with_init_error("MongoServerError: already initialized");
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(!pending_exists);
+    }
+
+    #[test]
+    fn ensure_keeps_pending_after_other_init_errors() {
+        let (result, pending_exists) = ensure_with_init_error("MongoServerError: disk failure");
+
+        assert!(result.is_err());
+        assert!(pending_exists);
+    }
 
     #[test]
     fn docker_failure_uses_stderr_then_stdout_then_empty_message() {
         assert_eq!(docker_error_message("error", "result"), "error");
         assert_eq!(docker_error_message("  ", " result\n"), "result");
         assert_eq!(docker_error_message("", ""), "no output");
+    }
+
+    #[test]
+    fn recognizes_mongo_already_initialized_errors_only() {
+        assert!(is_mongo_already_initialized(
+            "MongoServerError: already initialized"
+        ));
+        assert!(is_mongo_already_initialized("AlreadyInitialized"));
+        assert!(is_mongo_already_initialized("MongoServerError code: 23"));
+        assert!(!is_mongo_already_initialized("MongoServerError code: 230"));
+        assert!(!is_mongo_already_initialized("MongoServerError: disk full"));
     }
 
     #[test]

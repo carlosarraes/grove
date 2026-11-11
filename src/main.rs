@@ -415,11 +415,8 @@ fn main() -> Result<()> {
             if !dry_run {
                 instance.touch()?;
             }
-            if !setup_only
-                && !dry_run
-                && let Some(idle) = &instance.config.idle
-            {
-                enforce_idle(&instance, &idle.stop_after)?;
+            if !setup_only && !dry_run {
+                enforce_idle(&instance)?;
             }
 
             if !setup_only && exposure.is_exposed() {
@@ -710,6 +707,7 @@ fn main() -> Result<()> {
         Some(Command::Run { argv, heavy }) => {
             let instance = Instance::open(&cwd)?;
             instance.touch()?;
+            enforce_idle(&instance)?;
             if heavy {
                 load::wait_for_admission(&instance.config.admission.clone().unwrap_or_default())?;
                 instance.touch()?;
@@ -1211,37 +1209,44 @@ fn idle_candidates<'a>(
     doomed
 }
 
-/// The repo opted in with `[idle] stop_after`: this `up` stops its sibling instances
-/// nobody has touched past the window, ports kept. The pile-up forms one agent at a time
-/// and this is the one moment the agent adding to it is present — the moment `survey`
-/// already warns in; here the warning becomes the sweep.
-fn enforce_idle(instance: &Instance, stop_after: &str) -> Result<()> {
+/// Stop this repo's sibling instances that have had no grove command within its
+/// `[idle] stop_after` (4h unless the repo says otherwise, "off" to opt out), ports kept.
+/// The pile-up forms one agent at a time and `up` and `run` are the moments the agent
+/// adding to it is present. On stderr so a `run` child's stdout stays the child's.
+fn enforce_idle(instance: &Instance) -> Result<()> {
+    let Some(window) = instance.config.idle_window()? else {
+        return Ok(());
+    };
     let registry = grove::instance::registry()?;
     let now = grove::registry::now();
-    let window = grove::instance::parse_duration(stop_after)?;
     let running: Vec<Entry> = registry
         .list()?
         .into_iter()
         .filter(Entry::is_running)
         .collect();
-    let repo = instance
+    // Without a state dir there is no telling which repo this is, and an unscoped sweep
+    // would reach other repos' instances.
+    let Some(repo) = instance
         .entry
         .instance_dir
         .as_deref()
-        .and_then(Path::parent);
+        .and_then(Path::parent)
+    else {
+        return Ok(());
+    };
     let doomed = idle_candidates(
         &running,
         &instance.resolved.worktree,
         Some(window),
         now,
-        repo,
+        Some(repo),
     );
     for (entry, age) in doomed {
         if !registry.stop_if_idle(entry, window)? {
             continue;
         }
-        println!(
-            "stopped {}  (idle {}, past this repo's [idle] stop_after = {stop_after:?}; ports kept)",
+        eprintln!(
+            "grove: stopped idle {} (no grove command for {})",
             entry.slug,
             human_age(age)
         );

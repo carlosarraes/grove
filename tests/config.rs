@@ -313,6 +313,33 @@ command = "python3 -m http.server {{ port.web }}"
     assert_eq!(c.idle.as_ref().map(|i| i.stop_after.as_str()), Some("90m"));
 }
 
+fn idle_config(idle: &str) -> config::Config {
+    let wt = worktree_with(&format!(
+        "version = 1\n\n[ports]\nnames = [\"web\"]\n\n{idle}\n[[service]]\nname = \"web\"\ncommand = \"true\"\n"
+    ));
+    config::load(wt.path()).expect("load")
+}
+
+#[test]
+fn without_an_idle_section_instances_stop_after_four_hours() {
+    let window = idle_config("").idle_window().expect("window");
+    assert_eq!(window, Some(std::time::Duration::from_secs(4 * 3600)));
+}
+
+#[test]
+fn an_explicit_window_overrides_the_default() {
+    let window = idle_config("[idle]\nstop_after = \"90m\"\n")
+        .idle_window()
+        .expect("window");
+    assert_eq!(window, Some(std::time::Duration::from_secs(90 * 60)));
+}
+
+#[test]
+fn off_opts_a_repo_out_of_stopping_idle_instances() {
+    let c = idle_config("[idle]\nstop_after = \"off\"\n");
+    assert_eq!(c.idle_window().expect("window"), None);
+}
+
 #[test]
 fn setup_inputs_reject_ambiguous_or_invalid_declarations() {
     for (setup, inputs, extra, expected) in [

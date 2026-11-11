@@ -194,11 +194,14 @@ Do not write a separate `.grove.toml` to install dependencies. Use
 different cache inputs and misses the shared store. This uses the inherited project
 config without starting shared containers, seeds, or services.
 
-  [idle]             optional; opt in to stopping forgotten instances
-  stop_after         e.g. "2h". Every `grove up` for this repo first stops its sibling
-                     instances nobody has touched for this long, ports kept, and says
-                     so. Without it, `up` only warns about the pile-up. An instance is
-                     touched by any grove command in it and by its services writing logs.
+  [idle]             optional; tune or disable stopping of forgotten instances
+  stop_after         e.g. "2h", or "off". Default "4h" when [idle] is absent. Every
+                     `grove up` and `grove run` first stops this repo's sibling instances
+                     with no grove command for this long, ports kept, printing one
+                     `grove: stopped idle NAME (no grove command for 5h12m)` line each on
+                     stderr. The instance running the command is never stopped. Idle is
+                     time since the last up/run/logs/restart/seed in that worktree; service
+                     logs do not count, and `status`/`ls` do not reset it.
 
   [[service]]        repeatable; a long-running process
   name               identifier, also the log file name

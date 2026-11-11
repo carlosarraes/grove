@@ -2735,6 +2735,12 @@ fn backdate(cli: &Cli, worktree: &Path, seconds: u64) {
         }
     }
 
+    age_clock(cli, worktree, seconds);
+}
+
+/// Move only `last_used`, leaving the service logs fresh: the shape of an instance whose
+/// backend is still answering health checks long after anyone ran a grove command.
+fn age_clock(cli: &Cli, worktree: &Path, seconds: u64) {
     // Edited in the file rather than through `record`, which will not move the clock
     // backwards — that invariant is what stops a command writing back a stale entry and
     // undoing its own touch, and a test wanting an aged instance has to go around it.
@@ -2877,7 +2883,8 @@ fn joining_a_crowded_machine_warns_and_names_what_can_be_reclaimed() {
     for wt in &crowd {
         cli.run(wt, &["up"]).success();
     }
-    backdate(&cli, &crowd[0], 6 * 3600);
+    // Past the 2h warning window, inside the 4h default that `up` would stop it at.
+    backdate(&cli, &crowd[0], 3 * 3600);
 
     let joining = cli.worktree("five");
     let out = cli.run_on_machine(&joining, &["up"], "30", "8");
@@ -2887,7 +2894,7 @@ fn joining_a_crowded_machine_warns_and_names_what_can_be_reclaimed() {
     assert!(stderr.contains("4 instances"), "{stderr}");
     assert!(stderr.contains("load 30"), "{stderr}");
     assert!(
-        stderr.contains("one (6h)"),
+        stderr.contains("one (3h)"),
         "the warning must name the stale box and its age: {stderr}"
     );
     assert!(
@@ -3203,21 +3210,19 @@ fn a_dry_run_names_the_casualties_without_creating_any() {
     cli.run(&stale, &["down"]).success();
 }
 
-/// An agent deep in QA on a sibling worktree is exactly who this command is dangerous to,
-/// so an instance still serving traffic is not a candidate however long ago its last
-/// grove command was.
+/// Logs are not evidence of use: a backend answering health checks writes them forever,
+/// which is how idle stacks stayed up for a day. The sweep goes by the last grove command.
 #[test]
-fn an_instance_still_serving_traffic_survives_a_sweep() {
+fn an_instance_still_writing_logs_is_swept_when_no_grove_command_ran() {
     let cli = Cli::new();
     let here = cli.worktree("where_i_am_working");
-    let busy = cli.worktree("mid_browser_qa");
+    let quiet = cli.worktree("health_check_noise");
     cli.run(&here, &["up"]).success();
-    cli.run(&busy, &["up"]).success();
+    cli.run(&quiet, &["up"]).success();
 
-    // Its last grove command was hours ago, but the service has been logging since.
-    backdate(&cli, &busy, 3 * 3600);
+    age_clock(&cli, &quiet, 3 * 3600);
     let logs = registry_of(&cli)
-        .get(&busy)
+        .get(&quiet)
         .expect("get")
         .expect("entry")
         .instance_dir
@@ -3228,7 +3233,7 @@ fn an_instance_still_serving_traffic_survives_a_sweep() {
             .append(true)
             .open(logs.join("web.log"))
             .expect("log")
-            .write_all(b"GET /api/quotes 200\n")
+            .write_all(b"GET /health 200\n")
             .expect("append");
     }
 
@@ -3238,13 +3243,12 @@ fn an_instance_still_serving_traffic_survives_a_sweep() {
     let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
 
     assert!(
-        !stdout.contains("mid_browser_qa"),
-        "an instance whose service is still writing is in use, whoever last ran a grove \
-         command there: {stdout}"
+        stdout.contains("would stop health_check_noise"),
+        "log writes must not hide an instance nobody ran a grove command in: {stdout}"
     );
 
     cli.run(&here, &["down"]).success();
-    cli.run(&busy, &["down"]).success();
+    cli.run(&quiet, &["down"]).success();
 }
 
 /// Dropping every swept instance's database would mean loading each worktree's config to
@@ -5171,9 +5175,13 @@ fn health_does_not_mistake_a_recorded_datastore_for_a_stray_listener() {
     );
 }
 
+fn stderr_of(out: &assert_cmd::assert::Assert) -> String {
+    String::from_utf8_lossy(&out.get_output().stderr).into_owned()
+}
+
 /// An instance nobody has touched past the repo's window is stopped by the next `up`,
 /// whoever runs it. The pile-up forms one agent at a time, and `up` is the one moment the
-/// agent adding to it is present — so with the repo opted in, that moment acts.
+/// agent adding to it is present.
 #[test]
 fn up_stops_sibling_instances_idle_past_the_repos_window() {
     let config = CONFIG.replace("[ports]", "[idle]\nstop_after = \"1h\"\n\n[ports]");
@@ -5183,15 +5191,12 @@ fn up_stops_sibling_instances_idle_past_the_repos_window() {
     cli.run(&stale, &["up"]).success();
     backdate(&cli, &stale, 3 * 3600);
 
-    let out = cli
-        .run(&fresh, &["up"])
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let stdout = String::from_utf8_lossy(&out).into_owned();
-    assert!(stdout.contains("stopped fix_login"), "{stdout}");
-    assert!(stdout.contains("idle"), "{stdout}");
+    let out = cli.run(&fresh, &["up"]).success();
+    assert!(
+        stderr_of(&out).contains("grove: stopped idle fix_login (no grove command for 3h)"),
+        "{}",
+        stderr_of(&out)
+    );
 
     let entry = registry_of(&cli).get(&stale).expect("get").expect("entry");
     assert!(!entry.is_running(), "the stale instance is still running");
@@ -5200,20 +5205,131 @@ fn up_stops_sibling_instances_idle_past_the_repos_window() {
     cli.run(&fresh, &["down"]).success();
 }
 
-/// Without the opt-in, `up` only warns, as it always has.
+/// A repo with no `[idle]` section still gets swept, at four hours.
 #[test]
-fn up_leaves_idle_siblings_alone_when_the_repo_declares_no_window() {
+fn up_stops_siblings_after_four_hours_when_the_repo_declares_no_window() {
+    let cli = Cli::new();
+    let stale = cli.worktree("fix_login");
+    let recent = cli.worktree("fix_signup");
+    let fresh = cli.worktree("feat_search");
+    cli.run(&stale, &["up"]).success();
+    cli.run(&recent, &["up"]).success();
+    backdate(&cli, &stale, 5 * 3600);
+    backdate(&cli, &recent, 3 * 3600);
+
+    let out = cli.run(&fresh, &["up"]).success();
+    assert!(
+        stderr_of(&out).contains("grove: stopped idle fix_login (no grove command for 5h)"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert!(!registry_of(&cli).get(&stale).unwrap().unwrap().is_running());
+    assert!(
+        registry_of(&cli)
+            .get(&recent)
+            .unwrap()
+            .unwrap()
+            .is_running(),
+        "three hours is inside the default window"
+    );
+
+    cli.run(&recent, &["down"]).success();
+    cli.run(&fresh, &["down"]).success();
+}
+
+/// The regression behind nine stacks idling for 11-22h: services that keep logging made
+/// every instance look used. Only the last grove command counts.
+#[test]
+fn an_instance_with_fresh_logs_but_an_old_grove_command_is_stopped() {
     let cli = Cli::new();
     let stale = cli.worktree("fix_login");
     let fresh = cli.worktree("feat_search");
     cli.run(&stale, &["up"]).success();
-    backdate(&cli, &stale, 3 * 3600);
+    age_clock(&cli, &stale, 6 * 3600);
+
+    let ls = cli.run(&fresh, &["ls"]).success();
+    let stdout = String::from_utf8_lossy(&ls.get_output().stdout).into_owned();
+    let row = stdout
+        .lines()
+        .find(|l| l.starts_with("fix_login"))
+        .expect("row");
+    assert!(row.contains("idle 6h"), "{row}");
 
     cli.run(&fresh, &["up"]).success();
-    let entry = registry_of(&cli).get(&stale).expect("get").expect("entry");
+    assert!(!registry_of(&cli).get(&stale).unwrap().unwrap().is_running());
+
+    cli.run(&fresh, &["down"]).success();
+}
+
+/// `run` is what an agent does most, so it has to sweep too.
+#[test]
+fn run_stops_stale_siblings_and_leaves_the_current_and_fresh_instances_alone() {
+    let cli = Cli::new();
+    let stale = cli.worktree("fix_login");
+    let busy = cli.worktree("fix_signup");
+    let here = cli.worktree("feat_search");
+    for wt in [&stale, &busy, &here] {
+        cli.run(wt, &["up"]).success();
+    }
+    backdate(&cli, &stale, 5 * 3600);
+    backdate(&cli, &here, 5 * 3600);
+
+    let out = cli.run(&here, &["run", "--", "true"]).success();
+    let stderr = stderr_of(&out);
     assert!(
-        entry.is_running(),
-        "up stopped a sibling without being asked to"
+        stderr.contains("grove: stopped idle fix_login (no grove command for 5h)"),
+        "{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("stopped idle").count(),
+        1,
+        "only the stale sibling should be named: {stderr}"
+    );
+    assert!(!registry_of(&cli).get(&stale).unwrap().unwrap().is_running());
+    assert!(registry_of(&cli).get(&busy).unwrap().unwrap().is_running());
+    assert!(
+        registry_of(&cli).get(&here).unwrap().unwrap().is_running(),
+        "the instance the command runs in must never be stopped"
+    );
+
+    cli.run(&busy, &["down"]).success();
+    cli.run(&here, &["down"]).success();
+}
+
+/// `up` has the same protection: the instance being started is not its own sibling.
+#[test]
+fn up_never_stops_the_instance_it_is_running_in() {
+    let cli = Cli::new();
+    let here = cli.worktree("feat_search");
+    cli.run(&here, &["up"]).success();
+    backdate(&cli, &here, 9 * 3600);
+
+    let out = cli.run(&here, &["up"]).success();
+    assert!(
+        !stderr_of(&out).contains("stopped idle"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert!(registry_of(&cli).get(&here).unwrap().unwrap().is_running());
+
+    cli.run(&here, &["down"]).success();
+}
+
+/// `stop_after = "off"` is the opt-out; the old warning-only behaviour.
+#[test]
+fn off_disables_stopping_idle_siblings() {
+    let config = CONFIG.replace("[ports]", "[idle]\nstop_after = \"off\"\n\n[ports]");
+    let cli = Cli::with_config(&config);
+    let stale = cli.worktree("fix_login");
+    let fresh = cli.worktree("feat_search");
+    cli.run(&stale, &["up"]).success();
+    backdate(&cli, &stale, 9 * 3600);
+
+    cli.run(&fresh, &["up"]).success();
+    cli.run(&fresh, &["run", "--", "true"]).success();
+    assert!(
+        registry_of(&cli).get(&stale).unwrap().unwrap().is_running(),
+        "`off` must leave siblings running"
     );
 
     cli.run(&stale, &["down"]).success();

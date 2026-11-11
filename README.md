@@ -28,7 +28,8 @@ Two things break the moment you run more than one worktree at a time:
 - **Nothing tells you when there are too many.** Starting an instance is cheap and leaving
   one running is invisible, so they accumulate — and the bill arrives disguised as flaky
   tests on somebody's unrelated branch. `grove ls` reports the machine's load alongside
-  the instances, and `grove down --idle 2h` reclaims the forgotten ones. What `down` gives
+  the instances, and `grove down --idle 2h` reclaims the forgotten ones (`up` and `run` also
+  stop them on their own, see [Idle instances](#idle-instances)). What `down` gives
   back is CPU; the checkout and the dependencies `setup` installed stay until
   `git worktree remove`, which grove never runs for you. A `[service.cache]` block
   makes worktrees on the same lockfile share one copy of their dependencies instead.
@@ -170,7 +171,7 @@ repo's own fixture or settings constructor.
 | `down --idle 2h` \| `--all-but-this` | stop instances across the machine, keeping their ports; `--dry-run` names them first |
 | `restart [service]` | replace one service without touching the others |
 | `status [NAME] [--worktree NAME\|PATH] [--json]` | ports, pids, and whether each service's `ready.http` answers — plus a warning if a service predates your last edit |
-| `ls [--json]` | every instance on the machine, most neglected first, with its owner, the machine's load and what each holds on disk |
+| `ls [--json]` | every instance on the machine, most neglected first, with its owner, how long since its last grove command, the machine's load and what each holds on disk |
 | `test-containers [--remove-stale]` | report stale Mongo testcontainers; recheck and remove only with the explicit flag |
 | `health [--json]` | everything on the machine that is costing someone — stray listeners, orphans, idle instances, disk — each with the command that ends it |
 | `run -- <cmd>` | run a command with this instance's environment overlaid |
@@ -183,6 +184,27 @@ repo's own fixture or settings constructor.
 `grove clean` removes existing grove-linked git worktrees; `grove prune` stops and forgets orphaned instances whose worktree is already gone or left behind as a non-git husk. Clean is machine-wide and defaults to a dry run (`--dry-run` is explicit); pass `--yes` to remove eligible trees without forcing git or dropping databases. Names and repeatable `--worktree PATH` select registry entries; unknown selectors reclaim nothing. Unregistered worktrees are never touched.
 
 Clean reports each tree and skips primary checkouts, held instance locks, running `grove up` runs or stacks, open files, uncommitted changes, branches without upstreams, and unpushed commits. It requires `lsof` and refuses deletion when it is missing. Sizes count unique `nlink == 1` allocated blocks across the whole checkout using the same private-block method as `--footprint`, excluding virtualenv directories containing `pyvenv.cfg` and never following symlinks. These are reclaimable bytes, not `du` totals that include shared hardlinks. With `--yes`, safety checks run again before removal; a git removal failure stops further removals.
+
+### Idle instances
+
+An instance is idle when no grove command (`up`, `run`, `logs`, `restart`, `seed`) has run in its
+worktree for a while. Service logs do not count: a backend that logs health checks every few
+seconds would otherwise look busy forever. `status` and `ls` only read, so they do not reset the
+clock either.
+
+Every `grove up` and `grove run` stops the other instances of the same repo that have been idle
+for longer than `[idle] stop_after`, which is `4h` when the section is absent. Stopping keeps ports,
+worktree and database, so a stopped instance comes back on the same URLs with `grove up`. The
+instance the command runs in is never stopped. Each stop prints one line on stderr:
+
+```
+grove: stopped idle t3_x (no grove command for 5h12m)
+```
+
+```toml
+[idle]
+stop_after = "8h"   # or "off" to never stop idle instances
+```
 
 Dependency footprint walks are opt-in: `grove up --footprint` measures after setup. Plain `grove up`, `grove ls` and `grove health` do not walk the worktree; `ls` and health read stored figures and label unmeasured instances with the flag to run next.
 

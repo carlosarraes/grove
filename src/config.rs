@@ -7,6 +7,12 @@ use std::path::Path;
 
 pub const FILENAME: &str = ".grove.toml";
 
+/// How long an instance may sit without a grove command when the repo says nothing.
+pub const DEFAULT_STOP_AFTER: &str = "4h";
+
+/// The `[idle] stop_after` value that turns the sweep off.
+pub const STOP_AFTER_OFF: &str = "off";
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -21,8 +27,8 @@ pub struct Config {
     pub services: Vec<Service>,
     #[serde(default, rename = "seed")]
     pub seeds: Vec<Seed>,
-    /// How long an instance of this repo may run untouched before the next `grove up`
-    /// stops it. Opt-in: without it, `up` only warns about the pile-up.
+    /// How long an instance of this repo may run without a grove command before the next
+    /// `grove up` or `grove run` stops it. Defaults to `DEFAULT_STOP_AFTER`; `"off"` opts out.
     pub idle: Option<Idle>,
     pub admission: Option<Admission>,
 }
@@ -50,13 +56,13 @@ impl Default for Admission {
     }
 }
 
-/// The pile-up forms one agent at a time, and `up` is the one moment the agent adding to
-/// it is present. A repo that declares a window turns that moment from a warning into
-/// the sweep — ports kept, so a stopped instance comes back on the same URLs.
+/// The pile-up forms one agent at a time, and `up` and `run` are the moments the agent
+/// adding to it is present — so those commands stop the siblings nobody has used, ports
+/// kept, so a stopped instance comes back on the same URLs.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Idle {
-    /// e.g. `"2h"`; the same grammar as `ready.timeout`.
+    /// e.g. `"2h"`, the same grammar as `ready.timeout`, or `"off"`.
     pub stop_after: String,
 }
 
@@ -220,6 +226,21 @@ pub fn parse(text: &str) -> Result<Config> {
 }
 
 impl Config {
+    /// How long an instance may go without a grove command before a sibling's `up` or
+    /// `run` stops it; None when the repo opted out.
+    pub fn idle_window(&self) -> Result<Option<std::time::Duration>> {
+        let stop_after = self
+            .idle
+            .as_ref()
+            .map_or(DEFAULT_STOP_AFTER, |idle| idle.stop_after.as_str());
+        if stop_after == STOP_AFTER_OFF {
+            return Ok(None);
+        }
+        crate::instance::parse_duration(stop_after)
+            .map(Some)
+            .with_context(|| format!("[idle] stop_after = {stop_after:?}"))
+    }
+
     fn validate(&self) -> Result<()> {
         for seed in &self.seeds {
             let timeout = crate::instance::parse_duration(&seed.timeout)
@@ -252,10 +273,7 @@ impl Config {
                 anyhow::bail!("[admission] timeout must be greater than zero");
             }
         }
-        if let Some(idle) = &self.idle {
-            crate::instance::parse_duration(&idle.stop_after)
-                .with_context(|| format!("[idle] stop_after = {:?}", idle.stop_after))?;
-        }
+        self.idle_window()?;
         for service in &self.services {
             if service.command.is_none() && service.ready.is_some() {
                 anyhow::bail!(

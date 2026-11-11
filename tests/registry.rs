@@ -251,22 +251,18 @@ fn touching_records_that_someone_is_working_here() {
     assert!(idle < 60, "just touched, but reads as {idle}s idle");
 }
 
-/// The hazard this exists to prevent. An agent forty minutes into browser-driven QA —
-/// clicking dialogs, waiting on autosave, reading DOM — issues no grove commands at all
-/// while being maximally busy. On `last_used` alone its box reads as abandoned, and a
-/// sibling's `grove down --idle 30m` kills its backend mid-run.
-///
-/// A backend serving that QA is writing request logs the whole time, so the log is the
-/// evidence `last_used` cannot supply.
+/// The bug that left nine stacks running for 11-22h. A backend answering health checks
+/// writes a log line every few seconds forever, so letting log mtimes count made every
+/// instance look used. Idle is the time since a grove command, nothing else.
 #[test]
-fn an_instance_serving_traffic_is_not_idle_though_no_grove_command_ran() {
+fn chatty_service_logs_do_not_make_an_instance_look_used() {
     let h = Harness::new();
     let r = h.resolved("feat_search");
     let mut entry = h.registry.reserve(&r, &names()).expect("reserve");
 
     let logs = TempDir::new().expect("tempdir");
     entry.instance_dir = Some(logs.path().to_path_buf());
-    entry.last_used = Some(now() - 3600);
+    entry.last_used = Some(now() - 11 * 3600);
     entry.services.insert(
         "backend".to_string(),
         grove::supervise::Handle {
@@ -274,46 +270,12 @@ fn an_instance_serving_traffic_is_not_idle_though_no_grove_command_ran() {
             started_at: now() - 28_800,
         },
     );
-    std::fs::write(logs.path().join("backend.log"), "GET /api/quotes 200\n").expect("log");
+    std::fs::write(logs.path().join("backend.log"), "GET /health 200\n").expect("log");
 
     let idle = entry.idle_seconds(now()).expect("age");
     assert!(
-        idle < 60,
-        "an instance whose backend is still logging requests must not read as idle: {idle}s"
-    );
-}
-
-/// A log belonging to a service that is no longer running says nothing about now.
-#[test]
-fn a_stale_log_does_not_keep_an_instance_looking_busy() {
-    let h = Harness::new();
-    let r = h.resolved("feat_search");
-    let mut entry = h.registry.reserve(&r, &names()).expect("reserve");
-
-    let logs = TempDir::new().expect("tempdir");
-    let log = logs.path().join("backend.log");
-    std::fs::write(&log, "old\n").expect("log");
-    std::fs::File::options()
-        .write(true)
-        .open(&log)
-        .expect("open")
-        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200))
-        .expect("backdate the log");
-
-    entry.instance_dir = Some(logs.path().to_path_buf());
-    entry.last_used = Some(now() - 3600);
-    entry.services.insert(
-        "backend".to_string(),
-        grove::supervise::Handle {
-            pid: 1,
-            started_at: now() - 28_800,
-        },
-    );
-
-    let idle = entry.idle_seconds(now()).expect("age");
-    assert!(
-        (3500..3700).contains(&idle),
-        "with an older log, the last grove command is the freshest evidence: {idle}s"
+        (11 * 3600 - 60..11 * 3600 + 60).contains(&idle),
+        "a fresh log line must not reset the idle clock: {idle}s"
     );
 }
 

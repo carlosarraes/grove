@@ -38,9 +38,10 @@ pub struct Entry {
     /// make every instance on an upgraded machine look abandoned.
     #[serde(default)]
     pub last_used: Option<u64>,
-    /// Where this instance's service logs live. Persisted because it derives from
-    /// `Resolved::state_key`, which hangs off the main worktree — a path `ls` has no other
-    /// way to reach, since it reads the registry and never resolves a worktree.
+    /// Where this instance's service logs live, which also names the repo it belongs to.
+    /// Persisted because it derives from `Resolved::state_key`, which hangs off the main
+    /// worktree — a path the idle sweep has no other way to reach, since it reads the
+    /// registry and never resolves a sibling's worktree.
     #[serde(default)]
     pub instance_dir: Option<PathBuf>,
     /// Git-ignored bytes under the worktree, measured after `setup` ran — the moment the
@@ -67,37 +68,16 @@ pub struct DbResource {
 }
 
 impl Entry {
-    /// Seconds since the last evidence that anyone was using this instance, or None when
-    /// there is no evidence either way.
+    /// Seconds since the last grove command in this instance's worktree, or None when
+    /// none has been recorded.
     ///
-    /// Two sources, because neither is sufficient alone. `last_used` misses an agent
-    /// forty minutes into browser-driven QA, which issues no grove commands while being
-    /// maximally busy; the service logs catch exactly that, because a backend serving it
-    /// is writing request lines the whole time.
-    ///
-    /// It errs toward looking busy — a chatty reload watcher keeps an idle instance off
-    /// the list. For a number that decides what gets killed, that is the right direction
-    /// to be wrong in.
+    /// Service logs deliberately do not count. A backend answering health checks writes a
+    /// line every few seconds for as long as it runs, so any log-based signal marks every
+    /// instance busy forever and nothing is ever stopped. The cost is that an agent
+    /// driving a browser against the instance for hours without running a grove command
+    /// looks idle; its next `up`, `run` or `logs` brings the instance back on its ports.
     pub fn idle_seconds(&self, now: u64) -> Option<u64> {
-        let logged = self
-            .services
-            .keys()
-            .filter_map(|name| self.log_touched(name))
-            .max();
-        let freshest = self.last_used.into_iter().chain(logged).max()?;
-        Some(now.saturating_sub(freshest))
-    }
-
-    fn log_touched(&self, service: &str) -> Option<u64> {
-        let dir = self.instance_dir.as_ref()?;
-        dir.join(format!("{service}.log"))
-            .metadata()
-            .ok()?
-            .modified()
-            .ok()?
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .map(|d| d.as_secs())
+        Some(now.saturating_sub(self.last_used?))
     }
 
     /// Any service still answering. A recorded pid says only that something started once.

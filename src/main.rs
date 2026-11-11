@@ -398,6 +398,11 @@ fn main() -> Result<()> {
                 grove::instance::registry()?
                     .set_started_by(&instance.resolved.worktree, herdr_owner())?;
             }
+            // Before the waits, as `run --heavy` does: a held `up` has started, and a
+            // stale clock would let a sibling's sweep stop its services mid-wait.
+            if !dry_run {
+                instance.touch()?;
+            }
             let _startup_slot = if heavy {
                 Some(grove::load::wait_for_startup(
                     &instance.config.admission.clone().unwrap_or_default(),

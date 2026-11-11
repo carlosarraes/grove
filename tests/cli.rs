@@ -5296,6 +5296,85 @@ fn run_stops_stale_siblings_and_leaves_the_current_and_fresh_instances_alone() {
     cli.run(&here, &["down"]).success();
 }
 
+/// An `up` held at the load gate has already started. If its idle clock only moved after
+/// the gate opened, a sibling's `up` or `run` during a ten-minute wait would stop the
+/// services under it, and the `up` would then start them again on top of the wreckage.
+#[test]
+fn an_up_held_at_the_gate_is_not_stopped_by_a_sibling_sweep() {
+    use std::io::BufRead;
+    let cli = Cli::with_config(&format!("{CACHE_CONFIG}\n[admission]\ntimeout = \"60s\"\n"));
+    with_lockfile(&cli, "lockfile A\n");
+    let waiting = cli.worktree("gate_waiting");
+    let sibling = cli.worktree("gate_sibling");
+    cli.run_env(
+        &waiting,
+        &[("GROVE_LOAD", "1"), ("GROVE_LOAD15", "1")],
+        &["up", "--gate"],
+    )
+    .success();
+    age_clock(&cli, &waiting, 6 * 3600);
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("grove"))
+        .args(["up", "--gate"])
+        .current_dir(&waiting)
+        .env("GROVE_STATE_DIR", cli.state.path())
+        .env("GROVE_CACHE_DIR", cli.state.path().join("store"))
+        .env("PATH", cli.client_path())
+        .env("GROVE_PORT_RANGE", cli.port_range())
+        .env("GROVE_HEARTBEAT_SECS", "0.1")
+        .env("GROVE_LOAD", "70")
+        .env("GROVE_LOAD15", "70")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn up");
+    let stderr = child.stderr.take().unwrap();
+    let (lines, received) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            let _ = lines.send(line);
+        }
+    });
+    let mut seen = Vec::new();
+    loop {
+        let line = received
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap_or_else(|_| panic!("the gate never reported holding: {seen:?}"));
+        let holding = line.contains("still waiting");
+        seen.push(line);
+        if holding {
+            break;
+        }
+    }
+
+    let idle = grove::registry::now() - last_used(&cli, &waiting).expect("used");
+    assert!(
+        idle < 60,
+        "an up that is already waiting is working here, but it read as {idle}s idle"
+    );
+    cli.run(&sibling, &["run", "--", "true"]).success();
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the gated up exited early: {seen:?}"
+    );
+    assert!(
+        registry_of(&cli)
+            .get(&waiting)
+            .unwrap()
+            .unwrap()
+            .is_running(),
+        "a sibling's sweep stopped an instance whose up was waiting at the gate"
+    );
+
+    child.kill().expect("kill the held up");
+    child.wait().expect("reap");
+    reader.join().unwrap();
+    cli.run(&waiting, &["down"]).success();
+}
+
 /// `up` has the same protection: the instance being started is not its own sibling.
 #[test]
 fn up_never_stops_the_instance_it_is_running_in() {

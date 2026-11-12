@@ -2613,6 +2613,133 @@ fn restart_replaces_one_service_and_leaves_the_rest_alone() {
     cli.run(&wt, &["down"]).success();
 }
 
+const TWO_SERVICES: &str = r#"
+version = 1
+
+[ports]
+names = ["web", "api"]
+
+[[service]]
+name = "web"
+command = "python3 -u -m http.server {{ port.web }}"
+ready = { http = "http://127.0.0.1:{{ port.web }}/", timeout = "30s" }
+
+[[service]]
+name = "api"
+command = "python3 -u -m http.server {{ port.api }}"
+ready = { http = "http://127.0.0.1:{{ port.api }}/", timeout = "30s" }
+"#;
+
+fn pids_of(cli: &Cli, wt: &Path) -> serde_json::Value {
+    let out = cli
+        .run(wt, &["status", "--json"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    serde_json::from_slice::<serde_json::Value>(&out).expect("json")["services"].clone()
+}
+
+/// `grove status` recommends `grove restart <a> <b>` for several stale services, so the
+/// command must accept several names and replace exactly those, in the order given.
+#[test]
+fn restart_accepts_several_services_and_stops_them_in_the_order_given() {
+    let cli = Cli::with_config(TWO_SERVICES);
+    let wt = cli.worktree("feat_multi");
+    cli.run(&wt, &["up"]).success();
+    let before = pids_of(&cli, &wt);
+
+    let restarted = cli.run(&wt, &["restart", "web", "api"]).success();
+    let stdout = String::from_utf8_lossy(&restarted.get_output().stdout).into_owned();
+    let web = stdout.find("stopped web").expect("web stopped");
+    let api = stdout.find("stopped api").expect("api stopped");
+    assert!(web < api, "stopped in the order given: {stdout}");
+
+    let after = pids_of(&cli, &wt);
+    assert_ne!(before["web"]["pid"], after["web"]["pid"], "web replaced");
+    assert_ne!(before["api"]["pid"], after["api"]["pid"], "api replaced");
+
+    cli.run(&wt, &["down"]).success();
+}
+
+#[test]
+fn restart_with_several_names_leaves_unnamed_services_alone() {
+    let cli = Cli::with_config(TWO_SERVICES);
+    let wt = cli.worktree("feat_subset");
+    cli.run(&wt, &["up"]).success();
+    let before = pids_of(&cli, &wt);
+
+    cli.run(&wt, &["restart", "api"]).success();
+
+    let after = pids_of(&cli, &wt);
+    assert_eq!(before["web"]["pid"], after["web"]["pid"], "web untouched");
+    assert_ne!(before["api"]["pid"], after["api"]["pid"], "api replaced");
+
+    cli.run(&wt, &["down"]).success();
+}
+
+#[test]
+fn restart_with_no_names_still_restarts_everything() {
+    let cli = Cli::with_config(TWO_SERVICES);
+    let wt = cli.worktree("feat_all");
+    cli.run(&wt, &["up"]).success();
+    let before = pids_of(&cli, &wt);
+
+    cli.run(&wt, &["restart"]).success();
+
+    let after = pids_of(&cli, &wt);
+    assert_ne!(before["web"]["pid"], after["web"]["pid"]);
+    assert_ne!(before["api"]["pid"], after["api"]["pid"]);
+
+    cli.run(&wt, &["down"]).success();
+}
+
+/// A typo in the second name must not leave the first one already stopped.
+#[test]
+fn restart_with_an_unknown_name_fails_listing_the_valid_names_and_stops_nothing() {
+    let cli = Cli::with_config(TWO_SERVICES);
+    let wt = cli.worktree("feat_typo");
+    cli.run(&wt, &["up"]).success();
+    let before = pids_of(&cli, &wt);
+
+    let failed = cli.run(&wt, &["restart", "web", "wbe"]).failure();
+    let stderr = String::from_utf8_lossy(&failed.get_output().stderr).into_owned();
+    assert!(stderr.contains("wbe"), "names the bad service: {stderr}");
+    assert!(
+        stderr.contains("web") && stderr.contains("api"),
+        "lists the valid names: {stderr}"
+    );
+
+    assert_eq!(before, pids_of(&cli, &wt), "nothing was stopped");
+
+    cli.run(&wt, &["down"]).success();
+}
+
+/// Round trip: whatever `status` tells the user to type must be accepted as typed.
+#[test]
+fn the_restart_command_status_prints_for_two_stale_services_runs() {
+    let cli = Cli::with_config(TWO_SERVICES);
+    let wt = cli.worktree("feat_hint");
+    cli.run(&wt, &["up"]).success();
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(wt.join("README.md"), "changed\n").expect("edit");
+
+    let status = cli.run(&wt, &["status"]).success();
+    let stdout = String::from_utf8_lossy(&status.get_output().stdout).into_owned();
+    let hint = stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("grove restart"))
+        .unwrap_or_else(|| panic!("status must print a restart command: {stdout}"));
+    let args: Vec<&str> = hint.split_whitespace().skip(1).collect();
+    assert_eq!(args.len(), 3, "restart plus both stale services: {hint}");
+
+    cli.run(&wt, &args).success();
+
+    cli.run(&wt, &["down"]).success();
+}
+
 /// The failure that nearly produced a false bug report: a service started before your
 /// last edit keeps serving the old code, and nothing says so.
 #[test]

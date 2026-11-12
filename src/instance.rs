@@ -882,11 +882,14 @@ impl Instance {
         crate::resource::drop_database(resource, database)
     }
 
-    /// Stop the named service (or all of them) so the next `up` starts it fresh.
-    /// Returns what it stopped, so a caller can say which name it did not recognise.
-    pub fn stop_services(&mut self, only: Option<&str>) -> Result<Vec<String>> {
+    /// Stop the named services in the order given (or all of them if none are named) so the
+    /// next `up` starts them fresh. Every name is checked before any service is stopped, so
+    /// a typo cannot leave the services before it already down.
+    /// Returns what it stopped.
+    pub fn stop_services(&mut self, only: &[String]) -> Result<Vec<String>> {
         if let Some(name) = only
-            && !self.config.services.iter().any(|s| s.name == name)
+            .iter()
+            .find(|name| !self.config.services.iter().any(|s| s.name == **name))
         {
             let known: Vec<&str> = self
                 .config
@@ -897,11 +900,16 @@ impl Instance {
             bail!("this repo declares no service named {name:?}; it has {known:?}");
         }
 
+        let order: Vec<String> = if only.is_empty() {
+            self.entry.services.keys().cloned().collect()
+        } else {
+            only.to_vec()
+        };
         let mut stopped = Vec::new();
-        for (name, handle) in self.entry.services.clone() {
-            if only.is_some_and(|wanted| wanted != name) {
+        for name in order {
+            let Some(handle) = self.entry.services.get(&name).cloned() else {
                 continue;
-            }
+            };
             supervise::stop(&handle)?;
             self.entry.services.remove(&name);
             stopped.push(name);

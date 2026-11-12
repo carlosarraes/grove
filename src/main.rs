@@ -240,8 +240,11 @@ enum Command {
         #[arg(long)]
         since_restart: bool,
     },
-    /// Stop a service and start it again; all of them if none is named
-    Restart { service: Option<String> },
+    /// Stop services and start them again, in the order named; all of them if none is named
+    Restart {
+        #[arg(value_name = "SERVICE")]
+        services: Vec<String>,
+    },
     /// Remove idle grove-linked git worktrees (dry-run by default); prune forgets orphaned instances
     Clean {
         /// Instance names as `grove ls` shows them, or recorded worktree paths
@@ -793,14 +796,14 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Some(Command::Restart { service }) => {
+        Some(Command::Restart { services }) => {
             let _up_lock = grove::instance::lock_up(&cwd)?;
             let mut instance = Instance::open(&cwd)?;
             instance.refuse_in_main()?;
             grove::instance::registry()?
                 .set_started_by(&instance.resolved.worktree, herdr_owner())?;
             instance.touch()?;
-            for name in instance.stop_services(service.as_deref())? {
+            for name in instance.stop_services(&services)? {
                 println!("stopped {name}");
             }
             // `up` only starts what is not already running, so stopping first is what
@@ -1180,7 +1183,12 @@ fn warn_if_stale(instance: &Instance) {
     for name in &stale {
         println!("{name} started before your newest edit and may be serving stale code");
     }
-    println!("  grove restart {}", stale.join(" "));
+    println!("  {}", restart_hint(&stale));
+}
+
+/// The command `status` recommends; kept apart so a test can feed it back through the parser.
+fn restart_hint(stale: &[String]) -> String {
+    format!("grove restart {}", stale.join(" "))
 }
 
 /// Running instances past the window, oldest first. `repo` narrows the field to one
@@ -1697,5 +1705,35 @@ fn setup_plan_line(name: &str, plan: &grove::instance::SetupInstallPlan) -> Stri
             format!("{name}: cache hit (link-only)")
         }
         SetupInstallPlan::FullInstall(_) => format!("{name}: cache miss (full install)"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn restart_services(args: &[&str]) -> Vec<String> {
+        let cli = Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+        match cli.command {
+            Some(Command::Restart { services }) => services,
+            _ => panic!("{args:?} is not a restart"),
+        }
+    }
+
+    #[test]
+    fn restart_takes_zero_one_or_many_services() {
+        assert!(restart_services(&["grove", "restart"]).is_empty());
+        assert_eq!(restart_services(&["grove", "restart", "a"]), ["a"]);
+        assert_eq!(
+            restart_services(&["grove", "restart", "b", "a"]),
+            ["b", "a"]
+        );
+    }
+
+    #[test]
+    fn the_hint_for_two_stale_services_parses_as_a_restart() {
+        let hint = restart_hint(&["backend".to_string(), "frontend".to_string()]);
+        let words: Vec<&str> = hint.split_whitespace().collect();
+        assert_eq!(restart_services(&words), ["backend", "frontend"]);
     }
 }

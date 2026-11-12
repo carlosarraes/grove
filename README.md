@@ -169,7 +169,7 @@ repo's own fixture or settings constructor.
 | `up [--heavy] [--gate] [--footprint] [--expose] [--expose-host HOST] [--setup-only] [--dry-run]` | render config, optionally measure dependency footprint, expose opted-in services, and start shared resources and services; `--setup-only` runs dependency setup without starting anything, while `--dry-run` reports cache decisions without changes |
 | `down [--purge]` | stop services; `--purge` also drops the database |
 | `down --idle 2h` \| `--all-but-this` | stop instances across the machine, keeping their ports; `--dry-run` names them first |
-| `restart [service]` | replace one service without touching the others |
+| `restart [service...]` | replace the named services, in order, without touching the others; all of them if none are named |
 | `status [NAME] [--worktree NAME\|PATH] [--json]` | ports, pids, and whether each service's `ready.http` answers — plus a warning if a service predates your last edit |
 | `ls [--json]` | every instance on the machine, most neglected first, with its owner, how long since its last grove command, the machine's load and what each holds on disk |
 | `test-containers [--remove-stale]` | report stale Mongo testcontainers; recheck and remove only with the explicit flag |

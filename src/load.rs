@@ -210,12 +210,28 @@ fn cores() -> usize {
 
 /// Admission is a load check, not a concurrency reservation. Use Ferry for slot limits.
 pub fn wait_for_admission(config: &crate::config::Admission) -> anyhow::Result<()> {
-    wait_with_samples(config, sample)
+    wait_for_admission_cancellable(config, || {})
 }
 
+pub(crate) fn wait_for_admission_cancellable(
+    config: &crate::config::Admission,
+    cancelled: impl Fn(),
+) -> anyhow::Result<()> {
+    wait_with_samples_cancellable(config, sample, cancelled)
+}
+
+#[cfg(test)]
 fn wait_with_samples(
     config: &crate::config::Admission,
+    sample: impl FnMut() -> Option<Load>,
+) -> anyhow::Result<()> {
+    wait_with_samples_cancellable(config, sample, || {})
+}
+
+fn wait_with_samples_cancellable(
+    config: &crate::config::Admission,
     mut sample: impl FnMut() -> Option<Load>,
+    cancelled: impl Fn(),
 ) -> anyhow::Result<()> {
     use anyhow::{Context, bail};
     use std::time::{Duration, Instant};
@@ -224,6 +240,7 @@ fn wait_with_samples(
     let began = Instant::now();
     let mut heartbeat = Duration::ZERO;
     loop {
+        cancelled();
         let elapsed = began.elapsed();
         if elapsed >= timeout {
             bail!(

@@ -6950,29 +6950,128 @@ fn heavy_run_admission_controls_child_start_and_preserves_its_exit_code() {
 #[test]
 fn cancelling_heavy_admission_never_starts_the_child() {
     use std::io::{BufRead, BufReader};
-    let cli = Cli::new();
-    let wt = cli.worktree("cancel_admission");
-    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin!("grove"))
-        .current_dir(&wt)
-        .env("GROVE_STATE_DIR", cli.state.path())
-        .env("GROVE_PORT_RANGE", cli.port_range())
-        .env("GROVE_LOAD", "100")
-        .env("GROVE_CORES", "4")
-        .args(["run", "--heavy", "--", "touch", "ran"])
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut output = BufReader::new(child.stderr.take().unwrap());
-    let mut line = String::new();
-    output.read_line(&mut line).unwrap();
-    let waiting = line.contains("admission: waiting");
-    let _ = rustix::process::kill_process(
-        rustix::process::Pid::from_raw(child.id() as i32).unwrap(),
+    for signal in [
+        rustix::process::Signal::TERM,
         rustix::process::Signal::INT,
-    );
-    assert!(!child.wait().unwrap().success());
-    assert!(waiting, "expected admission wait, got {line}");
-    assert!(!wt.join("ran").exists());
+        rustix::process::Signal::HUP,
+    ] {
+        let cli = Cli::new();
+        let wt = cli.worktree("cancel_admission");
+        let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin!("grove"))
+            .current_dir(&wt)
+            .env("GROVE_STATE_DIR", cli.state.path())
+            .env("GROVE_PORT_RANGE", cli.port_range())
+            .env("GROVE_LOAD", "100")
+            .env("GROVE_CORES", "4")
+            .args(["run", "--heavy", "--", "touch", "ran"])
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = BufReader::new(child.stderr.take().unwrap());
+        let mut line = String::new();
+        output.read_line(&mut line).unwrap();
+        let waiting = line.contains("admission: waiting");
+        let _ = rustix::process::kill_process(
+            rustix::process::Pid::from_raw(child.id() as i32).unwrap(),
+            signal,
+        );
+        assert_eq!(child.wait().unwrap().code(), Some(128 + signal.as_raw()));
+        std::io::Read::read_to_string(&mut output, &mut line).unwrap();
+        assert!(
+            line.contains("grove: killed while waiting for load admission, nothing started"),
+            "{line}"
+        );
+        assert!(waiting, "expected admission wait, got {line}");
+        assert!(!wt.join("ran").exists());
+    }
+}
+
+#[test]
+fn run_forwards_signals_and_preserves_child_last_words() {
+    use std::os::unix::process::CommandExt;
+    for heavy in [false, true] {
+        for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            for group in [false, true] {
+                let cli = Cli::new();
+                let wt = cli.worktree("forward");
+                let log = std::fs::File::create(wt.join("stderr")).unwrap();
+                let mut command =
+                    std::process::Command::new(assert_cmd::cargo::cargo_bin!("grove"));
+                command
+                    .current_dir(&wt)
+                    .env("GROVE_STATE_DIR", cli.state.path())
+                    .env("GROVE_PORT_RANGE", cli.port_range())
+                    .env("GROVE_LOAD", "0")
+                    .arg("run");
+                if heavy {
+                    command.arg("--heavy");
+                }
+                let mut child = command
+                    .args([
+                        "--",
+                        "python3",
+                        "-c",
+                        r#"
+import signal, pathlib, sys, time
+def stop(signum, frame):
+    pathlib.Path("received").write_text(str(signum))
+    print("child last words", file=sys.stderr, flush=True)
+    sys.exit(7)
+for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(sig, stop)
+pathlib.Path("ready").touch()
+while True:
+    time.sleep(0.05)
+"#,
+                    ])
+                    .process_group(0)
+                    .stderr(log)
+                    .spawn()
+                    .unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                while !wt.join("ready").exists() {
+                    assert!(std::time::Instant::now() < deadline, "child never ready");
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                let target = child.id() as i32 * if group { -1 } else { 1 };
+                unsafe {
+                    libc::kill(target, signal);
+                }
+                let status = loop {
+                    if let Some(status) = child.try_wait().unwrap() {
+                        break status;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        unsafe {
+                            libc::kill(-(child.id() as i32), libc::SIGKILL);
+                        }
+                        panic!("grove did not exit");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                };
+                let stderr = std::fs::read_to_string(wt.join("stderr")).unwrap();
+                assert_eq!(status.code(), Some(128 + signal), "{stderr}");
+                assert_eq!(
+                    std::fs::read_to_string(wt.join("received")).unwrap(),
+                    signal.to_string()
+                );
+                assert!(stderr.contains("child last words"), "{stderr}");
+                let name = match signal {
+                    libc::SIGTERM => "SIGTERM",
+                    libc::SIGINT => "SIGINT",
+                    _ => "SIGHUP",
+                };
+                assert!(
+                    stderr.contains(&format!("grove: got {name} after ")),
+                    "{stderr}"
+                );
+                assert!(
+                    stderr.contains("s, forwarded to child (exit 7)"),
+                    "{stderr}"
+                );
+            }
+        }
+    }
 }
 
 fn stopped_resource_fixture(
@@ -9174,4 +9273,66 @@ fn setup_only_preserves_idle_sibling() {
     cli.run(&fresh, &["up"]).success();
     assert!(!registry_of(&cli).get(&stale).unwrap().unwrap().is_running());
     cli.run(&fresh, &["down"]).success();
+}
+
+#[test]
+fn run_bounds_wait_for_a_child_ignoring_term() {
+    let cli = Cli::new();
+    let wt = cli.worktree("ignore_term");
+    let log = std::fs::File::create(wt.join("stderr")).unwrap();
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin!("grove"))
+        .current_dir(&wt)
+        .env("GROVE_STATE_DIR", cli.state.path())
+        .env("GROVE_PORT_RANGE", cli.port_range())
+        .args([
+            "run",
+            "--",
+            "python3",
+            "-c",
+            r#"
+import os, pathlib, signal, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+pathlib.Path("ready").write_text(str(os.getpid()))
+time.sleep(60)
+"#,
+        ])
+        .stderr(log)
+        .spawn()
+        .unwrap();
+    let began = std::time::Instant::now();
+    while !wt.join("ready").exists() {
+        assert!(began.elapsed().as_secs() < 15);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let pid: i32 = std::fs::read_to_string(wt.join("ready"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let sent = std::time::Instant::now();
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if sent.elapsed().as_secs() >= 14 {
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    if status.is_none() {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+    assert_eq!(status.unwrap().code(), Some(143));
+    assert!(sent.elapsed() >= std::time::Duration::from_secs(10));
+    let stderr = std::fs::read_to_string(wt.join("stderr")).unwrap();
+    assert!(
+        stderr.contains("forwarded to child (exit timeout)"),
+        "{stderr}"
+    );
 }

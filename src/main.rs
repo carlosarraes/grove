@@ -725,16 +725,20 @@ fn main() -> Result<()> {
             let instance = Instance::open(&cwd)?;
             instance.touch()?;
             enforce_idle(&instance)?;
+            let admission = instance.config.admission.clone().unwrap_or_default();
+            let signals = grove::run::Signals::capture()?;
             if heavy {
-                load::wait_for_admission(&instance.config.admission.clone().unwrap_or_default())?;
+                signals.admit(&admission)?;
                 instance.touch()?;
             }
-            let status = std::process::Command::new(&argv[0])
+            signals.check_waiting();
+            let mut child = std::process::Command::new(&argv[0])
                 .args(&argv[1..])
                 .current_dir(&cwd)
                 .envs(instance.environment()?)
-                .status()
+                .spawn()
                 .with_context(|| format!("running `{}`", argv.join(" ")))?;
+            let status = signals.wait(&mut child)?;
 
             // Sampled after the child, so the average includes the contention the run
             // actually experienced — and printed only on failure, because a note that

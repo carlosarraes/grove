@@ -36,11 +36,18 @@ pub fn sample() -> Option<Load> {
         Some(forced) => forced,
         None => machine_load()?,
     };
-    let cores = override_value("GROVE_CORES")
+    Some(Load {
+        one,
+        cores: gate_cores(),
+    })
+}
+
+/// The cores available to carry load, `GROVE_CORES` forced for tests.
+fn gate_cores() -> usize {
+    override_value("GROVE_CORES")
         .map(|c| c as usize)
         .unwrap_or_else(cores)
-        .max(1);
-    Some(Load { one, cores })
+        .max(1)
 }
 
 /// Real machine load is not something a test can arrange, so both halves can be forced.
@@ -110,8 +117,12 @@ pub fn averages() -> Option<[f64; 2]> {
     Some([one, fifteen])
 }
 
-/// Both averages must be under their limits: the 1-minute one says what is running now,
-/// the 15-minute one whether that is a spike or the afternoon.
+/// The 1-minute average must be under its limit, and either the 15-minute average is
+/// under its limit too or the 1-minute one is under the core count. The 1-minute figure
+/// says what is running now; the 15-minute one tells a dip in a busy afternoon from a
+/// quiet machine, but it lags a finished spike by 10 to 20 minutes, so a 1-minute load
+/// under the core count overrides it: the machine has recovered, and the startup slots
+/// already bound how many starts go at once.
 pub fn judge(
     install: &Install,
     config: &crate::config::Admission,
@@ -131,13 +142,20 @@ pub fn judge(
             line: format!("{head}, load unreadable, holding"),
         },
         Some([one, fifteen]) => {
-            let admitted = one < max_one && fifteen < max_fifteen;
+            let cores = gate_cores();
+            let calm = fifteen < max_fifteen;
+            let recovered = one < cores as f64;
+            let admitted = one < max_one && (calm || recovered);
+            let verdict = match (admitted, calm) {
+                (true, true) => "ok".to_string(),
+                (true, false) => {
+                    format!("ok (15-min still high, machine recovered: 1-min under {cores} cores)")
+                }
+                (false, _) => "over, holding".to_string(),
+            };
             Verdict {
                 admitted,
-                line: format!(
-                    "{head}, load {one:.1}/{fifteen:.1} {}",
-                    if admitted { "ok" } else { "over, holding" }
-                ),
+                line: format!("{head}, load {one:.1}/{fifteen:.1} {verdict}"),
             }
         }
     }

@@ -4612,7 +4612,11 @@ fn install_gate_admits_a_link_only_up_at_load_that_holds_a_full_install() {
     let gate = cli
         .run_env(
             &b,
-            &[("GROVE_LOAD", "40"), ("GROVE_LOAD15", "65")],
+            &[
+                ("GROVE_LOAD", "40"),
+                ("GROVE_LOAD15", "65"),
+                ("GROVE_CORES", "16"),
+            ],
             &["gate"],
         )
         .code(3);
@@ -4631,6 +4635,61 @@ fn install_gate_admits_a_link_only_up_at_load_that_holds_a_full_install() {
 
     cli.run(&a, &["down"]).success();
     cli.run(&b, &["down"]).success();
+}
+
+/// A 15-minute average lags a finished spike by 10 to 20 minutes, so it must not hold an
+/// idle machine: once the 1-minute load is under the core count the gate admits and says
+/// why. A busy 1-minute load, or one over the install limit, still holds.
+#[test]
+fn install_gate_admits_a_recovered_machine_whose_15_minute_load_still_lags() {
+    let cli = Cli::with_config(CACHE_CONFIG);
+    with_lockfile(&cli, "lockfile A\n");
+    let wt = cli.worktree("gate_recovered");
+    let gate = |one: &str, fifteen: &str, cores: &str| {
+        cli.run_env(
+            &wt,
+            &[
+                ("GROVE_LOAD", one),
+                ("GROVE_LOAD15", fifteen),
+                ("GROVE_CORES", cores),
+            ],
+            &["gate"],
+        )
+    };
+    let line = |a: &assert_cmd::assert::Assert| {
+        String::from_utf8_lossy(&a.get_output().stdout)
+            .trim()
+            .to_string()
+    };
+
+    let recovered = line(&gate("2.8", "68.7", "16").success());
+    assert!(
+        recovered.contains("limits 25/35, load 2.8/68.7 ok (15-min still high, machine recovered: 1-min under 16 cores)"),
+        "{recovered}"
+    );
+
+    let busy = line(&gate("20", "68.7", "16").code(3));
+    assert!(
+        busy.ends_with("load 20.0/68.7 over, holding"),
+        "1-min over the core count with a high 15-min must hold: {busy}"
+    );
+
+    let over_limit = line(&gate("30", "10", "16").code(3));
+    assert!(
+        over_limit.ends_with("load 30.0/10.0 over, holding"),
+        "1-min over the install limit must hold: {over_limit}"
+    );
+
+    let calm = line(&gate("10", "20", "4").success());
+    assert!(
+        calm.ends_with("load 10.0/20.0 ok"),
+        "an admission the 15-min figure already allows keeps the plain wording: {calm}"
+    );
+    let quiet = line(&gate("2.8", "10", "16").success());
+    assert!(
+        quiet.ends_with("load 2.8/10.0 ok"),
+        "under both limits there is nothing to explain: {quiet}"
+    );
 }
 
 #[test]

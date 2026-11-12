@@ -258,6 +258,14 @@ It exits 0 when admitted and 3 when holding. `grove up --gate` prints the same l
 and waits for admission (up to `[admission] timeout`) before installing anything,
 repeating it with `: still waiting (Ns of TIMEOUT)` every 5 seconds while it holds.
 Limits are `[admission] full_install = [25, 35]` and `link_only = [60, 60]` by default.
+Both averages must normally be under their limits, but the 15-minute average lags a
+finished spike by 10 to 20 minutes, so a 1-minute load under the core count is admitted
+(still under the 1-minute limit) even while the 15-minute figure is high:
+
+```
+load gate: full install (...), limits 25/35, load 2.8/68.7 ok (15-min still high, machine recovered: 1-min under 16 cores)
+```
+
 To apply the same cache decision without starting the stack, run `grove up --setup-only`.
 
 ## Limit concurrent startup

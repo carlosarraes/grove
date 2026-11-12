@@ -36,6 +36,9 @@ pub struct Config {
 /// Optional limits for `run --heavy` and `up --heavy`; ordinary commands do not wait.
 /// `full_install` and `link_only` are the `[1-minute, 15-minute]` load limits that
 /// `grove gate` and `up --gate` apply, chosen by whether setup would build or only link.
+/// A start is admitted when the 1-minute load is under the first limit and either the
+/// 15-minute load is under the second or the 1-minute load is under the core count (the
+/// machine has recovered; the 15-minute average only lags a finished spike).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Admission {

@@ -292,6 +292,11 @@ impl Cli {
         args: &[&str],
     ) -> assert_cmd::assert::Assert {
         let mut command = Command::cargo_bin("grove").expect("binary");
+        // `health` reads the host's memory; a loaded or swapped-out host must not decide
+        // whether these tests pass. Callers may override either.
+        command
+            .env("GROVE_MEMORY_FREE_PCT", "50")
+            .env("GROVE_SWAP_USED_PCT", "0");
         command.envs(envs.iter().copied());
         command
             .current_dir(cwd)
@@ -5118,6 +5123,34 @@ fn dead_pid() -> u32 {
     let pid = child.id();
     child.wait().expect("wait for true");
     pid
+}
+
+/// The memory check is the one `health` line that reads the host rather than grove's own
+/// state, so the critical path is pinned through the same seam the other tests use.
+#[test]
+fn health_fails_on_critical_memory_pressure() {
+    let cli = Cli::new();
+    let wt = cli.worktree("feat_search");
+    cli.run(&wt, &["up"]).success();
+
+    let failed = cli
+        .run_env(
+            &wt,
+            &[
+                ("GROVE_MEMORY_FREE_PCT", "18"),
+                ("GROVE_SWAP_USED_PCT", "95"),
+            ],
+            &["health"],
+        )
+        .failure();
+    let stdout = String::from_utf8_lossy(&failed.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("FAIL  memory 18% free, swap 95G of 100G used"),
+        "the memory line must fail: {stdout}"
+    );
+    assert!(stdout.contains("memory pressure is critical"), "{stdout}");
+
+    cli.run(&wt, &["down"]).success();
 }
 
 /// A clean machine gets a report that says so, and an exit code scripts can gate on.

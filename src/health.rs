@@ -505,8 +505,36 @@ pub struct Memory {
     pub pressure_level: Option<u32>,
 }
 
+/// Real memory pressure is not something a test can arrange, and a host that is itself out
+/// of swap would fail every `health` test. Same kind of seam as `GROVE_LOAD`: deliberately
+/// undocumented, and unset on any real machine.
+fn env_percent(name: &str) -> Option<u64> {
+    std::env::var(name).ok()?.trim().parse().ok()
+}
+
 impl Memory {
+    /// Either variable forces the reading; the one left unset defaults to a healthy value.
+    /// Swap is reported against a fixed 100 GiB so the percentage reads straight off.
+    fn from_overrides(free_percent: Option<u64>, swap_used_percent: Option<u64>) -> Option<Memory> {
+        if free_percent.is_none() && swap_used_percent.is_none() {
+            return None;
+        }
+        const GIB: u64 = 1024 * 1024 * 1024;
+        Some(Memory {
+            free_percent: free_percent.unwrap_or(50).min(100),
+            swap_used: swap_used_percent.unwrap_or(0).min(100) * GIB,
+            swap_total: 100 * GIB,
+            pressure_level: None,
+        })
+    }
+
     pub fn sample() -> Option<Memory> {
+        if let Some(forced) = Memory::from_overrides(
+            env_percent("GROVE_MEMORY_FREE_PCT"),
+            env_percent("GROVE_SWAP_USED_PCT"),
+        ) {
+            return Some(forced);
+        }
         if cfg!(target_os = "macos") {
             let pressure = Command::new("memory_pressure").output().ok()?;
             let swap = Command::new("sysctl").arg("vm.swapusage").output().ok()?;
@@ -690,6 +718,21 @@ mod tests {
     use crate::registry::{DbResource, Entry};
     use std::collections::HashSet;
     use std::path::Path;
+
+    #[test]
+    fn memory_overrides_are_absent_unless_one_is_set() {
+        assert!(super::Memory::from_overrides(None, None).is_none());
+    }
+
+    #[test]
+    fn a_forced_reading_defaults_the_other_half_to_healthy() {
+        let swapped = super::Memory::from_overrides(None, Some(95)).expect("forced");
+        assert!(swapped.exhausted());
+        let starved = super::Memory::from_overrides(Some(18), None).expect("forced");
+        assert!(!starved.exhausted() && !starved.strained());
+        let healthy = super::Memory::from_overrides(Some(50), Some(0)).expect("forced");
+        assert!(!healthy.exhausted() && !healthy.strained());
+    }
 
     fn entry_with_datastore() -> Entry {
         let mut entry: Entry = serde_json::from_value(serde_json::json!({

@@ -234,7 +234,7 @@ enum Command {
         #[arg(short, long)]
         follow: bool,
         /// Show only the last N lines
-        #[arg(short = 'n', long)]
+        #[arg(short = 'n', long, visible_alias = "tail")]
         lines: Option<usize>,
         /// Show only what this service printed since it last started
         #[arg(long)]

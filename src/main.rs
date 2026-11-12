@@ -260,6 +260,15 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Detach stale worktrees holding a branch so `git worktree add` can use it; keeps dirty, busy and locked ones
+    Free {
+        /// Branch to release, e.g. feature/x
+        #[arg(value_name = "BRANCH")]
+        branch: String,
+        /// Say what would happen, and change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Stop and forget all orphaned instances, or only the selected orphans
     Prune {
         /// Instance names as `grove ls` shows them, or recorded worktree paths
@@ -820,6 +829,9 @@ fn main() -> Result<()> {
         }) => {
             let selectors: Vec<String> = names.into_iter().chain(worktrees).collect();
             grove::clean::run(&cwd, &selectors, yes)
+        }
+        Some(Command::Free { branch, dry_run }) => {
+            std::process::exit(grove::free::run(&cwd, &branch, dry_run)?);
         }
         Some(Command::Prune {
             names,

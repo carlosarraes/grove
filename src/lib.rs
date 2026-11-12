@@ -3,6 +3,7 @@ pub mod config;
 pub mod doctor;
 pub mod exposure;
 pub mod footprint;
+pub mod free;
 pub mod health;
 pub mod instance;
 pub mod last_up;

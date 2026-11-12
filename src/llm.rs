@@ -294,6 +294,10 @@ pass `--yes` to delete. It skips primary, locked, running, open-file, dirty, and
 unpushed trees, requires an upstream and lsof, and reports unique private blocks.
 `grove prune` instead stops and forgets orphaned instances whose worktree is gone or no longer a git worktree.
 
+`grove free <branch>` detaches clean, idle, unlocked worktrees holding a branch (keeping folder and
+branch) so git can check it out elsewhere: `grove free feature/x && git worktree add ../x feature/x`.
+Prints `freed`/`kept <path>: <reason>` per worktree; exit 0 free, 1 still held, 2 usage; `--dry-run`.
+
 ## Postgres and containerised stacks
 
 Not yet supported. Repos whose ports are baked into a compose file rather than passed on

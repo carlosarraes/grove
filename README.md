@@ -179,11 +179,14 @@ repo's own fixture or settings constructor.
 | `seed [--force]` | populate the datastore; markers follow the managed container incarnation, while `--force` rebuilds dirtied data |
 | `clean [NAME...] [--worktree PATH]... [--yes] [--dry-run]` | remove idle git worktrees recorded by grove; dry-run by default, delete only with `--yes` |
 | `prune [NAME...] [--worktree PATH]... [--dry-run] [--purge]` | stop and forget all instances whose worktree is gone or no longer a git worktree, or only the selected orphaned instances by `grove ls` name or recorded path; selected prune skips the shared store sweep |
+| `free BRANCH [--dry-run]` | detach clean, idle, unlocked worktrees that hold BRANCH so `git worktree add` can use it; exits 0 when free, 1 when something still holds it, 2 on usage errors |
 | `doctor` | check everything needed to start, and say what to fix |
 
 `grove clean` removes existing grove-linked git worktrees; `grove prune` stops and forgets orphaned instances whose worktree is already gone or left behind as a non-git husk. Clean is machine-wide and defaults to a dry run (`--dry-run` is explicit); pass `--yes` to remove eligible trees without forcing git or dropping databases. Names and repeatable `--worktree PATH` select registry entries; unknown selectors reclaim nothing. Unregistered worktrees are never touched.
 
 Clean reports each tree and skips primary checkouts, held instance locks, running `grove up` runs or stacks, open files, uncommitted changes, branches without upstreams, and unpushed commits. It requires `lsof` and refuses deletion when it is missing. Sizes count unique `nlink == 1` allocated blocks across the whole checkout using the same private-block method as `--footprint`, excluding virtualenv directories containing `pyvenv.cfg` and never following symlinks. These are reclaimable bytes, not `du` totals that include shared hardlinks. With `--yes`, safety checks run again before removal; a git removal failure stops further removals.
+
+`grove free` is the safe step before launching a lane on a branch git says is "already checked out at <path>": `grove free feature/x && git worktree add ../x feature/x`. It runs `git switch --detach` in each other worktree holding the branch, keeping the folder, the commits and the branch. It prints `freed <path>`, or `kept <path>: <reason>` (`dirty`, `in use by pid N`, `locked`, plus `main checkout` and `current worktree`, which it never touches), and `would free <path>` under `--dry-run`. Untracked files count as dirty, and a process counts as using a worktree when its cwd is inside it (`/proc` on Linux, `lsof` on macOS).
 
 ### Idle instances
 

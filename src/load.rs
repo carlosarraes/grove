@@ -271,11 +271,16 @@ fn wait_with_samples_cancellable(
             );
             heartbeat = elapsed + crate::timing::heartbeat_interval();
         }
-        std::thread::sleep(
-            Duration::from_secs(2)
+        let wake = Instant::now()
+            + Duration::from_secs(2)
                 .min(timeout - elapsed)
-                .min(heartbeat - elapsed),
-        );
+                .min(heartbeat - elapsed);
+        while Instant::now() < wake {
+            cancelled();
+            std::thread::sleep(
+                Duration::from_millis(20).min(wake.saturating_duration_since(Instant::now())),
+            );
+        }
     }
 }
 

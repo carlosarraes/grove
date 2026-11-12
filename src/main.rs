@@ -732,11 +732,13 @@ fn main() -> Result<()> {
                 instance.touch()?;
             }
             signals.check_waiting();
-            let mut child = std::process::Command::new(&argv[0])
+            let mut command = std::process::Command::new(&argv[0]);
+            command
                 .args(&argv[1..])
                 .current_dir(&cwd)
-                .envs(instance.environment()?)
-                .spawn()
+                .envs(instance.environment()?);
+            let mut child = signals
+                .spawn(&mut command)
                 .with_context(|| format!("running `{}`", argv.join(" ")))?;
             let status = signals.wait(&mut child)?;
 
@@ -752,7 +754,9 @@ fn main() -> Result<()> {
                     );
                 }
             }
-            std::process::exit(status.code().unwrap_or(1));
+            std::process::exit(status.code().unwrap_or_else(|| {
+                128 + std::os::unix::process::ExitStatusExt::signal(&status).unwrap_or(1)
+            }));
         }
         Some(Command::Logs {
             service,

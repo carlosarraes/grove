@@ -7025,6 +7025,7 @@ while True:
 "#,
                     ])
                     .process_group(0)
+                    .stdin(std::process::Stdio::null())
                     .stderr(log)
                     .spawn()
                     .unwrap();
@@ -8106,7 +8107,7 @@ fn a_real_resource_init_error_fails_without_waiting() {
     let output = rig.cli.run(&wt, &["up"]).failure().get_output().clone();
 
     assert!(String::from_utf8_lossy(&output.stderr).contains("initialization deliberately failed"));
-    assert!(began.elapsed() < std::time::Duration::from_secs(10));
+    assert!(began.elapsed() < std::time::Duration::from_secs(4));
     assert_eq!(
         std::fs::read_to_string(rig.cli.state.path().join("init-attempts"))
             .unwrap()
@@ -9290,12 +9291,15 @@ fn run_bounds_wait_for_a_child_ignoring_term() {
             "python3",
             "-c",
             r#"
-import os, pathlib, signal, time
+import os, pathlib, signal, subprocess, time
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
+descendant = subprocess.Popen(["sleep", "60"])
+pathlib.Path("descendant").write_text(str(descendant.pid))
 pathlib.Path("ready").write_text(str(os.getpid()))
 time.sleep(60)
 "#,
         ])
+        .stdin(std::process::Stdio::null())
         .stderr(log)
         .spawn()
         .unwrap();
@@ -9316,23 +9320,191 @@ time.sleep(60)
         if let Some(status) = child.try_wait().unwrap() {
             break Some(status);
         }
-        if sent.elapsed().as_secs() >= 14 {
+        if sent.elapsed().as_secs() >= 6 {
             break None;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
-    unsafe {
-        libc::kill(pid, libc::SIGKILL);
+    let descendant: i32 = std::fs::read_to_string(wt.join("descendant"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let descendant_survived = process_is_running(descendant);
+    if descendant_survived {
+        unsafe {
+            libc::kill(descendant, libc::SIGKILL);
+        }
     }
+    assert!(
+        !descendant_survived,
+        "TERM-ignoring descendant survived grove"
+    );
+    let survived = unsafe { libc::kill(pid, 0) == 0 };
+    if survived {
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+    assert!(!survived, "TERM-ignoring child survived grove");
     if status.is_none() {
         child.kill().unwrap();
         child.wait().unwrap();
     }
     assert_eq!(status.unwrap().code(), Some(143));
-    assert!(sent.elapsed() >= std::time::Duration::from_secs(10));
+    assert!(sent.elapsed() >= std::time::Duration::from_secs(4));
+    assert!(sent.elapsed() < std::time::Duration::from_secs(5));
     let stderr = std::fs::read_to_string(wt.join("stderr")).unwrap();
     assert!(
-        stderr.contains("forwarded to child (exit timeout)"),
+        stderr.contains("forwarded to child (exit killed after 4s)"),
         "{stderr}"
+    );
+}
+
+#[test]
+fn run_cancels_shell_and_sleep_on_pid_only_term_and_hup() {
+    for signal in [libc::SIGTERM, libc::SIGHUP] {
+        let cli = Cli::new();
+        let wt = cli.worktree("shell_signal");
+        let log = std::fs::File::create(wt.join("stderr")).unwrap();
+        let mut grove = std::process::Command::new(assert_cmd::cargo::cargo_bin!("grove"))
+            .current_dir(&wt)
+            .env("GROVE_STATE_DIR", cli.state.path())
+            .env("GROVE_PORT_RANGE", cli.port_range())
+            .env("GROVE_LOAD", "0")
+            .args(["run", "--heavy", "--", "sh", "-c",
+                "trap 'echo child-got-term >&2; exit 143' TERM HUP; echo $$ > shell-pid; sh -c 'echo $$ > sleep-pid; touch ready; exec sleep 60'"])
+            .stdin(std::process::Stdio::null())
+            .stderr(log).spawn().unwrap();
+        let began = std::time::Instant::now();
+        while !wt.join("ready").exists() {
+            assert!(began.elapsed().as_secs() < 15);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let shell: i32 = std::fs::read_to_string(wt.join("shell-pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let sleep: i32 = std::fs::read_to_string(wt.join("sleep-pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        unsafe {
+            libc::kill(grove.id() as i32, signal);
+        }
+        let sent = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = grove.try_wait().unwrap() {
+                break status;
+            }
+            if sent.elapsed().as_secs() >= 6 {
+                unsafe {
+                    libc::kill(shell, libc::SIGKILL);
+                    libc::kill(sleep, libc::SIGKILL);
+                }
+                grove.kill().unwrap();
+                grove.wait().unwrap();
+                panic!("grove exceeded cancellation deadline");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let stderr = std::fs::read_to_string(wt.join("stderr")).unwrap();
+        let shell_alive = process_is_running(shell);
+        let sleep_alive = process_is_running(sleep);
+        if shell_alive || sleep_alive {
+            unsafe {
+                libc::kill(shell, libc::SIGKILL);
+                libc::kill(sleep, libc::SIGKILL);
+            }
+        }
+        assert!(
+            !shell_alive && !sleep_alive,
+            "shell/sleep survived grove: {stderr}"
+        );
+        assert_eq!(status.code(), Some(128 + signal), "{stderr}");
+        assert!(stderr.contains("child-got-term"), "{stderr}");
+    }
+}
+
+fn process_is_running(pid: i32) -> bool {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    output.status.success() && !output.stdout.is_empty() && !output.stdout.starts_with(b"Z")
+}
+
+#[test]
+fn run_keeps_terminal_input_ctrl_c_and_restores_foreground_group() {
+    let cli = Cli::new();
+    let wt = cli.worktree("terminal");
+    let output = std::process::Command::new("python3")
+        .current_dir(&wt)
+        .env("GROVE_STATE_DIR", cli.state.path())
+        .env("GROVE_PORT_RANGE", cli.port_range())
+        .args([
+            "-c",
+            r#"
+import os, pty, select, signal, subprocess, sys, time
+pid, fd = pty.fork()
+if pid == 0:
+    payload = """
+import os, signal, sys, time
+assert os.tcgetpgrp(0) == os.getpgrp()
+signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
+print("tty-ready", flush=True)
+assert input() == "hello"
+print("input-received", flush=True)
+while True: time.sleep(0.05)
+"""
+    result = subprocess.run([sys.argv[1], "run", "--", "python3", "-c", payload])
+    assert result.returncode == 130, result.returncode
+    assert os.tcgetpgrp(0) == os.getpgrp(), "terminal not restored"
+    print("terminal-restored", flush=True)
+    os._exit(0)
+data = b""
+typed = interrupted = False
+deadline = time.monotonic() + 15
+try:
+    while time.monotonic() < deadline:
+        if select.select([fd], [], [], 0.1)[0]:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break
+            if not chunk: break
+            data += chunk
+        if b"tty-ready" in data and not typed:
+            os.write(fd, b"hello\n")
+            typed = True
+        if b"input-received" in data and not interrupted:
+            os.write(fd, b"\x03")
+            interrupted = True
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            assert os.waitstatus_to_exitcode(status) == 0, data
+            pid = 0
+            break
+    assert b"terminal-restored" in data, data
+finally:
+    if pid:
+        try:
+            done, status = os.waitpid(pid, os.WNOHANG)
+            if not done:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+    os.close(fd)
+"#,
+            assert_cmd::cargo::cargo_bin!("grove").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }

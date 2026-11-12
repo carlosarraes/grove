@@ -217,7 +217,7 @@ Do not write a separate `.grove.toml` to install dependencies. Use `grove up --s
 
 `grove run --heavy -- <command>` waits until the one-minute load is below the available
 core count. Plain `grove run` does not wait. This flag does not start services or MongoDB.
-Both forms forward TERM/INT/HUP to the child, allow up to 10s for its final output, and report cancellation; cancellation during admission reports that nothing started.
+Both forms forward TERM/INT/HUP to the child process group, allow up to 4s for final output before killing the group, and report cancellation; cancellation during admission reports that nothing started.
 The child receives the normal instance environment and keeps its exit code.
 
 The optional root-level config section sets the threshold and admission timeout:

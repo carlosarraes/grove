@@ -245,7 +245,7 @@ enum Command {
         #[arg(value_name = "SERVICE")]
         services: Vec<String>,
     },
-    /// Remove idle grove-linked git worktrees (dry-run by default); prune forgets orphaned instances
+    /// Remove idle worktrees with pushed commits or merged/closed PRs (dry-run by default); prune forgets orphaned instances
     Clean {
         /// Instance names as `grove ls` shows them, or recorded worktree paths
         #[arg(value_name = "NAME")]
@@ -253,8 +253,11 @@ enum Command {
         /// Select by recorded worktree path (repeatable)
         #[arg(long = "worktree", value_name = "PATH", action = clap::ArgAction::Append)]
         worktrees: Vec<String>,
+        /// Include all worktrees of this repository (repeatable)
+        #[arg(long = "repo", value_name = "PATH")]
+        repos: Vec<PathBuf>,
         /// Delete eligible worktrees; without this flag clean is a dry run
-        #[arg(long, conflicts_with = "dry_run")]
+        #[arg(long, visible_alias = "apply", conflicts_with = "dry_run")]
         yes: bool,
         /// Explicit dry run (the default); change nothing
         #[arg(long)]
@@ -855,11 +858,12 @@ fn main() -> Result<()> {
         Some(Command::Clean {
             names,
             worktrees,
+            repos,
             yes,
             dry_run: _,
         }) => {
             let selectors: Vec<String> = names.into_iter().chain(worktrees).collect();
-            grove::clean::run(&cwd, &selectors, yes)
+            grove::clean::run(&cwd, &selectors, &repos, yes)
         }
         Some(Command::Free { branch, dry_run }) => {
             std::process::exit(grove::free::run(&cwd, &branch, dry_run)?);

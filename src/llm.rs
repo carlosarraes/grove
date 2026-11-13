@@ -296,9 +296,13 @@ isolated session if needed.
 
 ## Worktree cleanup
 
-`grove clean` removes idle grove-linked git worktrees, with dry-run as the default;
-pass `--yes` to delete. It skips primary, locked, running, open-file, dirty, and
-unpushed trees, requires an upstream and lsof, and reports unique private blocks.
+`grove clean` discovers worktrees in registered repositories and repeatable `--repo PATH`
+repositories. Dry run is default; `--yes` / `--apply` deletes. It skips primary,
+locked, ferry-owned, running, open-file and dirty trees. Eligibility requires no
+commits ahead of upstream, or no open PR plus a merged/closed GitHub PR and proof
+HEAD reached GitHub. Detached HEAD uses branches containing HEAD. PR lookup fails
+closed. Linux scans /proc once; macOS needs lsof. Apply rechecks usage and status.
+It reports unique private blocks and releases registered instances after removal.
 `grove prune` instead stops and forgets orphaned instances whose worktree is gone or no longer a git worktree.
 
 `grove free <branch>` detaches clean, idle, unlocked worktrees holding a branch (keeping folder and

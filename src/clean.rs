@@ -1,17 +1,17 @@
 //! Remove idle, grove-linked git worktrees, with a read-only default.
 
 use anyhow::{Context, Result, bail};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::ErrorKind;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use crate::footprint::{human_size, unique_reclaimable};
-use crate::registry::{Entry, Registry};
+use crate::registry::Registry;
 use crate::{instance, last_up, resolve, supervise};
 
-pub fn run(cwd: &Path, selectors: &[String], yes: bool) -> Result<()> {
+pub fn run(cwd: &Path, selectors: &[String], repos: &[PathBuf], yes: bool) -> Result<()> {
     let registry = instance::registry()?;
     let entries = registry.list()?;
     let mut chosen = BTreeMap::new();
@@ -41,13 +41,121 @@ pub fn run(cwd: &Path, selectors: &[String], yes: bool) -> Result<()> {
         }
     }
 
+    let mut roots = BTreeSet::new();
+    let mut common_roots: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for path in chosen.keys().chain(repos.iter()) {
+        let common = git(
+            path,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?;
+        if !common.status.success() {
+            if repos.contains(path) {
+                bail!("not a git repository: {}", path.display());
+            }
+            continue;
+        }
+        let common = String::from_utf8(common.stdout)?.trim().to_owned();
+        if let Some(root) = common_roots.get(&common) {
+            roots.insert(root.clone());
+        } else {
+            let root = resolve::resolve(path)?.main_worktree;
+            roots.insert(root.clone());
+            common_roots.insert(common, root);
+        }
+    }
+    let mut candidates = BTreeMap::new();
+    let mut states = BTreeMap::new();
+    let mut pr_cache = BTreeMap::new();
+    for root in &roots {
+        let listing = git(root, &["worktree", "list", "--porcelain"])?;
+        if !listing.status.success() {
+            bail!("cannot list worktrees in {}", root.display());
+        }
+        for tree in crate::free::parse_porcelain(&String::from_utf8_lossy(&listing.stdout)) {
+            if selectors.is_empty()
+                || chosen.contains_key(&tree.path)
+                || repos
+                    .iter()
+                    .any(|p| resolve::resolve(p).is_ok_and(|r| r.main_worktree == *root))
+            {
+                candidates.insert(tree.path.clone(), (root.clone(), tree.locked));
+            }
+        }
+        states.insert(
+            root.clone(),
+            lookup_prs(root, |repo| {
+                pr_cache
+                    .entry(repo.to_owned())
+                    .or_insert_with(|| github_prs(repo).map_err(|e| e.to_string()))
+                    .clone()
+                    .map_err(anyhow::Error::msg)
+            })
+            .map_err(|e| e.to_string()),
+        );
+    }
+    let processes = process_paths()?;
+    let items: Vec<_> = candidates.iter().collect();
+    let queue = std::sync::Mutex::new(items.iter());
+    let inspections = std::thread::scope(
+        |scope| -> Result<BTreeMap<PathBuf, (Option<String>, u64)>> {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let queue = &queue;
+                    let registry = &registry;
+                    let processes = &processes;
+                    let states = &states;
+                    scope.spawn(move || -> Result<Vec<_>> {
+                        std::iter::from_fn(|| queue.lock().unwrap().next())
+                            .map(|(path, (root, locked))| {
+                                let (reason, _) = inspect(
+                                    path,
+                                    root,
+                                    *locked,
+                                    registry,
+                                    false,
+                                    processes,
+                                    &states[root],
+                                )?;
+                                let bytes = if reason.is_none() {
+                                    unique_reclaimable(path)
+                                } else {
+                                    0
+                                };
+                                Ok(((*path).clone(), (reason, bytes)))
+                            })
+                            .collect()
+                    })
+                })
+                .collect();
+            let mut results = BTreeMap::new();
+            for handle in handles {
+                results.extend(
+                    handle
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("worktree inspection panicked"))??,
+                );
+            }
+            Ok(results)
+        },
+    )?;
+    let mut pruned = BTreeSet::new();
     let (mut removable, mut skipped, mut removed, mut total) = (0, 0, 0, 0u64);
-    for (path, entry) in chosen {
-        let (mut reason, mut lock) = inspect(&entry, &registry, false)?;
-        let bytes = unique_reclaimable(&path);
+    for (path, (root, locked)) in candidates {
+        let entry = chosen.get(&path);
+        let prs = &states[&root];
+        let (mut reason, bytes) = inspections[&path].clone();
+        let mut lock = None;
         let size = human_size(bytes);
         if yes && reason.is_none() {
-            (reason, lock) = inspect(&entry, &registry, true)?;
+            (reason, lock) = inspect(
+                &path,
+                &root,
+                locked,
+                &registry,
+                true,
+                &process_paths()?,
+                prs,
+            )?;
         }
         if let Some(reason) = reason {
             println!("skip {} {size}  {reason}", path.display());
@@ -56,9 +164,8 @@ pub fn run(cwd: &Path, selectors: &[String], yes: bool) -> Result<()> {
         }
         removable += 1;
         if yes {
-            let resolved = resolve::resolve(&path)?;
             let output = Command::new("git")
-                .current_dir(&resolved.main_worktree)
+                .current_dir(&root)
                 .args(["worktree", "remove"])
                 .arg(&path)
                 .output()
@@ -78,7 +185,10 @@ pub fn run(cwd: &Path, selectors: &[String], yes: bool) -> Result<()> {
             } else {
                 bytes
             };
-            registry.release(&path)?;
+            pruned.insert(root);
+            if entry.is_some() {
+                registry.release(&path)?;
+            }
             removed += 1;
             total += freed;
             println!(
@@ -91,6 +201,12 @@ pub fn run(cwd: &Path, selectors: &[String], yes: bool) -> Result<()> {
             println!("ok   {} {size}  would free {size}", path.display());
         }
         drop(lock);
+    }
+    for repo in pruned {
+        let result = git(&repo, &["worktree", "prune"])?;
+        if !result.status.success() {
+            bail!("git worktree prune failed in {}", repo.display());
+        }
     }
     footer(removable, skipped, removed, total, yes);
     Ok(())
@@ -114,17 +230,48 @@ fn git(path: &Path, args: &[&str]) -> Result<Output> {
         .with_context(|| format!("git {} in {}", args.join(" "), path.display()))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inspect(
-    entry: &Entry,
+    path: &Path,
+    root: &Path,
+    locked: bool,
     registry: &Registry,
     retain_lock: bool,
+    processes: &[(u32, PathBuf)],
+    prs: &std::result::Result<Vec<Pr>, String>,
 ) -> Result<(Option<String>, Option<File>)> {
-    let path = &entry.worktree;
-    let resolved = resolve::resolve(path)?;
     let skip = |reason: &str| Ok((Some(reason.to_owned()), None));
-    if resolved.is_main() {
+    if path == root {
         return skip("primary worktree");
     }
+    if locked || (retain_lock && worktree_locked(root, path)?) {
+        return skip("locked worktree");
+    }
+    if std::env::var_os("HOME").is_some_and(|home| {
+        path.starts_with(PathBuf::from(home).join(".local/state/ferry/worktrees"))
+    }) {
+        return skip("ferry worktree");
+    }
+    if !resolve::is_worktree(path) {
+        return skip("worktree unavailable");
+    }
+    let resolved = resolve::Resolved {
+        worktree: path.to_owned(),
+        main_worktree: root.to_owned(),
+        slug: path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect(),
+    };
     let directory = instance::state_dir()?
         .join(resolved.state_key())
         .join(&resolved.slug);
@@ -144,42 +291,14 @@ fn inspect(
     if last_up::read(&directory).is_some_and(|last| last.running()) {
         return skip("grove up is running");
     }
-    let fresh = registry
+    if registry
         .get(path)?
-        .context("instance disappeared from registry")?;
-    if fresh.services.values().any(supervise::is_alive) {
+        .is_some_and(|fresh| fresh.services.values().any(supervise::is_alive))
+    {
         return skip("running stack");
     }
-    let output = match Command::new("lsof").args(["-t", "+D"]).arg(path).output() {
-        Ok(output) => output,
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            return skip("lsof not found; refusing to delete");
-        }
-        Err(error) => return Err(error.into()),
-    };
-    let pids: Vec<u32> = String::from_utf8_lossy(&output.stdout)
-        .split_whitespace()
-        .map(str::parse::<u32>)
-        .collect::<std::result::Result<_, _>>()?;
-    let pids: Vec<_> = pids
-        .into_iter()
-        .filter(|pid| *pid != std::process::id())
-        .collect();
-    if !pids.is_empty() {
-        return skip(&format!(
-            "open files (pid {})",
-            pids.iter()
-                .map(u32::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-    if !output.status.success() && !(output.status.code() == Some(1) && output.stdout.is_empty()) {
-        bail!(
-            "lsof failed for {}: {}",
-            path.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+    if let Some(pid) = crate::free::holder(processes, path) {
+        return skip(&format!("open files (pid {pid})"));
     }
     let status = git(path, &["status", "--porcelain"])?;
     if !status.status.success() {
@@ -188,22 +307,301 @@ fn inspect(
     if !status.stdout.is_empty() {
         return skip("uncommitted changes");
     }
-    if !git(path, &["rev-parse", "--abbrev-ref", "@{upstream}"])?
+    let upstream = git(path, &["rev-parse", "--abbrev-ref", "@{upstream}"])?
         .status
-        .success()
-    {
-        return skip("no upstream");
+        .success();
+    if upstream {
+        let ahead = git(path, &["rev-list", "--count", "@{upstream}..HEAD"])?;
+        if !ahead.status.success() {
+            return skip("cannot read upstream");
+        }
+        if String::from_utf8_lossy(&ahead.stdout).trim() == "0" {
+            return Ok((None, lock));
+        }
     }
-    let ahead = git(path, &["rev-list", "--count", "@{upstream}..HEAD"])?;
-    if !ahead.status.success() {
-        bail!("git rev-list failed for {}", path.display());
+    match pr_eligibility(path, prs) {
+        Ok(()) => Ok((None, lock)),
+        Err(reason) => skip(&format!(
+            "{}; {reason}",
+            if upstream {
+                "unpushed commits"
+            } else {
+                "no upstream"
+            }
+        )),
     }
-    if String::from_utf8_lossy(&ahead.stdout)
+}
+
+fn worktree_locked(root: &Path, path: &Path) -> Result<bool> {
+    let out = git(root, &["worktree", "list", "--porcelain"])?;
+    if !out.status.success() {
+        bail!("cannot check worktree lock");
+    }
+    Ok(
+        crate::free::parse_porcelain(&String::from_utf8_lossy(&out.stdout))
+            .iter()
+            .any(|t| t.path == path && t.locked),
+    )
+}
+
+#[derive(Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Pr {
+    number: u64,
+    state: String,
+    head_ref_name: String,
+    head_ref_oid: String,
+}
+
+fn github_repo(url: &str) -> Option<String> {
+    let name = url
         .trim()
-        .parse::<u64>()?
-        > 0
-    {
-        return skip("unpushed commits");
+        .strip_prefix("git@github.com:")
+        .or_else(|| url.trim().strip_prefix("https://github.com/"))
+        .or_else(|| url.trim().strip_prefix("ssh://git@github.com/"))?;
+    let name = name.trim_end_matches('/').trim_end_matches(".git");
+    let parts: Vec<_> = name.split('/').collect();
+    (parts.len() == 2
+        && parts.iter().all(|p| {
+            !p.is_empty()
+                && p.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+        }))
+    .then(|| name.to_owned())
+}
+
+fn lookup_prs(root: &Path, lookup: impl FnOnce(&str) -> Result<Vec<Pr>>) -> Result<Vec<Pr>> {
+    let remote = git(root, &["remote", "get-url", "origin"])?;
+    let repo =
+        github_repo(&String::from_utf8_lossy(&remote.stdout)).context("origin is not on GitHub")?;
+    lookup(&repo)
+}
+
+fn github_prs(repo: &str) -> Result<Vec<Pr>> {
+    let out = Command::new("gh")
+        .args([
+            "pr",
+            "list",
+            "-R",
+            repo,
+            "--state",
+            "all",
+            "--limit",
+            "4000",
+            "--json",
+            "number,state,headRefName,headRefOid",
+        ])
+        .output()
+        .context("gh unavailable")?;
+    if !out.status.success() {
+        bail!("gh failed: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
-    Ok((None, lock))
+    let prs: Vec<Pr> = serde_json::from_slice(&out.stdout)?;
+    Ok(prs)
+}
+
+fn pr_eligibility(
+    path: &Path,
+    prs: &std::result::Result<Vec<Pr>, String>,
+) -> std::result::Result<(), String> {
+    let check = || -> Result<()> {
+        let prs = prs
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!("pr state unknown ({e})"))?;
+        let branch = git(path, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+        let branches = if branch.status.success() {
+            branch
+        } else {
+            git(
+                path,
+                &["branch", "--contains", "HEAD", "--format=%(refname:short)"],
+            )?
+        };
+        if !branches.status.success() {
+            bail!("cannot read branches");
+        }
+        let names = String::from_utf8_lossy(&branches.stdout);
+        let matching: Vec<_> = prs
+            .iter()
+            .filter(|pr| names.lines().any(|name| name == pr.head_ref_name))
+            .collect();
+        if let Some(pr) = matching.iter().find(|pr| pr.state == "OPEN") {
+            bail!("pr #{} open", pr.number);
+        }
+        let closed: Vec<_> = matching
+            .iter()
+            .filter(|pr| pr.state == "MERGED" || pr.state == "CLOSED")
+            .collect();
+        if closed.is_empty() {
+            bail!("no merged/closed PR");
+        }
+        let reachable = git(path, &["rev-list", "-n1", "HEAD", "--not", "--remotes"])?;
+        if reachable.status.success() && reachable.stdout.is_empty() {
+            return Ok(());
+        }
+        for pr in closed {
+            if git(
+                path,
+                &["merge-base", "--is-ancestor", "HEAD", &pr.head_ref_oid],
+            )?
+            .status
+            .success()
+            {
+                return Ok(());
+            }
+        }
+        bail!("unpushed commits")
+    };
+    check().map_err(|e| e.to_string())
+}
+
+fn process_paths() -> Result<Vec<(u32, PathBuf)>> {
+    if !cfg!(target_os = "linux") {
+        return crate::free::process_cwds();
+    }
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir("/proc")?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == std::process::id() {
+            continue;
+        }
+        if let Ok(path) = std::fs::read_link(entry.path().join("cwd")) {
+            paths.push((pid, path));
+        }
+        if let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) {
+            for fd in fds.flatten() {
+                if let Ok(path) = std::fs::read_link(fd.path()) {
+                    paths.push((pid, path));
+                }
+            }
+        }
+    }
+    Ok(paths)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn github_remotes_are_strict() {
+        assert_eq!(
+            github_repo("git@github.com:acme/repo.git"),
+            Some("acme/repo".into())
+        );
+        assert_eq!(
+            github_repo("https://github.com/acme/repo.git"),
+            Some("acme/repo".into())
+        );
+        assert_eq!(github_repo("https://example.com/acme/repo"), None);
+    }
+}
+
+#[cfg(test)]
+mod pr_tests {
+    use super::*;
+
+    fn command(path: &Path, args: &[&str]) -> String {
+        let out = git(path, args).unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    #[test]
+    fn pr_evidence_covers_pushed_unpushed_detached_and_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        command(repo, &["init", "-b", "topic"]);
+        command(repo, &["config", "user.email", "test@example.com"]);
+        command(repo, &["config", "user.name", "Test"]);
+        command(repo, &["commit", "--allow-empty", "-m", "base"]);
+        let head = command(repo, &["rev-parse", "HEAD"]);
+        let remote = repo.join("remote.git");
+        command(repo, &["init", "--bare", remote.to_str().unwrap()]);
+        command(repo, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        command(repo, &["push", "origin", "topic"]);
+        let prs = |state: &str, oid: &str| -> std::result::Result<Vec<Pr>, String> {
+            Ok(serde_json::from_value(serde_json::json!([{"number":42,"state":state,"headRefName":"topic","headRefOid":oid}])).unwrap())
+        };
+        assert!(pr_eligibility(repo, &prs("CLOSED", &head)).is_ok());
+        assert!(
+            pr_eligibility(
+                repo,
+                &prs("CLOSED", "0000000000000000000000000000000000000000")
+            )
+            .is_ok()
+        );
+        assert!(pr_eligibility(repo, &Ok(Vec::new())).is_err());
+        assert!(pr_eligibility(repo, &prs("MERGED", &head)).is_ok());
+        assert!(
+            pr_eligibility(repo, &prs("OPEN", &head))
+                .unwrap_err()
+                .contains("pr #42 open")
+        );
+        command(repo, &["commit", "--allow-empty", "-m", "local"]);
+        assert!(pr_eligibility(repo, &prs("CLOSED", &head)).is_err());
+        let local = command(repo, &["rev-parse", "HEAD"]);
+        assert!(pr_eligibility(repo, &prs("CLOSED", &local)).is_ok());
+        command(repo, &["commit", "--allow-empty", "-m", "PR descendant"]);
+        let descendant = command(repo, &["rev-parse", "HEAD"]);
+        command(repo, &["checkout", "--detach", &local]);
+        assert!(pr_eligibility(repo, &prs("CLOSED", &descendant)).is_ok());
+        command(repo, &["branch", "second", &local]);
+        let mut mixed = prs("CLOSED", &descendant).unwrap();
+        mixed.push(Pr {
+            number: 43,
+            state: "OPEN".into(),
+            head_ref_name: "second".into(),
+            head_ref_oid: local.clone(),
+        });
+        assert!(
+            pr_eligibility(repo, &Ok(mixed))
+                .unwrap_err()
+                .contains("pr #43 open")
+        );
+        assert!(pr_eligibility(repo, &prs("CLOSED", &local)).is_ok());
+        assert!(pr_eligibility(repo, &prs("OPEN", &local)).is_err());
+        let error = pr_eligibility(repo, &Err("gh authentication failed".into())).unwrap_err();
+        assert!(error.contains("pr state unknown (gh authentication failed)"));
+        command(
+            repo,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "git@github.com:acme/repo.git",
+            ],
+        );
+        assert!(lookup_prs(repo, |_| anyhow::bail!("gh failed")).is_err());
+        assert_eq!(
+            lookup_prs(repo, |_| prs("CLOSED", &local).map_err(anyhow::Error::msg))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn process_cwd_blocks_a_worktree() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .current_dir(temp.path())
+            .spawn()
+            .unwrap();
+        let paths = process_paths().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(crate::free::holder(&paths, temp.path()), Some(child.id()));
+    }
 }

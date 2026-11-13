@@ -9174,6 +9174,7 @@ fn clean_freed_bytes_exclude_hardlinks() {
 }
 
 #[test]
+#[cfg(not(target_os = "linux"))]
 fn clean_refuses_when_lsof_is_missing() {
     let cli = Cli::new();
     let wt = clean_linked(&cli, "missing_lsof", true);
@@ -9612,4 +9613,58 @@ cache = { path = "node_modules", key = ["package-lock.json"] }
         let entry = registry_of(&cli).get(&wt).unwrap().unwrap();
         assert_ne!(entry.cache_keys["root"], entry.cache_keys["frontend"]);
     }
+}
+
+#[test]
+fn clean_repo_discovers_unregistered_and_protects_git_locks() {
+    let cli = Cli::new();
+    let wt = cli.fx.add_worktree("unregistered_clean");
+    common::git(&wt, &["branch", "--set-upstream-to=main"]);
+    common::git(&cli.fx.main, &["worktree", "lock", wt.to_str().unwrap()]);
+    cli.run(
+        &cli.fx.main,
+        &["clean", "--repo", cli.fx.main.to_str().unwrap(), "--apply"],
+    )
+    .success()
+    .stdout(predicates::str::contains("locked worktree"));
+    assert!(wt.exists());
+    common::git(&cli.fx.main, &["worktree", "unlock", wt.to_str().unwrap()]);
+    std::fs::write(wt.join("README.md"), "dirty").unwrap();
+    cli.run(
+        &cli.fx.main,
+        &["clean", "--repo", cli.fx.main.to_str().unwrap(), "--apply"],
+    )
+    .success()
+    .stdout(predicates::str::contains("uncommitted changes"));
+    assert!(wt.exists());
+    common::git(&wt, &["checkout", "--", "README.md"]);
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .current_dir(&wt)
+        .spawn()
+        .unwrap();
+    let result = cli.run(
+        &cli.fx.main,
+        &["clean", "--repo", cli.fx.main.to_str().unwrap(), "--apply"],
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+    result
+        .success()
+        .stdout(predicates::str::contains("open files (pid"));
+    assert!(wt.exists());
+    cli.run(
+        &cli.fx.main,
+        &["clean", "--repo", cli.fx.main.to_str().unwrap()],
+    )
+    .success()
+    .stdout(predicates::str::contains("would free"));
+    assert!(wt.exists());
+    cli.run(
+        &cli.fx.main,
+        &["clean", "--repo", cli.fx.main.to_str().unwrap(), "--apply"],
+    )
+    .success()
+    .stdout(predicates::str::contains("removed, freed"));
+    assert!(!wt.exists());
 }

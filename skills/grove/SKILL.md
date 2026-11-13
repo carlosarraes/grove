@@ -324,3 +324,10 @@ use `cache = { path = "node_modules", key = ["pnpm-lock.yaml", "pnpm-workspace.y
 and omit the workspace key when absent. A frontend install does not cover root
 hook tools such as lefthook. `grove doctor` warns about uncovered lockfile projects
 and prints a setup snippet; `grove up` also warns without failing.
+
+`grove clean` defaults to dry run and discovers worktrees in registered repositories;
+repeat `--repo PATH` to include others. `--yes` / `--apply` removes idle, clean,
+unlocked trees whose commits are covered by their upstream or by a merged/closed
+GitHub PR with no open PR and proof HEAD reached GitHub. Detached HEAD uses local
+branches containing HEAD. PR lookup fails closed. Primary and ferry worktrees are
+protected. Linux uses /proc; macOS requires lsof. Apply rechecks usage and status.

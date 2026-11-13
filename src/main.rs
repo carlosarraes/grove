@@ -256,6 +256,9 @@ enum Command {
         /// Include all worktrees of this repository (repeatable)
         #[arg(long = "repo", value_name = "PATH")]
         repos: Vec<PathBuf>,
+        /// Minimum idle age (ms/s/m/h/d or seconds); 0 disables the age guard
+        #[arg(long, default_value = "24h")]
+        min_age: String,
         /// Delete eligible worktrees; without this flag clean is a dry run
         #[arg(long, visible_alias = "apply", conflicts_with = "dry_run")]
         yes: bool,
@@ -859,11 +862,12 @@ fn main() -> Result<()> {
             names,
             worktrees,
             repos,
+            min_age,
             yes,
             dry_run: _,
         }) => {
             let selectors: Vec<String> = names.into_iter().chain(worktrees).collect();
-            grove::clean::run(&cwd, &selectors, &repos, yes)
+            grove::clean::run(&cwd, &selectors, &repos, yes, &min_age)
         }
         Some(Command::Free { branch, dry_run }) => {
             std::process::exit(grove::free::run(&cwd, &branch, dry_run)?);

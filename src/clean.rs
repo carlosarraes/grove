@@ -6,12 +6,20 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::footprint::{human_size, unique_reclaimable};
 use crate::registry::Registry;
 use crate::{instance, last_up, resolve, supervise};
 
-pub fn run(cwd: &Path, selectors: &[String], repos: &[PathBuf], yes: bool) -> Result<()> {
+pub fn run(
+    cwd: &Path,
+    selectors: &[String],
+    repos: &[PathBuf],
+    yes: bool,
+    min_age: &str,
+) -> Result<()> {
+    let min_age = (min_age, instance::parse_duration(min_age)?);
     let registry = instance::registry()?;
     let entries = registry.list()?;
     let mut chosen = BTreeMap::new();
@@ -115,6 +123,7 @@ pub fn run(cwd: &Path, selectors: &[String], repos: &[PathBuf], yes: bool) -> Re
                                     false,
                                     processes,
                                     &states[root],
+                                    min_age,
                                 )?;
                                 let bytes = if reason.is_none() {
                                     unique_reclaimable(path)
@@ -155,6 +164,7 @@ pub fn run(cwd: &Path, selectors: &[String], repos: &[PathBuf], yes: bool) -> Re
                 true,
                 &process_paths()?,
                 prs,
+                min_age,
             )?;
         }
         if let Some(reason) = reason {
@@ -239,6 +249,7 @@ fn inspect(
     retain_lock: bool,
     processes: &[(u32, PathBuf)],
     prs: &std::result::Result<Vec<Pr>, String>,
+    min_age: (&str, Duration),
 ) -> Result<(Option<String>, Option<File>)> {
     let skip = |reason: &str| Ok((Some(reason.to_owned()), None));
     if path == root {
@@ -300,6 +311,11 @@ fn inspect(
     if let Some(pid) = crate::free::holder(processes, path) {
         return skip(&format!("open files (pid {pid})"));
     }
+    match age_guard(path, min_age, SystemTime::now()) {
+        Ok(Some(reason)) => return skip(&reason),
+        Ok(None) => {}
+        Err(error) => return skip(&format!("activity age unknown ({error})")),
+    }
     let status = git(path, &["status", "--porcelain"])?;
     if !status.status.success() {
         bail!("git status failed for {}", path.display());
@@ -330,6 +346,57 @@ fn inspect(
             }
         )),
     }
+}
+
+fn age_guard(path: &Path, min_age: (&str, Duration), now: SystemTime) -> Result<Option<String>> {
+    if min_age.1.is_zero() {
+        return Ok(None);
+    }
+    let admin = git(path, &["rev-parse", "--absolute-git-dir"])?;
+    if !admin.status.success() {
+        bail!("cannot locate worktree git directory");
+    }
+    let admin = PathBuf::from(String::from_utf8(admin.stdout)?.trim());
+    let commit = git(path, &["log", "-1", "--format=%ct", "HEAD"])?;
+    if !commit.status.success() {
+        bail!("cannot read HEAD commit time");
+    }
+    let timestamp = String::from_utf8(commit.stdout)?.trim().parse::<u64>()?;
+    let mut newest = UNIX_EPOCH
+        .checked_add(Duration::from_secs(timestamp))
+        .context("HEAD timestamp out of range")?;
+    for file in [path.to_owned(), path.join(".git"), admin.join("index")] {
+        let modified = std::fs::metadata(&file)
+            .with_context(|| format!("stat {}", file.display()))?
+            .modified()?;
+        newest = newest.max(modified);
+    }
+    match std::fs::read_to_string(admin.join("logs/HEAD")) {
+        Ok(log) => {
+            for line in log.lines() {
+                let timestamp = line
+                    .split('\t')
+                    .next()
+                    .context("invalid HEAD reflog")?
+                    .split_whitespace()
+                    .rev()
+                    .nth(1)
+                    .context("missing HEAD reflog timestamp")?
+                    .parse::<u64>()?;
+                newest = newest.max(
+                    UNIX_EPOCH
+                        .checked_add(Duration::from_secs(timestamp))
+                        .context("reflog timestamp out of range")?,
+                );
+            }
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(
+        (now.duration_since(newest).unwrap_or_default() <= min_age.1)
+            .then(|| format!("active in the last {}", min_age.0)),
+    )
 }
 
 fn worktree_locked(root: &Path, path: &Path) -> Result<bool> {
@@ -603,5 +670,148 @@ mod pr_tests {
         child.kill().unwrap();
         child.wait().unwrap();
         assert_eq!(crate::free::holder(&paths, temp.path()), Some(child.id()));
+    }
+}
+
+#[cfg(test)]
+mod age_tests {
+    use super::*;
+
+    const OLD: u64 = 1_600_000_000;
+
+    fn fixture(commit_time: u64) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("main");
+        std::fs::create_dir(&root).unwrap();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.name", "Test"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["commit", "--allow-empty", "-m", "base"],
+        ] {
+            let output = Command::new("git")
+                .current_dir(&root)
+                .args(args)
+                .env("GIT_COMMITTER_DATE", format!("{commit_time} +0000"))
+                .env("GIT_AUTHOR_DATE", format!("{commit_time} +0000"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let tree = temp.path().join("tree");
+        assert!(
+            git(
+                &root,
+                &["worktree", "add", "-b", "topic", tree.to_str().unwrap()]
+            )
+            .unwrap()
+            .status
+            .success()
+        );
+        let admin = git(&tree, &["rev-parse", "--absolute-git-dir"]).unwrap();
+        let admin = PathBuf::from(String::from_utf8(admin.stdout).unwrap().trim());
+        reset_activity(&tree, &admin);
+        (temp, tree, admin)
+    }
+
+    fn set_modified(path: &Path, seconds: u64) {
+        File::open(path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(seconds)),
+            )
+            .unwrap();
+    }
+
+    fn reset_activity(tree: &Path, admin: &Path) {
+        let head = git(tree, &["rev-parse", "HEAD"]).unwrap();
+        let head = String::from_utf8(head.stdout).unwrap();
+        std::fs::write(
+            admin.join("logs/HEAD"),
+            format!(
+                "{0} {0} Test <test@example.com> {OLD} +0000\tcheckout\n",
+                head.trim()
+            ),
+        )
+        .unwrap();
+        for path in [tree.to_owned(), tree.join(".git"), admin.join("index")] {
+            set_modified(&path, OLD);
+        }
+    }
+
+    #[test]
+    fn each_activity_signal_protects_an_otherwise_old_worktree() {
+        let (_temp, tree, admin) = fixture(OLD);
+        let now = UNIX_EPOCH + Duration::from_secs(OLD + 172_800);
+        let threshold = ("24h", Duration::from_secs(86_400));
+        assert!(age_guard(&tree, threshold, now).unwrap().is_none());
+        for path in [tree.clone(), tree.join(".git"), admin.join("index")] {
+            set_modified(&path, OLD + 172_800);
+            assert_eq!(
+                age_guard(&tree, threshold, now).unwrap().as_deref(),
+                Some("active in the last 24h")
+            );
+            reset_activity(&tree, &admin);
+        }
+        let log = admin.join("logs/HEAD");
+        let contents = std::fs::read_to_string(&log).unwrap();
+        std::fs::write(
+            &log,
+            contents.replace(&OLD.to_string(), &(OLD + 172_800).to_string()),
+        )
+        .unwrap();
+        assert!(age_guard(&tree, threshold, now).unwrap().is_some());
+        assert!(
+            age_guard(&tree, ("0", Duration::ZERO), now)
+                .unwrap()
+                .is_none()
+        );
+        std::fs::write(&log, "malformed\n").unwrap();
+        assert!(age_guard(&tree, threshold, now).is_err());
+    }
+
+    #[test]
+    fn commit_time_protects_even_with_old_metadata_and_no_reflog() {
+        let (_temp, tree, admin) = fixture(OLD + 172_800);
+        std::fs::remove_file(admin.join("logs/HEAD")).unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(OLD + 172_800);
+        assert!(
+            age_guard(&tree, ("1d", Duration::from_secs(86_400)), now)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn threshold_and_future_activity_are_protected() {
+        let (_temp, tree, _admin) = fixture(OLD);
+        let threshold = ("1d", Duration::from_secs(86_400));
+        assert!(
+            age_guard(
+                &tree,
+                threshold,
+                UNIX_EPOCH + Duration::from_secs(OLD + 86_400)
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            age_guard(
+                &tree,
+                threshold,
+                UNIX_EPOCH + Duration::from_secs(OLD + 86_401)
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            age_guard(&tree, threshold, UNIX_EPOCH + Duration::from_secs(OLD - 1))
+                .unwrap()
+                .is_some()
+        );
     }
 }

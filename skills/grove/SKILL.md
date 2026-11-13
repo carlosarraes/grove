@@ -331,3 +331,8 @@ unlocked trees whose commits are covered by their upstream or by a merged/closed
 GitHub PR with no open PR and proof HEAD reached GitHub. Detached HEAD uses local
 branches containing HEAD. PR lookup fails closed. Primary and ferry worktrees are
 protected. Linux uses /proc; macOS requires lsof. Apply rechecks usage and status.
+
+Clean requires `--min-age 24h` of inactivity by default, using the newest HEAD
+reflog/commit time, worktree `.git` file/index mtime, or root directory mtime. This
+protects queued checkouts too. Durations follow `[idle] stop_after` syntax;
+`--min-age 0` disables the guard. Unknown age keeps the tree. Apply rechecks age.

@@ -9047,13 +9047,16 @@ fn clean_linked(cli: &Cli, name: &str, upstream: bool) -> std::path::PathBuf {
 fn clean_defaults_to_dry_run_and_skips_no_upstream() {
     let cli = Cli::new();
     let wt = clean_linked(&cli, "no_upstream", false);
-    cli.run(&cli.fx.main, &["clean"])
+    cli.run(&cli.fx.main, &["clean", "--min-age", "0"])
         .success()
         .stdout(predicates::str::contains("no upstream"));
     assert!(wt.exists());
     // Even an eligible tree survives the default and explicit dry run.
     common::git(&wt, &["branch", "--set-upstream-to=main"]);
-    for args in [&["clean"][..], &["clean", "--dry-run"][..]] {
+    for args in [
+        &["clean", "--min-age", "0"][..],
+        &["clean", "--min-age", "0", "--dry-run"][..],
+    ] {
         cli.run(&cli.fx.main, args)
             .success()
             .stdout(predicates::str::contains("would free"));
@@ -9065,7 +9068,7 @@ fn clean_defaults_to_dry_run_and_skips_no_upstream() {
 fn clean_yes_removes_worktree_and_releases_registry() {
     let cli = Cli::new();
     let wt = clean_linked(&cli, "idle_clean", true);
-    cli.run(&cli.fx.main, &["clean", "--yes"])
+    cli.run(&cli.fx.main, &["clean", "--min-age", "0", "--yes"])
         .success()
         .stdout(predicates::str::contains("removed, freed"));
     assert!(!wt.exists());
@@ -9083,7 +9086,10 @@ fn clean_skips_dirty_worktrees() {
     let cli = Cli::new();
     let wt = clean_linked(&cli, "dirty_clean", true);
     std::fs::write(wt.join("uncommitted"), "keep me").unwrap();
-    for args in [&["clean"][..], &["clean", "--yes"][..]] {
+    for args in [
+        &["clean", "--min-age", "0"][..],
+        &["clean", "--min-age", "0", "--yes"][..],
+    ] {
         cli.run(&cli.fx.main, args)
             .success()
             .stdout(predicates::str::contains("uncommitted changes"));
@@ -9130,7 +9136,7 @@ fn clean_skips_locked_worktree() {
             break;
         }
     }
-    let output = cli.run(&cli.fx.main, &["clean"]);
+    let output = cli.run(&cli.fx.main, &["clean", "--min-age", "0"]);
     child.stdin.take().unwrap().write_all(b"done\n").unwrap();
     assert!(child.wait().unwrap().success());
     output
@@ -9144,7 +9150,7 @@ fn clean_skips_open_files() {
     let cli = Cli::new();
     let wt = clean_linked(&cli, "open_clean", false);
     let _file = std::fs::File::open(wt.join("README.md")).unwrap();
-    cli.run(&cli.fx.main, &["clean", "--yes"])
+    cli.run(&cli.fx.main, &["clean", "--min-age", "0", "--yes"])
         .success()
         .stdout(predicates::str::contains("open files (pid"));
     assert!(wt.exists());
@@ -9163,10 +9169,10 @@ fn clean_freed_bytes_exclude_hardlinks() {
     let bytes = grove::footprint::unique_reclaimable(&wt);
     assert!((1024 * 1024..1200 * 1024).contains(&bytes), "{bytes}");
     let size = grove::footprint::human_size(bytes);
-    cli.run(&cli.fx.main, &["clean"])
+    cli.run(&cli.fx.main, &["clean", "--min-age", "0"])
         .success()
         .stdout(predicates::str::contains(format!("would free {size}")));
-    cli.run(&cli.fx.main, &["clean", "--yes"])
+    cli.run(&cli.fx.main, &["clean", "--min-age", "0", "--yes"])
         .success()
         .stdout(predicates::str::contains(format!("removed, freed {size}")));
     assert!(!wt.exists());
@@ -9190,7 +9196,7 @@ fn clean_refuses_when_lsof_is_missing() {
         .current_dir(&cli.fx.main)
         .env("GROVE_STATE_DIR", cli.state.path())
         .env("PATH", &bin)
-        .args(["clean", "--yes"])
+        .args(["clean", "--min-age", "0", "--yes"])
         .assert()
         .success()
         .stdout(predicates::str::contains(
@@ -9204,7 +9210,7 @@ fn clean_skips_running_stack() {
     let cli = Cli::new();
     let wt = cli.worktree("running_clean");
     cli.run(&wt, &["up"]).success();
-    cli.run(&cli.fx.main, &["clean", "--yes"])
+    cli.run(&cli.fx.main, &["clean", "--min-age", "0", "--yes"])
         .success()
         .stdout(predicates::str::contains("running stack"));
     assert!(wt.exists());
@@ -9216,7 +9222,14 @@ fn clean_unknown_selector_reclaims_nothing() {
     let wt = clean_linked(&cli, "selected_clean", true);
     cli.run(
         &cli.fx.main,
-        &["clean", "selected_clean", "unknown", "--yes"],
+        &[
+            "clean",
+            "--min-age",
+            "0",
+            "selected_clean",
+            "unknown",
+            "--yes",
+        ],
     )
     .failure()
     .stderr(predicates::str::contains("no instance named"));
@@ -9228,7 +9241,7 @@ fn clean_never_removes_primary_or_unlinked_worktree() {
     let cli = Cli::new();
     cli.run(&cli.fx.main, &["status"]).success();
     let unlinked = cli.fx.add_worktree("unlinked_clean");
-    cli.run(&cli.fx.main, &["clean", "--yes"])
+    cli.run(&cli.fx.main, &["clean", "--min-age", "0", "--yes"])
         .success()
         .stdout(predicates::str::contains("primary worktree"));
     assert!(cli.fx.main.exists());
@@ -9242,7 +9255,7 @@ fn clean_skips_unpushed_commits() {
     std::fs::write(wt.join("README.md"), "not pushed\n").unwrap();
     common::git(&wt, &["add", "README.md"]);
     common::git(&wt, &["commit", "-m", "local commit"]);
-    cli.run(&cli.fx.main, &["clean", "--yes"])
+    cli.run(&cli.fx.main, &["clean", "--min-age", "0", "--yes"])
         .success()
         .stdout(predicates::str::contains("unpushed commits"));
     assert!(wt.exists());
@@ -9252,8 +9265,11 @@ fn clean_skips_unpushed_commits() {
 fn clean_yes_conflicts_with_explicit_dry_run() {
     let cli = Cli::new();
     let wt = clean_linked(&cli, "conflicting_clean", false);
-    cli.run(&cli.fx.main, &["clean", "--yes", "--dry-run"])
-        .failure();
+    cli.run(
+        &cli.fx.main,
+        &["clean", "--min-age", "0", "--yes", "--dry-run"],
+    )
+    .failure();
     assert!(wt.exists());
 }
 
@@ -9623,7 +9639,14 @@ fn clean_repo_discovers_unregistered_and_protects_git_locks() {
     common::git(&cli.fx.main, &["worktree", "lock", wt.to_str().unwrap()]);
     cli.run(
         &cli.fx.main,
-        &["clean", "--repo", cli.fx.main.to_str().unwrap(), "--apply"],
+        &[
+            "clean",
+            "--min-age",
+            "0",
+            "--repo",
+            cli.fx.main.to_str().unwrap(),
+            "--apply",
+        ],
     )
     .success()
     .stdout(predicates::str::contains("locked worktree"));
@@ -9632,7 +9655,14 @@ fn clean_repo_discovers_unregistered_and_protects_git_locks() {
     std::fs::write(wt.join("README.md"), "dirty").unwrap();
     cli.run(
         &cli.fx.main,
-        &["clean", "--repo", cli.fx.main.to_str().unwrap(), "--apply"],
+        &[
+            "clean",
+            "--min-age",
+            "0",
+            "--repo",
+            cli.fx.main.to_str().unwrap(),
+            "--apply",
+        ],
     )
     .success()
     .stdout(predicates::str::contains("uncommitted changes"));
@@ -9645,7 +9675,14 @@ fn clean_repo_discovers_unregistered_and_protects_git_locks() {
         .unwrap();
     let result = cli.run(
         &cli.fx.main,
-        &["clean", "--repo", cli.fx.main.to_str().unwrap(), "--apply"],
+        &[
+            "clean",
+            "--min-age",
+            "0",
+            "--repo",
+            cli.fx.main.to_str().unwrap(),
+            "--apply",
+        ],
     );
     child.kill().unwrap();
     child.wait().unwrap();
@@ -9655,16 +9692,89 @@ fn clean_repo_discovers_unregistered_and_protects_git_locks() {
     assert!(wt.exists());
     cli.run(
         &cli.fx.main,
-        &["clean", "--repo", cli.fx.main.to_str().unwrap()],
+        &[
+            "clean",
+            "--min-age",
+            "0",
+            "--repo",
+            cli.fx.main.to_str().unwrap(),
+        ],
     )
     .success()
     .stdout(predicates::str::contains("would free"));
     assert!(wt.exists());
     cli.run(
         &cli.fx.main,
-        &["clean", "--repo", cli.fx.main.to_str().unwrap(), "--apply"],
+        &[
+            "clean",
+            "--min-age",
+            "0",
+            "--repo",
+            cli.fx.main.to_str().unwrap(),
+            "--apply",
+        ],
     )
     .success()
     .stdout(predicates::str::contains("removed, freed"));
     assert!(!wt.exists());
+}
+
+#[test]
+fn clean_default_age_protects_queued_registered_and_unregistered_worktrees() {
+    let cli = Cli::new();
+    let registered = clean_linked(&cli, "queued_registered", true);
+    let unregistered = cli.fx.add_worktree("queued_unregistered");
+    common::git(&unregistered, &["branch", "--set-upstream-to=main"]);
+    for args in [
+        vec!["clean"],
+        vec!["clean", "--yes"],
+        vec!["clean", "--min-age", "1d", "--yes"],
+    ] {
+        cli.run(&cli.fx.main, &args)
+            .success()
+            .stdout(predicates::str::contains("active in the last"));
+        assert!(registered.exists());
+        assert!(unregistered.exists());
+    }
+    cli.run(&cli.fx.main, &["clean", "--min-age", "0", "--yes"])
+        .success();
+    assert!(!registered.exists());
+    assert!(!unregistered.exists());
+}
+
+#[test]
+fn clean_removes_an_old_unregistered_worktree_with_default_age_guard() {
+    let cli = Cli::new();
+    let tree = cli.fx.add_worktree("old_unregistered");
+    let commit = std::process::Command::new("git")
+        .current_dir(&tree)
+        .args(["commit", "--allow-empty", "--amend", "--no-edit"])
+        .env("GIT_COMMITTER_DATE", "1600000000 +0000")
+        .output()
+        .unwrap();
+    assert!(
+        commit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    common::git(&tree, &["branch", "old_base", "HEAD"]);
+    common::git(&tree, &["branch", "--set-upstream-to=old_base"]);
+    common::git(&tree, &["reflog", "expire", "--expire=all", "HEAD"]);
+    let admin = common::git(&tree, &["rev-parse", "--absolute-git-dir"]);
+    let admin = std::path::PathBuf::from(admin.trim());
+    for path in [tree.clone(), tree.join(".git"), admin.join("index")] {
+        std::fs::File::open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000),
+            ))
+            .unwrap();
+    }
+    cli.run(
+        &cli.fx.main,
+        &["clean", "--repo", cli.fx.main.to_str().unwrap(), "--yes"],
+    )
+    .success()
+    .stdout(predicates::str::contains("removed, freed"));
+    assert!(!tree.exists());
 }

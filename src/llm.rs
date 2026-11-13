@@ -297,7 +297,10 @@ isolated session if needed.
 ## Worktree cleanup
 
 `grove clean` discovers worktrees in registered repositories and repeatable `--repo PATH`
-repositories. Dry run is default; `--yes` / `--apply` deletes. It skips primary,
+repositories. Dry run is default; `--yes` / `--apply` deletes.
+`--min-age` defaults to 24h (ms/s/m/h/d or seconds; 0 disables). Every candidate
+must be older by HEAD reflog/commit time, .git file/index mtime and root dir mtime;
+the newest activity wins. Unknown age keeps the tree; apply rechecks age. It skips primary,
 locked, ferry-owned, running, open-file and dirty trees. Eligibility requires no
 commits ahead of upstream, or no open PR plus a merged/closed GitHub PR and proof
 HEAD reached GitHub. Detached HEAD uses branches containing HEAD. PR lookup fails

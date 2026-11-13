@@ -177,12 +177,14 @@ repo's own fixture or settings constructor.
 | `run -- <cmd>` | run a command with this instance's environment overlaid |
 | `logs [service] [--since-restart] [-n N]` | what a service printed |
 | `seed [--force]` | populate the datastore; markers follow the managed container incarnation, while `--force` rebuilds dirtied data |
-| `clean [NAME...] [--worktree PATH]... [--repo PATH]... [--yes|--apply] [--dry-run]` | remove idle worktrees; dry-run by default |
+| `clean [NAME...] [--worktree PATH]... [--repo PATH]... [--yes|--apply] [--dry-run] [--min-age AGE]` | remove idle worktrees; dry-run by default |
 | `prune [NAME...] [--worktree PATH]... [--dry-run] [--purge]` | stop and forget all instances whose worktree is gone or no longer a git worktree, or only the selected orphaned instances by `grove ls` name or recorded path; selected prune skips the shared store sweep |
 | `free BRANCH [--dry-run]` | detach clean, idle, unlocked worktrees that hold BRANCH so `git worktree add` can use it; exits 0 when free, 1 when something still holds it, 2 on usage errors |
 | `doctor` | check everything needed to start, and say what to fix |
 
 `grove clean` discovers all git worktrees in repositories with registered instances. Repeatable `--repo PATH` adds repositories. Names and `--worktree PATH` restrict selection to recorded instances. Dry run is the default; `--yes` (alias `--apply`) removes eligible worktrees without forcing git or dropping databases.
+
+Clean also requires at least `--min-age 24h` of inactivity by default. It uses the newest HEAD reflog/commit timestamp, worktree `.git` file mtime, per-worktree index mtime, or top-level directory mtime, and checks again before removal. This protects newly created checkouts whose agents are queued. Durations use the `[idle] stop_after` syntax (`ms`, `s`, `m`, `h`, `d`, or bare seconds); `--min-age 0` disables the age guard. Unreadable activity data keeps the worktree.
 
 Clean skips primary, git-locked, ferry-owned (`~/.local/state/ferry/worktrees`), busy and dirty worktrees, including untracked files. Existing upstream eligibility is unchanged: no commits ahead of the upstream. Otherwise it requires a merged/closed GitHub PR for the branch, no open PR, and proof that HEAD reached GitHub through PR ancestry or a remote-tracking ref. Detached checkouts use local branches containing HEAD; any open PR on those branches blocks PR-based removal. PR state is read once per repository with gh; unavailable or failed results fail closed for this path.
 

@@ -28,6 +28,13 @@ impl fmt::Display for Verdict {
 
 pub fn check(instance: &Instance) -> Vec<Verdict> {
     let mut verdicts = Vec::new();
+    for project in crate::uncovered::detect(&instance.resolved.worktree, &instance.config) {
+        verdicts.push(Verdict::Warn(format!(
+            "{} Add:\n{}",
+            project.warning(),
+            project.snippet(&instance.config)
+        )));
+    }
 
     if instance.resolved.is_main() {
         verdicts.push(Verdict::Fail {

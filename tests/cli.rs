@@ -9524,3 +9524,92 @@ fn run_names_the_missing_executable_in_plain_and_heavy_mode() {
             )));
     }
 }
+
+#[test]
+fn uncovered_lockfile_warns_in_doctor_and_setup_dry_run() {
+    let cli = Cli::with_config("version = 1\n");
+    let wt = cli.worktree("uncovered");
+    std::fs::write(
+        wt.join("package.json"),
+        r#"{"devDependencies":{"lefthook":"1"}}"#,
+    )
+    .unwrap();
+    std::fs::write(wt.join("pnpm-lock.yaml"), "lock").unwrap();
+    std::fs::write(wt.join("pnpm-workspace.yaml"), "packages: []").unwrap();
+    let output = cli.run(&wt, &["doctor"]).get_output().clone();
+    let terminal = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        terminal.contains("./package.json + pnpm-lock.yaml is not installed by any service"),
+        "{terminal}"
+    );
+    assert!(
+        terminal.contains("corepack pnpm install --frozen-lockfile"),
+        "{terminal}"
+    );
+    assert!(
+        terminal.contains(r#"key = ["pnpm-lock.yaml", "pnpm-workspace.yaml"]"#),
+        "{terminal}"
+    );
+    let output = cli
+        .run(&wt, &["up", "--setup-only", "--dry-run"])
+        .success()
+        .get_output()
+        .clone();
+    let terminal = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        terminal.matches("./package.json + pnpm-lock.yaml").count(),
+        1,
+        "{terminal}"
+    );
+    assert!(terminal.contains("grove doctor"), "{terminal}");
+    assert!(!terminal.contains("[[service]]"), "{terminal}");
+}
+
+#[test]
+fn root_and_frontend_setup_only_caches_store_and_link_separately() {
+    let cli = Cli::with_config(
+        r#"
+version = 1
+[[service]]
+name = "root"
+cwd = "."
+setup = "mkdir -p node_modules/.bin; echo root > node_modules/.bin/lefthook"
+cache = { path = "node_modules", key = ["package-lock.json"] }
+[[service]]
+name = "frontend"
+cwd = "frontend"
+setup = "mkdir -p node_modules/.bin; echo frontend > node_modules/.bin/vite"
+cache = { path = "node_modules", key = ["package-lock.json"] }
+"#,
+    );
+    for slug in ["root_cache_first", "root_cache_second"] {
+        let wt = cli.worktree(slug);
+        std::fs::create_dir_all(wt.join("frontend")).unwrap();
+        for cwd in [wt.clone(), wt.join("frontend")] {
+            std::fs::write(cwd.join("package-lock.json"), "{}").unwrap();
+        }
+        let output = cli
+            .run(&wt, &["up", "--setup-only"])
+            .success()
+            .get_output()
+            .clone();
+        let terminal = String::from_utf8_lossy(&output.stderr);
+        if slug.ends_with("second") {
+            assert_eq!(terminal.matches("cache hit").count(), 2, "{terminal}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(wt.join("node_modules/.bin/lefthook")).unwrap(),
+            "root\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join("frontend/node_modules/.bin/vite")).unwrap(),
+            "frontend\n"
+        );
+        let entry = registry_of(&cli).get(&wt).unwrap().unwrap();
+        assert_ne!(entry.cache_keys["root"], entry.cache_keys["frontend"]);
+    }
+}

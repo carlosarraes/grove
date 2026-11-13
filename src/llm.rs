@@ -234,6 +234,13 @@ Three fields run commands, and the difference between them is how often:
 `setup` when its inputs change, `[[seed]]` once per instance, `prepare` every `up`. Put a
 dependency install in `setup`, fixture data in `[[seed]]`, and code generation in
 `prepare` -- generated output is the one that goes stale when it is only made once.
+Root/workspace installs need their own setup-only [[service]] with cwd = "." and
+no command. A frontend setup does not install root hook tools such as lefthook.
+Use setup = "corepack pnpm install --frozen-lockfile" and
+cache = {{ path = "node_modules", key = ["pnpm-lock.yaml", "pnpm-workspace.yaml"] }}
+for a pnpm workspace. Omit the workspace key if that file is absent. Doctor
+warns about lockfile projects with no setup at their cwd and suggests a service.
+
 Use `cache` for dependencies safe to share. For local installs such as Python venvs,
 use `setup_inputs = ["uv.lock", "pyproject.toml"]` with cwd = "backend". Without
 setup_inputs or cache, only a changed setup command invalidates the marker.

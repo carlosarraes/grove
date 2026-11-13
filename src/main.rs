@@ -402,6 +402,12 @@ fn main() -> Result<()> {
                 }
             };
             let mut instance = Instance::open(&cwd)?;
+            for project in grove::uncovered::detect(&instance.resolved.worktree, &instance.config) {
+                eprintln!(
+                    "warn: {} See `grove doctor` for a setup snippet.",
+                    project.warning()
+                );
+            }
             instance.validate_services(&services)?;
             if !allow_main {
                 instance.refuse_in_main()?;

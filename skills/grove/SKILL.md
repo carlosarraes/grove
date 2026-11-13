@@ -317,3 +317,10 @@ an existing worktree. Use `--no-cache` only to rebuild an entry you distrust.
 Cache entries published by 0.1.22 include a file inventory and use a new key format.
 The first worktree on each key installs once after this upgrade. Later worktrees reuse
 that entry. Capture the full output and exit code when a refresh fails.
+
+Root/workspace dependencies need a setup-only `[[service]]` with `cwd = "."`,
+`setup = "corepack pnpm install --frozen-lockfile"`, and no `command`. For pnpm,
+use `cache = { path = "node_modules", key = ["pnpm-lock.yaml", "pnpm-workspace.yaml"] }`
+and omit the workspace key when absent. A frontend install does not cover root
+hook tools such as lefthook. `grove doctor` warns about uncovered lockfile projects
+and prints a setup snippet; `grove up` also warns without failing.

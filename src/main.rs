@@ -737,9 +737,26 @@ fn main() -> Result<()> {
                 .args(&argv[1..])
                 .current_dir(&cwd)
                 .envs(instance.environment()?);
-            let mut child = signals
-                .spawn(&mut command)
-                .with_context(|| format!("running `{}`", argv.join(" ")))?;
+            let mut child = signals.spawn(&mut command).map_err(|error| {
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                {
+                    let path = command
+                        .get_envs()
+                        .find(|(key, _)| *key == "PATH")
+                        .map(|(_, value)| value.map(std::ffi::OsStr::to_os_string))
+                        .unwrap_or_else(|| std::env::var_os("PATH"));
+                    anyhow::anyhow!(grove::run::not_found_diagnostic(
+                        &argv[0],
+                        &cwd,
+                        &instance.resolved.worktree,
+                        path.as_deref(),
+                    ))
+                } else {
+                    error.context(format!("running `{}`", argv.join(" ")))
+                }
+            })?;
             let status = signals.wait(&mut child)?;
 
             // Sampled after the child, so the average includes the contention the run

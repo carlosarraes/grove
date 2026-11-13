@@ -134,3 +134,77 @@ impl Drop for Signals {
         let _ = self.restore_terminal();
     }
 }
+
+/// Explain ENOENT using the same working directory and PATH as the failed child.
+pub fn not_found_diagnostic(
+    program: &str,
+    cwd: &std::path::Path,
+    worktree: &std::path::Path,
+    search_path: Option<&std::ffi::OsStr>,
+) -> String {
+    use std::path::Path;
+    let explicit = program.contains('/');
+    let path = if explicit {
+        Some(cwd.join(program))
+    } else {
+        search_path.and_then(|paths| {
+            std::env::split_paths(paths)
+                .map(|directory| cwd.join(directory).join(program))
+                .find(|candidate| std::fs::symlink_metadata(candidate).is_ok())
+        })
+    };
+    let prefix = format!("grove run: `{program}`");
+    if let Some(path) = &path {
+        if let Ok(target) = std::fs::read_link(path)
+            && !path.exists()
+        {
+            return format!("{prefix} is a dangling symlink to {}", target.display());
+        }
+        if path.exists() {
+            // ENOENT also comes from the kernel when a script's interpreter is absent.
+            use std::io::Read;
+            let mut header = Vec::new();
+            if let Ok(file) = std::fs::File::open(path) {
+                let _ = file.take(256).read_to_end(&mut header);
+            }
+            if let Some(shebang) = header.strip_prefix(b"#!") {
+                let line = shebang
+                    .split(|byte| *byte == b'\n')
+                    .next()
+                    .unwrap_or_default();
+                let interpreter = line
+                    .split(|byte| *byte == b' ' || *byte == b'\t')
+                    .find(|part| !part.is_empty());
+                if let Some(interpreter) = interpreter {
+                    use std::os::unix::ffi::OsStrExt;
+                    let interpreter = Path::new(std::ffi::OsStr::from_bytes(interpreter));
+                    if !cwd.join(interpreter).exists() {
+                        return format!(
+                            "{prefix} exists but its interpreter `{}` is missing",
+                            interpreter.display()
+                        );
+                    }
+                }
+            }
+            return format!(
+                "{prefix} exists at {} but could not start (an interpreter or loader may be missing)",
+                path.display()
+            );
+        }
+    }
+    let mut message = if explicit {
+        format!(
+            "{prefix} not found (looked in {})",
+            cwd.join(program).display()
+        )
+    } else {
+        format!("{prefix} is not on PATH")
+    };
+    if let Some(name) = Path::new(program).file_name() {
+        let suggestion = Path::new("node_modules/.bin").join(name);
+        if worktree.join(&suggestion).is_file() {
+            message.push_str(&format!("; did you mean {}?", suggestion.display()));
+        }
+    }
+    message
+}

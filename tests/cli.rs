@@ -9508,3 +9508,19 @@ finally:
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn run_names_the_missing_executable_in_plain_and_heavy_mode() {
+    let cli = Cli::with_config("version = 1\n");
+    for args in [
+        vec!["run", "--", "does/not/exist"],
+        vec!["run", "--heavy", "--", "does/not/exist"],
+    ] {
+        cli.run(&cli.fx.main, &args)
+            .failure()
+            .stderr(predicates::str::contains(format!(
+                "grove run: `does/not/exist` not found (looked in {})",
+                cli.fx.main.join("does/not/exist").display()
+            )));
+    }
+}

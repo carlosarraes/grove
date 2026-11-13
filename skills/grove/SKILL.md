@@ -53,6 +53,11 @@ reachable by other machines on the network.
 
 ## Working
 
+`grove run` resolves relative executable paths from the current directory and bare names
+through PATH. If spawning fails because a file is missing, its error names the attempted
+absolute path, missing shebang interpreter, or dangling symlink target. A root
+`node_modules/.bin` suggestion means that executable exists in the worktree root.
+
 Commands that need to reach the instance get its ports from `grove run`:
 
 ```

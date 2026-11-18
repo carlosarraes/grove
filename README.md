@@ -173,7 +173,7 @@ repo's own fixture or settings constructor.
 | `status [NAME] [--worktree NAME\|PATH] [--json]` | ports, pids, and whether each service's `ready.http` answers — plus a warning if a service predates your last edit |
 | `ls [--json]` | every instance on the machine, most neglected first, with its owner, how long since its last grove command, the machine's load and what each holds on disk |
 | `test-containers [--remove-stale]` | report stale Mongo testcontainers; recheck and remove only with the explicit flag |
-| `health [--json]` | everything on the machine that is costing someone — stray listeners, orphans, idle instances, disk — each with the command that ends it |
+| `health [--json]` | everything on the machine that is costing someone — stray listeners, orphans, port-block pressure, idle instances, disk — each with the command that ends it |
 | `run -- <cmd>` | run a command with this instance's environment overlaid |
 | `logs [service] [--since-restart] [-n N]` | what a service printed |
 | `seed [--force]` | populate the datastore; markers follow the managed container incarnation, while `--force` rebuilds dirtied data |
@@ -483,6 +483,8 @@ Ordinary `grove health` reports available disk space and recorded instance usage
 but labels the store size as unmeasured. It does not recursively scan the store
 before it reports health findings.
 Ports held by colima, Docker Desktop, or other recognized container forwards are reported as forwards; health never suggests killing the forwarder process.
+
+Each instance holds a 10-port block from its first `up` until its worktree is removed; stopping it keeps the block so it returns on the same ports. `health` warns once 80% of the blocks in the range are reserved and fails at 100%, when `up` can no longer allocate. Stopping instances frees nothing: `grove prune` releases blocks of orphaned instances, `grove clean` (dry run, then `--yes`) removes idle worktrees with pushed commits or merged/closed PRs and releases theirs, and `GROVE_PORT_RANGE=low-high` widens the range. The exhaustion error from `up` says the same, with counts of running, stopped and orphaned holders.
 
 ## Resource initialization failures
 

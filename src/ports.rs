@@ -2,8 +2,11 @@
 
 use anyhow::{Result, bail};
 use std::collections::{BTreeMap, HashSet};
+use std::fmt;
 use std::net::TcpListener;
 use std::ops::Range;
+
+use crate::registry::Entry;
 
 /// Deliberately far from 3000/5173/8000/8080. Every dev config carries a hardcoded
 /// fallback to one of those, so an instance whose rewrite failed lands on a dead port and
@@ -63,7 +66,7 @@ pub fn allocate_within(
         );
     }
 
-    let blocks = ((range.end - range.start) / STRIDE).max(1);
+    let blocks = blocks(&range);
     let first = fnv1a(&format!("{repo_key}/{slug}")) % u32::from(blocks);
 
     // Start at the block this instance hashes to, then walk. Hashing gives stability
@@ -85,7 +88,99 @@ pub fn allocate_within(
         }
     }
 
-    bail!("no free port block in {range:?}; run `grove ls` and stop instances you are done with")
+    Err(Exhausted { range }.into())
+}
+
+pub fn blocks(range: &Range<u16>) -> u16 {
+    ((range.end - range.start) / STRIDE).max(1)
+}
+
+/// Every block in the range is reserved or bound. Typed so the registry, which knows who
+/// holds the blocks, can say so; allocation alone cannot.
+#[derive(Debug)]
+pub struct Exhausted {
+    pub range: Range<u16>,
+}
+
+impl fmt::Display for Exhausted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "no free port block in {:?}", self.range)
+    }
+}
+
+impl std::error::Error for Exhausted {}
+
+/// What releases a block. Stopping an instance does not: its block stays reserved so it
+/// comes back on the same ports.
+pub const CURE: &str = "`grove prune` frees blocks of orphaned instances (worktree gone); `grove clean` (dry run, then `--yes`) removes idle worktrees with pushed commits or merged/closed PRs and releases theirs; GROVE_PORT_RANGE=low-high widens the range";
+
+/// Blocks in a range the registry has promised away, by the state of their holder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pressure {
+    pub blocks: u16,
+    pub running: usize,
+    pub stopped: usize,
+    pub orphaned: usize,
+}
+
+impl Pressure {
+    pub fn of<'a>(range: &Range<u16>, entries: impl IntoIterator<Item = &'a Entry>) -> Self {
+        let mut pressure = Pressure {
+            blocks: blocks(range),
+            running: 0,
+            stopped: 0,
+            orphaned: 0,
+        };
+        let mut seen = HashSet::new();
+        for entry in entries {
+            let Some(port) = entry.ports.values().find(|p| range.contains(p)) else {
+                continue;
+            };
+            if !seen.insert((port - range.start) / STRIDE) {
+                continue;
+            }
+            if entry.is_orphaned() {
+                pressure.orphaned += 1;
+            } else if entry.is_running() {
+                pressure.running += 1;
+            } else {
+                pressure.stopped += 1;
+            }
+        }
+        pressure
+    }
+
+    pub fn held(&self) -> usize {
+        self.running + self.stopped + self.orphaned
+    }
+
+    pub fn percent(&self) -> usize {
+        self.held() * 100 / usize::from(self.blocks)
+    }
+
+    pub fn holders(&self) -> String {
+        format!(
+            "{} running, {} stopped, {} orphaned",
+            self.running, self.stopped, self.orphaned
+        )
+    }
+
+    /// The exhaustion error `grove up` prints: who holds the blocks, why stopping does
+    /// not help, and what does.
+    pub fn exhausted_message(&self, range: &Range<u16>) -> String {
+        let mut headline = format!(
+            "no free port block in {range:?}: {} blocks, {} held by grove ({})",
+            self.blocks,
+            self.held(),
+            self.holders()
+        );
+        if self.held() < usize::from(self.blocks) {
+            headline.push_str("; the rest are bound by other processes");
+        }
+        format!(
+            "{headline}\nstopped instances keep their block until their worktree is removed\nto free blocks: {CURE}"
+        )
+    }
 }
 
 /// Bound on all interfaces rather than loopback alone: a dev server listening on 0.0.0.0

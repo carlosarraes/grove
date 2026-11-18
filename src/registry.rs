@@ -201,7 +201,23 @@ impl Registry {
                     &resolved.slug,
                     names,
                     &taken,
-                )?,
+                )
+                .map_err(|error| {
+                    match error.downcast_ref::<ports::Exhausted>() {
+                        Some(exhausted) => {
+                            let others = state
+                                .instances
+                                .iter()
+                                .filter(|(k, _)| *k != &key)
+                                .map(|(_, e)| e);
+                            anyhow::anyhow!(
+                                ports::Pressure::of(&exhausted.range, others)
+                                    .exhausted_message(&exhausted.range)
+                            )
+                        }
+                        None => error,
+                    }
+                })?,
                 services: BTreeMap::new(),
                 db_name: None,
                 db_resource: None,

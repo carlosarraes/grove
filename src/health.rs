@@ -25,6 +25,7 @@ pub fn check(cwd: &Path) -> Result<Vec<Verdict>> {
     let now = registry::now();
     let mut verdicts = listeners(&entries);
     verdicts.push(orphans(&entries));
+    verdicts.push(port_blocks(&entries));
     verdicts.push(disk(cwd, &entries));
     verdicts.push(idle(&entries, now)?);
     verdicts.extend(store_state(&entries)?);
@@ -352,6 +353,34 @@ fn orphans(entries: &[Entry]) -> Verdict {
             some_of(&gone)
         ),
         fix: "grove prune".to_string(),
+    }
+}
+
+/// Blocks the registry has promised away. Stopped instances keep theirs, so a machine
+/// that never removes worktrees fills the range with nothing running, and `up` then
+/// fails for everyone.
+fn port_blocks(entries: &[Entry]) -> Verdict {
+    let range = ports::range();
+    let pressure = ports::Pressure::of(&range, entries);
+    let what = format!(
+        "{} of {} port blocks reserved ({}%) in {range:?}: {}",
+        pressure.held(),
+        pressure.blocks,
+        pressure.percent(),
+        pressure.holders()
+    );
+    if pressure.held() >= usize::from(pressure.blocks) {
+        Verdict::Fail {
+            what: format!("{what} — grove up cannot allocate"),
+            fix: ports::CURE.to_string(),
+        }
+    } else if pressure.percent() >= 80 {
+        Verdict::Warn(format!(
+            "{what}; stopped instances keep their block — {}",
+            ports::CURE
+        ))
+    } else {
+        Verdict::Ok(what)
     }
 }
 

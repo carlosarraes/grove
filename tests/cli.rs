@@ -297,7 +297,6 @@ impl Cli {
         command
             .env("GROVE_MEMORY_FREE_PCT", "50")
             .env("GROVE_SWAP_USED_PCT", "0");
-        command.envs(envs.iter().copied());
         command
             .current_dir(cwd)
             .env("GROVE_STATE_DIR", self.state.path())
@@ -312,6 +311,7 @@ impl Cli {
                 .env("GROVE_DOCKER_INSPECT", &docker.inspect)
                 .env("GROVE_DOCKER_LOGS", self.state.path().join("docker.log"));
         }
+        command.envs(envs.iter().copied());
         command.args(args).assert()
     }
 }
@@ -5236,6 +5236,106 @@ fn health_is_quiet_on_a_clean_machine() {
     );
 
     cli.run(&wt, &["down"]).success();
+}
+
+/// A slice of this test's leased ports holding exactly `blocks` ten-port blocks.
+fn block_range(cli: &Cli, blocks: u16) -> String {
+    format!("{}-{}", cli.ports.start, cli.ports.start + blocks * 10)
+}
+
+/// Stopped instances keep their block, so the exhaustion error must name what actually
+/// releases one — not "stop instances", which frees nothing.
+#[test]
+fn port_block_exhaustion_names_prune_and_clean_and_prune_frees_a_block() {
+    let cli = Cli::new();
+    let range = block_range(&cli, 3);
+    let env = [("GROVE_PORT_RANGE", range.as_str())];
+
+    let orphaned = cli.worktree("feat_gone");
+    cli.run_env(&orphaned, &env, &["up"]).success();
+    cli.run_env(&orphaned, &env, &["down"]).success();
+    std::fs::remove_dir_all(&orphaned).expect("remove worktree");
+    let stopped = cli.worktree("feat_stopped");
+    cli.run_env(&stopped, &env, &["up"]).success();
+    cli.run_env(&stopped, &env, &["down"]).success();
+    let running = cli.worktree("feat_running");
+    cli.run_env(&running, &env, &["up"]).success();
+
+    let late = cli.worktree("feat_late");
+    let failed = cli.run_env(&late, &env, &["up"]).failure();
+    let stderr = String::from_utf8_lossy(&failed.get_output().stderr).into_owned();
+    assert!(stderr.contains("no free port block"), "{stderr}");
+    assert!(
+        stderr.contains("3 blocks, 3 held by grove (1 running, 1 stopped, 1 orphaned)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("stopped instances keep their block"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("grove prune"), "{stderr}");
+    assert!(stderr.contains("grove clean"), "{stderr}");
+    assert!(stderr.contains("GROVE_PORT_RANGE"), "{stderr}");
+    assert!(!stderr.contains("stop instances"), "{stderr}");
+
+    cli.run_env(&running, &env, &["prune"]).success();
+    cli.run_env(&late, &env, &["up"]).success();
+
+    cli.run_env(&late, &env, &["down"]).success();
+    cli.run_env(&running, &env, &["down"]).success();
+}
+
+/// Reserved blocks count whether or not anything is listening: a stopped instance holds
+/// its block exactly as a running one does.
+#[test]
+fn health_reports_port_block_pressure_at_its_thresholds() {
+    let cli = Cli::new();
+    let range = block_range(&cli, 5);
+    let env = [("GROVE_PORT_RANGE", range.as_str())];
+    let reserve = |slug: &str| {
+        let wt = cli.worktree(slug);
+        cli.run_env(&wt, &env, &["status"]);
+        wt
+    };
+    let health = |wt: &Path| {
+        let out = cli.run_env(wt, &env, &["health"]).get_output().clone();
+        let line = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::trim_start)
+            .find(|l| l.contains("port blocks"))
+            .unwrap_or_default()
+            .to_string();
+        (out.status.success(), line)
+    };
+
+    let first = reserve("feat_a");
+    let (ok, line) = health(&first);
+    assert!(ok, "{line}");
+    assert!(line.starts_with("ok"), "{line}");
+    assert!(line.contains("1 of 5 port blocks reserved (20%)"), "{line}");
+
+    for slug in ["feat_b", "feat_c", "feat_d"] {
+        reserve(slug);
+    }
+    let (ok, line) = health(&first);
+    assert!(ok, "a warning alone must not fail health: {line}");
+    assert!(line.starts_with("warn"), "{line}");
+    assert!(line.contains("4 of 5 port blocks reserved (80%)"), "{line}");
+    assert!(line.contains("grove clean"), "{line}");
+    assert!(line.contains("grove prune"), "{line}");
+
+    reserve("feat_e");
+    let (ok, line) = health(&first);
+    assert!(!ok, "a full range must fail health");
+    assert!(line.starts_with("FAIL"), "{line}");
+    assert!(
+        line.contains("5 of 5 port blocks reserved (100%)"),
+        "{line}"
+    );
+    let out = cli.run_env(&first, &env, &["health"]).get_output().clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("grove prune"), "{stdout}");
+    assert!(stdout.contains("grove clean"), "{stdout}");
 }
 
 #[test]

@@ -459,20 +459,7 @@ fn descendants(root: u32) -> Vec<u32> {
             Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
         })
         .collect();
-    let mut found = vec![root];
-    let mut index = 0;
-    while index < found.len() {
-        let parent = found[index];
-        found.extend(
-            pairs
-                .iter()
-                .filter(|(_, ppid)| *ppid == parent)
-                .map(|(pid, _)| *pid),
-        );
-        index += 1;
-    }
-    found.remove(0);
-    found
+    crate::top::descendants_of(&pairs, root)
 }
 
 /// Where grove keeps the registry and per-service logs. `GROVE_STATE_DIR` overrides

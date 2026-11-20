@@ -105,8 +105,8 @@ impl Machine {
     version,
     about,
     disable_help_subcommand = true,
-    after_help = "Worktree commands act on the worktree you run them in. `ls`, `health`, `prune` and \
-                  `clean` are machine-wide. `ls`, `status`, `doctor`, `down`, `gate`, `prune` and \
+    after_help = "Worktree commands act on the worktree you run them in. `ls`, `top`, `health`, `prune` \
+                  and `clean` are machine-wide. `ls`, `status`, `doctor`, `down`, `gate`, `prune` and \
                   `clean` accept instance names as `grove ls` shows them, or worktree paths: \
                   `grove status feature_branch`. `--worktree` is an alias for the positional \
                   target on `ls`, `status` and `gate`; it is repeatable on `prune` and `clean`."
@@ -300,6 +300,14 @@ enum Command {
     Doctor {
         /// Instance name as `grove ls` shows it, or a worktree path [default: the worktree you are in]
         name: Option<String>,
+    },
+    /// CPU and memory per running instance: services, tests, agents; read-only
+    Top {
+        /// Also stopped instances that still have test or agent processes
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
     },
     /// Everything on this machine that is costing someone, and what ends it
     Health {
@@ -1077,6 +1085,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Command::TestContainers { remove_stale }) => grove::test_containers::run(remove_stale),
+        Some(Command::Top { all, json }) => grove::top::run(all, json),
         Some(Command::Health { json }) => {
             let verdicts = grove::health::check(&cwd)?;
             let healthy = if json {

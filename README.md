@@ -173,6 +173,7 @@ repo's own fixture or settings constructor.
 | `status [NAME] [--worktree NAME\|PATH] [--json]` | ports, pids, and whether each service's `ready.http` answers — plus a warning if a service predates your last edit |
 | `ls [--json]` | every instance on the machine, most neglected first, with its owner, how long since its last grove command, the machine's load and what each holds on disk |
 | `test-containers [--remove-stale]` | report stale Mongo testcontainers; recheck and remove only with the explicit flag |
+| `top [--all] [--json]` | CPU and memory per running instance — each service's process group, plus tests, agents and other processes running in its worktree — with uptime, last grove command, owner and branch; the footer names load and the heaviest programs outside every worktree. Read-only; `--all` adds stopped instances that still have tests or agents running |
 | `health [--json]` | everything on the machine that is costing someone — stray listeners, orphans, port-block pressure, idle instances, disk — each with the command that ends it |
 | `run -- <cmd>` | run a command with this instance's environment overlaid |
 | `logs [service] [--since-restart] [-n N]` | what a service printed |

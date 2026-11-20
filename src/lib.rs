@@ -20,6 +20,7 @@ pub mod skill;
 pub mod store;
 pub mod supervise;
 mod timing;
+pub mod top;
 
 pub mod test_containers;
 

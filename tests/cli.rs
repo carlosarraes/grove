@@ -9878,3 +9878,119 @@ fn clean_removes_an_old_unregistered_worktree_with_default_age_guard() {
     .stdout(predicates::str::contains("removed, freed"));
     assert!(!tree.exists());
 }
+
+#[test]
+fn help_lists_top_as_machine_wide() {
+    let out = Command::cargo_bin("grove")
+        .expect("binary")
+        .arg("--help")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&out);
+    assert!(stdout.contains("`ls`, `top`, `health`"), "{stdout}");
+    assert!(stdout.contains("top "), "{stdout}");
+}
+
+/// `top` reads the registry it is pointed at and the `ps` listing it is handed, and
+/// changes neither.
+#[test]
+fn top_json_attributes_a_fixture_listing_without_writing_the_registry() {
+    let state = TempDir::new().expect("tempdir");
+    let worktree = state.path().join("wt/busy");
+    let registry = serde_json::json!({
+        "instances": {
+            worktree.to_str().unwrap(): {
+                "worktree": worktree,
+                "slug": "busy",
+                "ports": {"backend": 41000},
+                "services": {"backend": {"pid": 100, "started_at": grove::registry::now() - 120}},
+                "last_used": grove::registry::now() - 600,
+                "started_by": "herdr pane 3"
+            },
+            "/nowhere/stopped": {
+                "worktree": "/nowhere/stopped",
+                "slug": "stopped",
+                "ports": {},
+                "services": {},
+                "last_used": 1
+            }
+        }
+    });
+    let text = serde_json::to_string_pretty(&registry).unwrap();
+    std::fs::write(state.path().join("registry.json"), &text).unwrap();
+    let wt = worktree.display();
+    let fixture = state.path().join("ps.txt");
+    std::fs::write(
+        &fixture,
+        format!(
+            "  100     1   100 12.0 100000 sh -c uvicorn\n  101   100   100 30.0 200000 python -m uvicorn\n  \
+             400     1   400 80.0 400000 node {wt}/node_modules/vitest/vitest.mjs\n  \
+             900     1   900 200.0 900000 /opt/google/chrome/chrome\n  \
+             901   900   900 50.0 100000 /opt/google/chrome/chrome --type=renderer\n  \
+             950     1   950 1.0 600000 claude\n"
+        ),
+    )
+    .unwrap();
+
+    let out = Command::cargo_bin("grove")
+        .expect("binary")
+        .env("GROVE_STATE_DIR", state.path())
+        .env("GROVE_PS_FIXTURE", &fixture)
+        .env("GROVE_LOAD", "30.5")
+        .env("GROVE_CORES", "18")
+        .args(["top", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let parsed: serde_json::Value = serde_json::from_slice(&out).expect("json");
+
+    assert_eq!(parsed["load"], 30.5);
+    assert_eq!(parsed["cores"], 18);
+    let instances = parsed["instances"].as_array().expect("instances");
+    assert_eq!(instances.len(), 1, "running only: {parsed}");
+    let busy = &instances[0];
+    assert_eq!(busy["slug"], "busy");
+    assert_eq!(busy["cpu"], 122.0);
+    assert_eq!(busy["services"][0]["name"], "backend");
+    assert_eq!(busy["services"][0]["cpu"], 42.0);
+    assert_eq!(busy["tests"]["cpu"], 80.0);
+    assert_eq!(busy["started_by"], "herdr pane 3");
+    let outside: Vec<&str> = parsed["outside_worktrees"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(outside, ["chrome", "claude"], "{parsed}");
+    assert_eq!(parsed["outside_worktrees"][0]["cpu"], 250.0);
+
+    let table = Command::cargo_bin("grove")
+        .expect("binary")
+        .env("GROVE_STATE_DIR", state.path())
+        .env("GROVE_PS_FIXTURE", &fixture)
+        .env("GROVE_LOAD", "30.5")
+        .env("GROVE_CORES", "18")
+        .arg("top")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let table = String::from_utf8_lossy(&table);
+    assert!(table.contains("backend 42%"), "{table}");
+    assert!(table.contains("10m ago"), "last grove command: {table}");
+    assert!(
+        table.contains("load 30.5 on 18 cores; outside worktrees: chrome 250%"),
+        "{table}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(state.path().join("registry.json")).unwrap(),
+        text,
+        "top is read-only"
+    );
+}

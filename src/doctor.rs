@@ -10,6 +10,7 @@ use crate::instance::Instance;
 use crate::resource;
 use crate::resource::{NOFILE_LIMIT, Observation};
 
+#[derive(Debug)]
 pub enum Verdict {
     Ok(String),
     Warn(String),

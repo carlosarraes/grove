@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::doctor::Verdict;
 use crate::footprint::human_size;
@@ -30,6 +30,10 @@ pub fn check(cwd: &Path) -> Result<Vec<Verdict>> {
     verdicts.push(idle(&entries, now)?);
     verdicts.extend(store_state(&entries)?);
     verdicts.extend(unmanaged(cwd, &entries));
+    verdicts.extend(git_maintenance(
+        &git_common_dirs(&entries),
+        SystemTime::now(),
+    ));
     verdicts.push(memory());
     verdicts.push(machine(&entries));
     verdicts.extend(
@@ -525,6 +529,136 @@ fn unmanaged(cwd: &Path, entries: &[Entry]) -> Option<Verdict> {
     })
 }
 
+/// A git lock older than this was left by a process that died: git holds these for
+/// seconds, and maintenance for minutes at most.
+const STALE_LOCK: Duration = Duration::from_secs(24 * 3600);
+
+/// Locks that, once orphaned, stop git maintenance or every ref update in the repo.
+const GIT_LOCKS: [&str; 3] = ["objects/maintenance.lock", "packed-refs.lock", "index.lock"];
+
+/// The shared git dir behind each registered instance, once per repo. Instances are
+/// grouped by the repo their `instance_dir` names before git is asked, so a repo with
+/// hundreds of worktrees costs one `git rev-parse`, not hundreds.
+fn git_common_dirs(entries: &[Entry]) -> Vec<PathBuf> {
+    let mut repos: BTreeMap<&Path, Vec<&Path>> = BTreeMap::new();
+    for entry in entries {
+        let repo = entry
+            .instance_dir
+            .as_deref()
+            .and_then(Path::parent)
+            .unwrap_or(&entry.worktree);
+        repos.entry(repo).or_default().push(&entry.worktree);
+    }
+    let mut commons: Vec<PathBuf> = repos
+        .values()
+        .filter_map(|worktrees| worktrees.iter().find_map(|w| git_common_dir(w)))
+        .collect();
+    commons.sort();
+    commons.dedup();
+    commons
+}
+
+fn git_common_dir(worktree: &Path) -> Option<PathBuf> {
+    if !worktree.is_dir() {
+        return None;
+    }
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let common = String::from_utf8(out.stdout).ok()?;
+    Some(PathBuf::from(common.trim()))
+}
+
+/// The command that repairs a repo whose maintenance stalled, addressed the way a reader
+/// would type it: from the main worktree, or by git dir for a bare repo.
+fn maintenance_fix(common: &Path) -> String {
+    let target = match common.parent() {
+        Some(repo) if common.file_name().is_some_and(|n| n == ".git") => {
+            format!("-C {}", repo.display())
+        }
+        _ => format!("--git-dir={}", common.display()),
+    };
+    format!("git {target} maintenance run --task=loose-objects --task=incremental-repack")
+}
+
+/// Locks under `common` older than [`STALE_LOCK`] at `now`. A lock left by a crashed
+/// `git maintenance` silently skips every later run, and nothing else in git says so:
+/// the repo just slows until fetches time out and ref updates fail.
+fn stale_git_locks(common: &Path, now: SystemTime) -> Vec<Verdict> {
+    GIT_LOCKS
+        .iter()
+        .filter_map(|lock| {
+            let path = common.join(lock);
+            let modified = std::fs::symlink_metadata(&path).ok()?.modified().ok()?;
+            let age = now.duration_since(modified).ok()?;
+            (age > STALE_LOCK).then(|| {
+                Verdict::Warn(format!(
+                    "stale git lock {} ({} old), git maintenance and ref updates are blocked behind it; fix: rm {}, then {}",
+                    path.display(),
+                    human_age(age.as_secs()),
+                    path.display(),
+                    maintenance_fix(common)
+                ))
+            })
+        })
+        .collect()
+}
+
+/// Loose objects and packs from `git count-objects -v`.
+fn parse_count_objects(text: &str) -> Option<(u64, u64)> {
+    let field = |name: &str| {
+        text.lines().find_map(|l| {
+            l.strip_prefix(name)?
+                .strip_prefix(": ")?
+                .trim()
+                .parse()
+                .ok()
+        })
+    };
+    Some((field("count")?, field("packs")?))
+}
+
+/// Loose objects and packs past what a maintained repo ever holds: the symptom of a
+/// maintenance that stopped for some reason other than a lock.
+fn stalled_maintenance(common: &Path, loose: u64, packs: u64) -> Option<Verdict> {
+    (loose > 50_000 || packs > 100).then(|| {
+        Verdict::Warn(format!(
+            "git maintenance looks stalled in {}: {loose} loose objects, {packs} packs; fix: {}",
+            common.display(),
+            maintenance_fix(common)
+        ))
+    })
+}
+
+fn git_maintenance(commons: &[PathBuf], now: SystemTime) -> Vec<Verdict> {
+    let mut verdicts: Vec<Verdict> = Vec::new();
+    for common in commons {
+        verdicts.extend(stale_git_locks(common, now));
+        let counted = Command::new("git")
+            .arg(format!("--git-dir={}", common.display()))
+            .args(["count-objects", "-v"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| parse_count_objects(&String::from_utf8_lossy(&o.stdout)));
+        if let Some((loose, packs)) = counted {
+            verdicts.extend(stalled_maintenance(common, loose, packs));
+        }
+    }
+    if verdicts.is_empty() && !commons.is_empty() {
+        verdicts.push(Verdict::Ok(format!(
+            "no stale git locks or stalled maintenance across {} repo{}",
+            commons.len(),
+            if commons.len() == 1 { "" } else { "s" }
+        )));
+    }
+    verdicts
+}
+
 /// Memory availability and swap usage, with the kernel pressure level on macOS.
 pub struct Memory {
     pub free_percent: u64,
@@ -918,5 +1052,169 @@ mod tests {
             running_owner_line("rbp_warm_2", Path::new("/tmp/rbp-warm-2"), None),
             "rbp_warm_2 running, unknown owner (started before grove 0.1.51 or outside herdr); worktree /tmp/rbp-warm-2; find out: grove status rbp_warm_2 lists its pids, ps -o pid,ppid,command -p <pid> shows who launched them"
         );
+    }
+}
+
+#[cfg(test)]
+mod git_maintenance_tests {
+    use super::{
+        git_common_dirs, git_maintenance, parse_count_objects, stale_git_locks, stalled_maintenance,
+    };
+    use crate::doctor::Verdict;
+    use crate::registry::Entry;
+    use std::path::Path;
+    use std::process::Command;
+    use std::time::{Duration, SystemTime};
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(status.status.success(), "git {args:?}: {status:?}");
+    }
+
+    fn repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        dir
+    }
+
+    /// Writes `common/<lock>` and backdates it by `age` with std's `File::set_modified`.
+    fn lock(common: &Path, lock: &str, age: Duration) -> std::path::PathBuf {
+        let path = common.join(lock);
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_modified(SystemTime::now() - age).unwrap();
+        path
+    }
+
+    fn entry(worktree: &Path, instance_dir: Option<&Path>) -> Entry {
+        serde_json::from_value(serde_json::json!({
+            "worktree": worktree,
+            "slug": "x",
+            "ports": {},
+            "instance_dir": instance_dir,
+        }))
+        .unwrap()
+    }
+
+    fn warnings(verdicts: &[Verdict]) -> Vec<&str> {
+        verdicts
+            .iter()
+            .filter_map(|v| match v {
+                Verdict::Warn(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const DAY: Duration = Duration::from_secs(24 * 3600);
+
+    #[test]
+    fn no_lock_is_healthy() {
+        let repo = repo();
+        let common = repo.path().join(".git");
+        assert!(stale_git_locks(&common, SystemTime::now()).is_empty());
+        let verdicts = git_maintenance(&[common], SystemTime::now());
+        assert!(
+            matches!(verdicts.as_slice(), [Verdict::Ok(text)] if text.contains("no stale git locks")),
+            "{verdicts:?}"
+        );
+    }
+
+    #[test]
+    fn a_fresh_lock_is_a_running_maintenance_not_a_finding() {
+        let repo = repo();
+        let common = repo.path().join(".git");
+        lock(
+            &common,
+            "objects/maintenance.lock",
+            Duration::from_secs(600),
+        );
+        assert!(stale_git_locks(&common, SystemTime::now()).is_empty());
+    }
+
+    #[test]
+    fn a_lock_older_than_a_day_names_its_path_age_and_fix() {
+        let repo = repo();
+        let common = repo.path().join(".git");
+        let path = lock(&common, "objects/maintenance.lock", 23 * DAY);
+        let verdicts = stale_git_locks(&common, SystemTime::now());
+        let [text] = warnings(&verdicts)[..] else {
+            panic!("{verdicts:?}")
+        };
+        assert!(text.contains(&path.display().to_string()), "{text}");
+        assert!(text.contains("(23d old)"), "{text}");
+        assert!(text.contains(&format!("rm {}", path.display())), "{text}");
+        assert!(
+            text.contains(&format!(
+                "git -C {} maintenance run --task=loose-objects --task=incremental-repack",
+                repo.path().display()
+            )),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn stale_ref_and_index_locks_are_flagged_too() {
+        let repo = repo();
+        let common = repo.path().join(".git");
+        lock(&common, "packed-refs.lock", 2 * DAY);
+        lock(&common, "index.lock", 2 * DAY);
+        let verdicts = stale_git_locks(&common, SystemTime::now());
+        let found = warnings(&verdicts);
+        assert_eq!(found.len(), 2, "{verdicts:?}");
+        assert!(found[0].contains("packed-refs.lock") && found[1].contains("index.lock"));
+    }
+
+    #[test]
+    fn worktrees_of_one_repo_share_one_common_dir_and_missing_ones_are_skipped() {
+        let repo = repo();
+        git(
+            repo.path(),
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "i",
+            ],
+        );
+        let linked = repo.path().join("linked");
+        git(
+            repo.path(),
+            &["worktree", "add", "-q", linked.to_str().unwrap()],
+        );
+        let state = tempfile::tempdir().unwrap();
+        let instance = state.path().join("repo-key");
+        let gone = state.path().join("gone-worktree");
+        let entries = [
+            entry(&gone, Some(&instance.join("gone"))),
+            entry(&linked, Some(&instance.join("linked"))),
+            entry(repo.path(), None),
+            entry(&state.path().join("also-gone"), None),
+        ];
+        let commons = git_common_dirs(&entries);
+        let expected = repo.path().canonicalize().unwrap().join(".git");
+        assert_eq!(commons, vec![expected]);
+    }
+
+    #[test]
+    fn count_objects_past_the_thresholds_reads_as_stalled() {
+        let text = "count: 165000\nsize: 1\nin-pack: 9\npacks: 283\nsize-pack: 1\nprune-packable: 0\ngarbage: 0\nsize-garbage: 0\n";
+        assert_eq!(parse_count_objects(text), Some((165_000, 283)));
+        let common = Path::new("/r/.git");
+        let stalled = stalled_maintenance(common, 165_000, 283).expect("stalled");
+        assert!(
+            matches!(&stalled, Verdict::Warn(t) if t.starts_with("git maintenance looks stalled") && t.contains("git -C /r maintenance run")),
+            "{stalled:?}"
+        );
+        assert!(stalled_maintenance(common, 50_000, 100).is_none());
     }
 }

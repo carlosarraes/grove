@@ -451,9 +451,14 @@ impl Activity {
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]
 pub struct Usage {
+    #[serde(serialize_with = "one_decimal")]
     pub cpu: f64,
     pub rss_bytes: u64,
     pub processes: usize,
+}
+
+fn one_decimal<S: serde::Serializer>(value: &f64, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_f64((value * 10.0).round() / 10.0)
 }
 
 impl Usage {
@@ -485,6 +490,7 @@ pub struct Row {
     pub slug: String,
     pub worktree: PathBuf,
     pub running: bool,
+    #[serde(serialize_with = "one_decimal")]
     pub cpu: f64,
     pub rss_bytes: u64,
     /// Live services only.

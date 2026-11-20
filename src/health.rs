@@ -27,7 +27,11 @@ pub fn check(cwd: &Path) -> Result<Vec<Verdict>> {
     verdicts.push(orphans(&entries));
     verdicts.push(port_blocks(&entries));
     verdicts.push(disk(cwd, &entries));
-    verdicts.push(idle(&entries, now)?);
+    verdicts.push(idle(
+        &entries,
+        now,
+        &crate::top::Activity::sample(&entries),
+    )?);
     verdicts.extend(store_state(&entries)?);
     verdicts.extend(unmanaged(cwd, &entries));
     verdicts.extend(git_maintenance(
@@ -446,12 +450,12 @@ fn df(path: &Path) -> Option<(u64, u64)> {
     Some((total * 1024, free * 1024))
 }
 
-fn idle(entries: &[Entry], now: u64) -> Result<Verdict> {
+fn idle(entries: &[Entry], now: u64, activity: &crate::top::Activity) -> Result<Verdict> {
     let window = crate::instance::parse_duration(IDLE_WINDOW)?.as_secs();
     let mut stale: Vec<(String, u64)> = entries
         .iter()
         .filter(|e| e.is_running())
-        .filter_map(|e| Some((e.slug.clone(), e.idle_seconds(now)?)))
+        .filter_map(|e| Some((e.slug.clone(), e.effective_idle(now, activity)?)))
         .filter(|(_, age)| *age >= window)
         .collect();
     stale.sort_by_key(|(_, age)| std::cmp::Reverse(*age));

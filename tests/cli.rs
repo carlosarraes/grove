@@ -9994,3 +9994,59 @@ fn top_json_attributes_a_fixture_listing_without_writing_the_registry() {
         "top is read-only"
     );
 }
+
+/// A stack whose last grove command was hours ago but which has vitest running in its
+/// worktree is in use: `ls` says so, and neither `down --idle` nor the sweep stops it.
+#[test]
+fn tests_running_in_a_worktree_keep_its_instance_from_counting_as_idle() {
+    let cli = Cli::new();
+    let here = cli.worktree("where_i_am_working");
+    let testing = cli.worktree("running_vitest");
+    cli.run(&here, &["up"]).success();
+    cli.run(&testing, &["up"]).success();
+    backdate(&cli, &testing, 3 * 3600);
+
+    // A real process whose argv names the worktree, as a vitest worker's does.
+    let bin = testing.join("node_modules/.bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+        .into_iter()
+        .find(|p| Path::new(p).exists())
+        .expect("sleep");
+    std::fs::copy(sleep, bin.join("vitest")).unwrap();
+    let mut vitest = std::process::Command::new(bin.join("vitest"))
+        .arg("60")
+        .spawn()
+        .expect("spawn vitest stand-in");
+
+    let out = cli
+        .run(&here, &["down", "--idle", "2h", "--dry-run"])
+        .success();
+    let swept = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    let out = cli.run(&here, &["ls"]).success();
+    let listed = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    let row = listed
+        .lines()
+        .find(|l| l.starts_with("running_vitest"))
+        .unwrap_or_default()
+        .to_string();
+
+    let _ = vitest.kill();
+    let _ = vitest.wait();
+
+    assert!(
+        !swept.contains("running_vitest"),
+        "tests are running there: {swept}"
+    );
+    assert!(row.contains("active"), "{listed}");
+
+    // Only the stand-in was protecting it.
+    let out = cli
+        .run(&here, &["down", "--idle", "2h", "--dry-run"])
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(stdout.contains("would stop running_vitest"), "{stdout}");
+
+    cli.run(&here, &["down"]).success();
+    cli.run(&testing, &["down"]).success();
+}

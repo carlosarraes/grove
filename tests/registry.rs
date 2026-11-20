@@ -414,7 +414,11 @@ fn an_idle_snapshot_cannot_stop_a_resumed_instance() {
     h.registry.touch(&resolved.worktree).expect("resume");
     let stopped = h
         .registry
-        .stop_if_idle(&entry, std::time::Duration::from_secs(3600))
+        .stop_if_idle(
+            &entry,
+            std::time::Duration::from_secs(3600),
+            &grove::top::Activity::default(),
+        )
         .expect("sweep");
     let alive = grove::supervise::is_alive(&handle);
     let recorded = h
@@ -426,4 +430,46 @@ fn an_idle_snapshot_cannot_stop_a_resumed_instance() {
     assert!(!stopped, "a stale candidate stopped a resumed instance");
     assert!(alive, "the resumed service died");
     assert_eq!(recorded.services.get("web"), Some(&handle));
+}
+
+/// The recheck under the lock judges by the same activity the caller sampled before it:
+/// a stale clock does not stop an instance with tests running in its worktree.
+#[test]
+fn stop_if_idle_spares_an_instance_with_tests_running() {
+    let h = Harness::new();
+    let resolved = h.resolved("testing");
+    let mut entry = h.registry.reserve(&resolved, &names()).expect("reserve");
+    let handle = grove::supervise::spawn(
+        "exec sleep 60",
+        &resolved.worktree,
+        &Default::default(),
+        &h._state.path().join("service.log"),
+    )
+    .expect("spawn");
+    entry.services.insert("web".into(), handle);
+    entry.last_used = Some(grove::registry::now() - 7200);
+    h.registry.record(&entry).expect("record");
+
+    let listing = format!(
+        "  9000 1 9000 80.0 1000 node {}/node_modules/vitest/vitest.mjs\n",
+        resolved.worktree.display()
+    );
+    let activity = grove::top::Activity::from_snapshot(
+        &grove::top::Snapshot::from_ps(&listing),
+        std::slice::from_ref(&entry),
+    );
+    let window = std::time::Duration::from_secs(3600);
+    let spared = !h
+        .registry
+        .stop_if_idle(&entry, window, &activity)
+        .expect("sweep");
+    let alive = grove::supervise::is_alive(&handle);
+    let stopped = h
+        .registry
+        .stop_if_idle(&entry, window, &grove::top::Activity::default())
+        .expect("sweep");
+    grove::supervise::stop(&handle).expect("cleanup");
+
+    assert!(spared && alive, "vitest was running in the worktree");
+    assert!(stopped, "without it the instance is idle");
 }

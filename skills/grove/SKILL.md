@@ -136,8 +136,9 @@ window before starting, so the running set never outgrows what someone touched r
 has been deleted.)
 
 **Read the list before sweeping when other agents share the machine.** grove counts an
-instance as busy while its services are still writing to their logs, which covers an agent
-driving a browser through a long QA pass. A box that is quiet for some other reason — a
+instance as busy while tests or an agent run in its worktree, but not while only its own
+services do, so an agent driving a browser from elsewhere through a long QA pass looks
+idle. A box that is quiet for some other reason — a
 review paused mid-read, a session waiting on a human — looks exactly like an abandoned
 one. `--dry-run` names every casualty, generous windows cost little, and where you cannot
 tell whose instance is whose, `grove down` in each worktree you own is the certain move.

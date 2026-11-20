@@ -29,19 +29,27 @@ struct Machine {
 /// `exclude` is the worktree the caller is standing in, which `down --idle` will not stop
 /// and so must not be offered.
 fn survey(exclude: Option<&Path>) -> Result<Machine> {
-    let now = grove::registry::now();
-    let window = grove::instance::parse_duration(IDLE_WINDOW)?.as_secs();
-
     let running: Vec<Entry> = grove::instance::registry()?
         .list()?
         .into_iter()
         .filter(Entry::is_running)
         .collect();
+    let activity = grove::top::Activity::sample(&running);
+    survey_of(running, exclude, &activity)
+}
+
+fn survey_of(
+    running: Vec<Entry>,
+    exclude: Option<&Path>,
+    activity: &grove::top::Activity,
+) -> Result<Machine> {
+    let now = grove::registry::now();
+    let window = grove::instance::parse_duration(IDLE_WINDOW)?.as_secs();
 
     let mut idle: Vec<(String, u64)> = running
         .iter()
         .filter(|e| exclude.is_none_or(|w| e.worktree != w))
-        .filter_map(|e| Some((e.slug.clone(), e.idle_seconds(now)?)))
+        .filter_map(|e| Some((e.slug.clone(), e.effective_idle(now, activity)?)))
         .filter(|(_, age)| *age >= window)
         .collect();
     idle.sort_by_key(|(_, age)| std::cmp::Reverse(*age));
@@ -614,6 +622,9 @@ fn main() -> Result<()> {
                 }
             }
             let now = grove::registry::now();
+            // Sampled once against the whole registry, so the rows, the sort and the
+            // footer agree on who is working.
+            let activity = grove::top::Activity::sample(&registry.list()?);
 
             // Most neglected first. Eighteen rows with the stale ones scattered through
             // them is how a pile-up goes unnoticed; the reclaim candidates belong on top.
@@ -622,17 +633,22 @@ fn main() -> Result<()> {
                 let key = |e: &grove::registry::Entry| {
                     (
                         std::cmp::Reverse(e.is_running()),
-                        std::cmp::Reverse(e.idle_seconds(now).unwrap_or(0)),
+                        std::cmp::Reverse(e.effective_idle(now, &activity).unwrap_or(0)),
                     )
                 };
                 key(a).cmp(&key(b)).then_with(|| a.slug.cmp(&b.slug))
             });
 
-            let machine = survey(None)?;
+            let running: Vec<Entry> = registry
+                .list()?
+                .into_iter()
+                .filter(Entry::is_running)
+                .collect();
+            let machine = survey_of(running, None, &activity)?;
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&ls_json(&entries, now, &machine))?
+                    serde_json::to_string_pretty(&ls_json(&entries, now, &machine, &activity))?
                 );
                 return Ok(());
             }
@@ -699,6 +715,7 @@ fn main() -> Result<()> {
                 // Only for what is running: how long a stopped instance has been stopped
                 // is not a question anyone is asking here.
                 let idle = match entry.idle_seconds(now).filter(|_| live > 0) {
+                    _ if live > 0 && activity.is_busy(&entry.worktree) => "active".to_string(),
                     Some(age) => format!("idle {}", human_age(age)),
                     None => String::new(),
                 };
@@ -1264,6 +1281,7 @@ fn idle_candidates<'a>(
     window: Option<std::time::Duration>,
     now: u64,
     repo: Option<&Path>,
+    activity: &grove::top::Activity,
 ) -> Vec<(&'a Entry, u64)> {
     let mut doomed: Vec<(&Entry, u64)> = running
         .iter()
@@ -1271,8 +1289,8 @@ fn idle_candidates<'a>(
         .filter(|e| {
             repo.is_none_or(|repo| e.instance_dir.as_deref().and_then(Path::parent) == Some(repo))
         })
-        .filter_map(|e| match (window, e.idle_seconds(now)) {
-            (None, age) => Some((e, age.unwrap_or(0))),
+        .filter_map(|e| match (window, e.effective_idle(now, activity)) {
+            (None, _) => Some((e, e.idle_seconds(now).unwrap_or(0))),
             (Some(w), Some(age)) if age >= w.as_secs() => Some((e, age)),
             // No evidence either way is not evidence of neglect.
             (Some(_), _) => None,
@@ -1307,15 +1325,19 @@ fn enforce_idle(instance: &Instance) -> Result<()> {
     else {
         return Ok(());
     };
+    // Before any lock: `stop_if_idle` rechecks under the registry lock, where running
+    // `ps` would hold up every other grove command.
+    let activity = grove::top::Activity::sample(&running);
     let doomed = idle_candidates(
         &running,
         &instance.resolved.worktree,
         Some(window),
         now,
         Some(repo),
+        &activity,
     );
     for (entry, age) in doomed {
-        if !registry.stop_if_idle(entry, window)? {
+        if !registry.stop_if_idle(entry, window, &activity)? {
             continue;
         }
         eprintln!(
@@ -1342,7 +1364,8 @@ fn sweep(here: &Path, idle: Option<&str>, dry_run: bool) -> Result<()> {
         .into_iter()
         .filter(Entry::is_running)
         .collect();
-    let doomed = idle_candidates(&running, here, window, now, None);
+    let activity = grove::top::Activity::sample(&running);
+    let doomed = idle_candidates(&running, here, window, now, None, &activity);
 
     if doomed.is_empty() {
         println!("nothing to stop — {} running", running.len());
@@ -1473,7 +1496,12 @@ fn last_up(entry: &Entry) -> Option<grove::last_up::LastUp> {
     entry.instance_dir.as_deref().and_then(grove::last_up::read)
 }
 
-fn ls_json(entries: &[Entry], now: u64, machine: &Machine) -> serde_json::Value {
+fn ls_json(
+    entries: &[Entry],
+    now: u64,
+    machine: &Machine,
+    activity: &grove::top::Activity,
+) -> serde_json::Value {
     let instances: Vec<serde_json::Value> = entries
         .iter()
         .map(|e| {
@@ -1483,6 +1511,7 @@ fn ls_json(entries: &[Entry], now: u64, machine: &Machine) -> serde_json::Value 
                 "running": e.is_running(),
                 "orphaned": e.is_orphaned(),
                 "idle_seconds": e.idle_seconds(now),
+                "active": activity.is_busy(&e.worktree),
                 "exposed": e.exposure.is_exposed(),
                 "public_host": e.exposure.public_host(),
                 "ports": e.ports,

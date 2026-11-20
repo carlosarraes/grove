@@ -198,7 +198,9 @@ Linux scans process working directories and file descriptors once; macOS uses on
 An instance is idle when no grove command (`up`, `run`, `logs`, `restart`, `seed`) has run in its
 worktree for a while. Service logs do not count: a backend that logs health checks every few
 seconds would otherwise look busy forever. `status` and `ls` only read, so they do not reset the
-clock either.
+clock either. Tests (pytest, vitest, jest, tsc, Playwright) or agents (claude, codex) running in
+the worktree do count, without moving the clock: while they run, `ls` shows the instance as
+`active`, and neither `health`, `down --idle` nor the sweep below treats it as idle.
 
 Every `grove up` and `grove run` stops the other instances of the same repo that have been idle
 for longer than `[idle] stop_after`, which is `4h` when the section is absent. Stopping keeps ports,

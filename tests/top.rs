@@ -2,7 +2,7 @@
 
 use grove::registry::Entry;
 use grove::supervise::Handle;
-use grove::top::{Class, Cwds, Snapshot, classify, parse_ps, report};
+use grove::top::{Activity, Class, Cwds, Snapshot, classify, parse_ps, report};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
@@ -222,4 +222,41 @@ fn classify_by_argv() {
     ] {
         assert_eq!(classify(command), class, "{command}");
     }
+}
+
+#[test]
+fn tests_or_agents_in_a_worktree_mean_it_is_not_idle() {
+    let activity = Activity::from_snapshot(&snapshot(), &entries());
+    let all = entries();
+    let busy = &all[0];
+    assert_eq!(
+        busy.idle_seconds(NOW),
+        Some(600),
+        "the clock itself is untouched"
+    );
+    assert_eq!(
+        busy.effective_idle(NOW, &activity),
+        None,
+        "vitest is running here"
+    );
+    assert_eq!(
+        all[2].effective_idle(NOW, &activity),
+        None,
+        "pytest is running here"
+    );
+    assert_eq!(
+        all[3].effective_idle(NOW, &activity),
+        None,
+        "an agent is here"
+    );
+}
+
+#[test]
+fn service_processes_alone_do_not_make_a_stack_active() {
+    // `reaped` runs only its services, and a shell sits in `silent`.
+    let mut all = entries();
+    all[1].last_used = Some(NOW - 5 * 3600);
+    let activity = Activity::from_snapshot(&snapshot(), &all);
+    assert_eq!(all[1].effective_idle(NOW, &activity), Some(5 * 3600));
+    assert_eq!(all[4].effective_idle(NOW, &activity), Some(9 * 3600));
 }

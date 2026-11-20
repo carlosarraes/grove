@@ -80,6 +80,17 @@ impl Entry {
         Some(now.saturating_sub(self.last_used?))
     }
 
+    /// The idle age every sweep and report judges by: [`Entry::idle_seconds`], except
+    /// that live tests or agents in the worktree mean someone is working here (None).
+    /// Observed, never persisted: looking must not move the clock.
+    pub fn effective_idle(&self, now: u64, activity: &crate::top::Activity) -> Option<u64> {
+        if activity.is_busy(&self.worktree) {
+            None
+        } else {
+            self.idle_seconds(now)
+        }
+    }
+
     /// Any service still answering. A recorded pid says only that something started once.
     pub fn is_running(&self) -> bool {
         self.services.values().any(crate::supervise::is_alive)
@@ -268,14 +279,21 @@ impl Registry {
 
     /// Recheck and stop under the registry lock so a concurrent touch or restart
     /// cannot replace activity or service handles between the decision and the stop.
-    pub fn stop_if_idle(&self, candidate: &Entry, window: std::time::Duration) -> Result<bool> {
+    /// `activity` is sampled by the caller before this takes the lock: `ps` is too slow
+    /// to run while every other grove command waits.
+    pub fn stop_if_idle(
+        &self,
+        candidate: &Entry,
+        window: std::time::Duration,
+        activity: &crate::top::Activity,
+    ) -> Result<bool> {
         self.with_lock(|state| {
             let Some(entry) = state.instances.get_mut(&key(&candidate.worktree)) else {
                 return Ok(false);
             };
             if entry.services != candidate.services
                 || entry
-                    .idle_seconds(now())
+                    .effective_idle(now(), activity)
                     .is_none_or(|age| age < window.as_secs())
             {
                 return Ok(false);

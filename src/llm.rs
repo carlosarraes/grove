@@ -307,6 +307,10 @@ HEAD reached GitHub. Detached HEAD uses branches containing HEAD. PR lookup fail
 closed. Linux scans /proc once; macOS needs lsof. Apply rechecks usage and status.
 It reports unique private blocks and releases registered instances after removal.
 `grove prune` instead stops and forgets orphaned instances whose worktree is gone or no longer a git worktree.
+`grove release [NAME...] | --stopped [--min-age 1h] [--yes]` frees the port blocks of stopped
+instances and keeps their worktree, env files and database; dry run by default, refuses running
+ones; the next `up` there allocates a new block. An `up` that finds the range full takes the
+block of the stopped instance idle longest (over 1h) by itself and says which.
 
 `grove free <branch>` detaches clean, idle, unlocked worktrees holding a branch (keeping folder and
 branch) so git can check it out elsewhere: `grove free feature/x && git worktree add ../x feature/x`.

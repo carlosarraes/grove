@@ -33,6 +33,7 @@ fn entry(slug: &str, services: &[(&str, u32)], last_used_ago: u64) -> Entry {
         disk_bytes: None,
         started_by: Some("herdr pane 7".into()),
         cache_keys: BTreeMap::new(),
+        released: false,
     }
 }
 

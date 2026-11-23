@@ -5270,9 +5270,10 @@ fn port_block_exhaustion_names_prune_and_clean_and_prune_frees_a_block() {
         "{stderr}"
     );
     assert!(
-        stderr.contains("stopped instances keep their block"),
+        stderr.contains("no stopped instance has been idle long enough"),
         "{stderr}"
     );
+    assert!(stderr.contains("grove release --stopped"), "{stderr}");
     assert!(stderr.contains("grove prune"), "{stderr}");
     assert!(stderr.contains("grove clean"), "{stderr}");
     assert!(stderr.contains("GROVE_PORT_RANGE"), "{stderr}");
@@ -5283,6 +5284,211 @@ fn port_block_exhaustion_names_prune_and_clean_and_prune_frees_a_block() {
 
     cli.run_env(&late, &env, &["down"]).success();
     cli.run_env(&running, &env, &["down"]).success();
+}
+
+fn web_port(cli: &Cli, worktree: &Path) -> Option<u16> {
+    registry_of(cli)
+        .get(worktree)
+        .expect("get")
+        .expect("entry")
+        .ports
+        .get("web")
+        .copied()
+}
+
+fn ls_row(cli: &Cli, cwd: &Path, slug: &str) -> String {
+    let out = cli.run(cwd, &["ls"]).success().get_output().stdout.clone();
+    String::from_utf8_lossy(&out)
+        .lines()
+        .find(|line| line.starts_with(&format!("{slug} ")))
+        .unwrap_or_else(|| panic!("no ls row for {slug}"))
+        .to_string()
+}
+
+/// An exhausted range with stopped instances idle past an hour is not exhausted: `up`
+/// takes the block of the one idle longest, says so, and leaves the fresher one alone.
+#[test]
+fn exhausted_up_takes_the_block_of_the_longest_idle_stopped_instance() {
+    let cli = Cli::new();
+    let range = block_range(&cli, 3);
+    let env = [("GROVE_PORT_RANGE", range.as_str())];
+
+    let mut blocks = Vec::new();
+    for (slug, idle) in [
+        ("feat_old", 3 * 3600),
+        ("feat_older", 9 * 3600),
+        ("feat_fresh", 60),
+    ] {
+        let wt = cli.worktree(slug);
+        cli.run_env(&wt, &env, &["up"]).success();
+        cli.run_env(&wt, &env, &["down"]).success();
+        age_clock(&cli, &wt, idle);
+        blocks.push((wt.clone(), web_port(&cli, &wt).expect("port")));
+    }
+    let (older, older_port) = blocks[1].clone();
+
+    let late = cli.worktree("feat_late");
+    let up = cli.run_env(&late, &env, &["up"]).success();
+    let stderr = String::from_utf8_lossy(&up.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("from stopped feat_older (idle 9h)"),
+        "{stderr}"
+    );
+    assert_eq!(stderr.matches("no free port block").count(), 1, "{stderr}");
+    assert_eq!(web_port(&cli, &late), Some(older_port));
+    assert_eq!(web_port(&cli, &older), None);
+    assert_eq!(web_port(&cli, &blocks[0].0), Some(blocks[0].1));
+    assert_eq!(web_port(&cli, &blocks[2].0), Some(blocks[2].1));
+    assert!(
+        ls_row(&cli, &late, "feat_older").contains("stopped (no ports)"),
+        "{}",
+        ls_row(&cli, &late, "feat_older")
+    );
+
+    cli.run_env(&late, &env, &["down"]).success();
+}
+
+/// `release` without `--yes` names what it would free and frees nothing.
+#[test]
+fn release_dry_run_changes_nothing() {
+    let cli = Cli::new();
+    let wt = cli.worktree("feat_idle");
+    cli.run(&wt, &["up"]).success();
+    cli.run(&wt, &["down"]).success();
+    age_clock(&cli, &wt, 2 * 3600);
+    let port = web_port(&cli, &wt).expect("port");
+    let before = std::fs::read_to_string(cli.state.path().join("registry.json")).expect("read");
+
+    let out = cli
+        .run(&wt, &["release", "--stopped"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&out).into_owned();
+    assert!(stdout.contains("would release feat_idle"), "{stdout}");
+    assert!(stdout.contains(&format!("web={port}")), "{stdout}");
+    assert!(stdout.contains("Nothing released (dry run)"), "{stdout}");
+
+    let after = std::fs::read_to_string(cli.state.path().join("registry.json")).expect("read");
+    assert_eq!(before, after);
+    assert!(ls_row(&cli, &wt, "feat_idle").contains("stopped "));
+    assert!(!ls_row(&cli, &wt, "feat_idle").contains("no ports"));
+}
+
+/// `release --stopped --yes` frees the blocks of stopped instances idle past --min-age,
+/// skips younger and running ones, keeps the worktree and its env files, and `ls` shows
+/// what happened.
+#[test]
+fn release_yes_frees_stopped_blocks_and_ls_reflects_it() {
+    let cli = Cli::new();
+    let idle = cli.worktree("feat_idle");
+    cli.run(&idle, &["up"]).success();
+    cli.run(&idle, &["down"]).success();
+    age_clock(&cli, &idle, 2 * 3600);
+    let young = cli.worktree("feat_young");
+    cli.run(&young, &["up"]).success();
+    cli.run(&young, &["down"]).success();
+    let running = cli.worktree("feat_running");
+    cli.run(&running, &["up"]).success();
+    age_clock(&cli, &running, 5 * 3600);
+    let env_file = idle.join("backend/.env.local");
+    let rendered = std::fs::read_to_string(&env_file).expect("env");
+
+    let out = cli
+        .run(&idle, &["release", "--stopped", "--yes"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&out).into_owned();
+    assert!(stdout.contains("released feat_idle"), "{stdout}");
+    assert!(!stdout.contains("feat_young"), "{stdout}");
+    assert!(!stdout.contains("feat_running"), "{stdout}");
+
+    assert_eq!(web_port(&cli, &idle), None);
+    assert!(web_port(&cli, &young).is_some());
+    assert!(web_port(&cli, &running).is_some());
+    assert_eq!(std::fs::read_to_string(&env_file).expect("env"), rendered);
+    assert!(ls_row(&cli, &idle, "feat_idle").contains("stopped (no ports)"));
+    assert!(!ls_row(&cli, &idle, "feat_young").contains("no ports"));
+
+    let json = cli
+        .run(&idle, &["ls", "--json"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&json).expect("json");
+    let row = json["instances"]
+        .as_array()
+        .expect("instances")
+        .iter()
+        .find(|i| i["slug"] == "feat_idle")
+        .expect("row")
+        .clone();
+    assert_eq!(row["released"], true);
+
+    cli.run(&running, &["down"]).success();
+}
+
+/// Naming a running instance is refused before anything is released.
+#[test]
+fn release_refuses_a_running_instance() {
+    let cli = Cli::new();
+    let stopped = cli.worktree("feat_stopped");
+    cli.run(&stopped, &["up"]).success();
+    cli.run(&stopped, &["down"]).success();
+    let running = cli.worktree("feat_running");
+    cli.run(&running, &["up"]).success();
+
+    let failed = cli
+        .run(
+            &running,
+            &["release", "feat_stopped", "feat_running", "--yes"],
+        )
+        .failure();
+    let stderr = String::from_utf8_lossy(&failed.get_output().stderr).into_owned();
+    assert!(stderr.contains("feat_running is running"), "{stderr}");
+    assert!(stderr.contains("grove down feat_running"), "{stderr}");
+    assert!(web_port(&cli, &running).is_some());
+    assert!(web_port(&cli, &stopped).is_some());
+
+    cli.run(&running, &["down"]).success();
+}
+
+/// A released instance comes back on a block allocated afresh, with its env rendered for
+/// the new port, even when another instance has since taken its old one.
+#[test]
+fn released_instance_up_gets_a_new_block() {
+    let cli = Cli::new();
+    let range = block_range(&cli, 2);
+    let env = [("GROVE_PORT_RANGE", range.as_str())];
+
+    let first = cli.worktree("feat_first");
+    cli.run_env(&first, &env, &["up"]).success();
+    cli.run_env(&first, &env, &["down"]).success();
+    cli.run_env(&first, &env, &["release", "feat_first", "--yes"])
+        .success();
+    assert_eq!(web_port(&cli, &first), None);
+
+    // Another instance may now take the old block, so the comeback must allocate anew.
+    let second = cli.worktree("feat_second");
+    cli.run_env(&second, &env, &["up"]).success();
+    let second_port = web_port(&cli, &second).expect("port");
+
+    cli.run_env(&first, &env, &["up"]).success();
+    let new = web_port(&cli, &first).expect("new port");
+    assert_ne!(new, second_port);
+    let rendered = std::fs::read_to_string(first.join("backend/.env.local")).expect("env");
+    assert!(
+        rendered.contains(&format!("http://localhost:{new}")),
+        "{rendered}"
+    );
+    assert!(!ls_row(&cli, &first, "feat_first").contains("no ports"));
+
+    cli.run_env(&first, &env, &["down"]).success();
+    cli.run_env(&second, &env, &["down"]).success();
 }
 
 /// Reserved blocks count whether or not anything is listening: a stopped instance holds

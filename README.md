@@ -180,6 +180,7 @@ repo's own fixture or settings constructor.
 | `seed [--force]` | populate the datastore; markers follow the managed container incarnation, while `--force` rebuilds dirtied data |
 | `clean [NAME...] [--worktree PATH]... [--repo PATH]... [--yes|--apply] [--dry-run] [--min-age AGE]` | remove idle worktrees; dry-run by default |
 | `prune [NAME...] [--worktree PATH]... [--dry-run] [--purge]` | stop and forget all instances whose worktree is gone or no longer a git worktree, or only the selected orphaned instances by `grove ls` name or recorded path; selected prune skips the shared store sweep |
+| `release [NAME...] [--stopped] [--min-age AGE] [--yes]` | free the port blocks of stopped instances, by name or every one idle at least `--min-age` (default 1h) with `--stopped`; keeps the worktree, env files, database and containers. Dry run by default; refuses running instances. Released instances show `stopped (no ports)` in `ls` and get a new block on their next `up` |
 | `free BRANCH [--dry-run]` | detach clean, idle, unlocked worktrees that hold BRANCH so `git worktree add` can use it; exits 0 when free, 1 when something still holds it, 2 on usage errors |
 | `doctor` | check everything needed to start, and say what to fix |
 
@@ -487,7 +488,7 @@ but labels the store size as unmeasured. It does not recursively scan the store
 before it reports health findings.
 Ports held by colima, Docker Desktop, or other recognized container forwards are reported as forwards; health never suggests killing the forwarder process.
 
-Each instance holds a 10-port block from its first `up` until its worktree is removed; stopping it keeps the block so it returns on the same ports. `health` warns once 80% of the blocks in the range are reserved and fails at 100%, when `up` can no longer allocate. Stopping instances frees nothing: `grove prune` releases blocks of orphaned instances, `grove clean` (dry run, then `--yes`) removes idle worktrees with pushed commits or merged/closed PRs and releases theirs, and `GROVE_PORT_RANGE=low-high` widens the range. The exhaustion error from `up` says the same, with counts of running, stopped and orphaned holders.
+Each instance holds a 10-port block from its first `up` until its worktree is removed or the block is released; stopping it keeps the block so it returns on the same ports. When `up` finds no free block, it takes the block of the stopped instance idle the longest (no live services, no grove command for an hour), prints one line naming it, and carries on; that instance shows `stopped (no ports)` in `ls` and gets a new block on its next `up`. `health` warns once 80% of the blocks in the range are reserved and fails at 100%. Stopping instances frees nothing by itself: `grove release --stopped` (dry run, then `--yes`) frees the blocks of stopped instances while keeping their worktrees and data, `grove prune` releases blocks of orphaned instances, `grove clean` (dry run, then `--yes`) removes idle worktrees with pushed commits or merged/closed PRs and releases theirs, and `GROVE_PORT_RANGE=low-high` widens the range. When no stopped instance qualifies, the exhaustion error from `up` says the same, with counts of running, stopped and orphaned holders.
 
 ## Resource initialization failures
 

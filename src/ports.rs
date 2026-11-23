@@ -91,6 +91,33 @@ pub fn allocate_within(
     Err(Exhausted { range }.into())
 }
 
+/// The block `held` sits in, offered to `names` if every port in it is unpromised and
+/// unbound. How an exhausted range hands a stopped instance's block to someone who needs it.
+pub fn take_block(
+    range: &Range<u16>,
+    held: &BTreeMap<String, u16>,
+    names: &[String],
+    taken: &HashSet<u16>,
+) -> Option<BTreeMap<String, u16>> {
+    if names.len() > STRIDE as usize {
+        return None;
+    }
+    let port = held.values().find(|p| range.contains(p))?;
+    let base = range.start + (port - range.start) / STRIDE * STRIDE;
+    if base + STRIDE > range.end {
+        return None;
+    }
+    let candidate: BTreeMap<String, u16> = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.clone(), base + i as u16))
+        .collect();
+    candidate
+        .values()
+        .all(|p| !taken.contains(p) && is_free(*p))
+        .then_some(candidate)
+}
+
 pub fn blocks(range: &Range<u16>) -> u16 {
     ((range.end - range.start) / STRIDE).max(1)
 }
@@ -111,8 +138,8 @@ impl fmt::Display for Exhausted {
 impl std::error::Error for Exhausted {}
 
 /// What releases a block. Stopping an instance does not: its block stays reserved so it
-/// comes back on the same ports.
-pub const CURE: &str = "`grove prune` frees blocks of orphaned instances (worktree gone); `grove clean` (dry run, then `--yes`) removes idle worktrees with pushed commits or merged/closed PRs and releases theirs; GROVE_PORT_RANGE=low-high widens the range";
+/// comes back on the same ports, until `grove release` or an exhausted `up` takes it.
+pub const CURE: &str = "`grove release --stopped` (dry run, then `--yes`) frees blocks of stopped instances, keeping their worktrees and data; `grove prune` frees blocks of orphaned instances (worktree gone); `grove clean` (dry run, then `--yes`) removes idle worktrees with pushed commits or merged/closed PRs and releases theirs; GROVE_PORT_RANGE=low-high widens the range";
 
 /// Blocks in a range the registry has promised away, by the state of their holder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,7 +205,7 @@ impl Pressure {
             headline.push_str("; the rest are bound by other processes");
         }
         format!(
-            "{headline}\nstopped instances keep their block until their worktree is removed\nto free blocks: {CURE}"
+            "{headline}\nno stopped instance has been idle long enough for `up` to take its block\nto free blocks: {CURE}"
         )
     }
 }

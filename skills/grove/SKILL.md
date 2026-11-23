@@ -135,6 +135,11 @@ still works when it comes back. A repo that declares `[idle] stop_after = "2h"` 
 window before starting, so the running set never outgrows what someone touched recently. (`grove prune` is the other case: instances whose worktree
 has been deleted.)
 
+Stopped instances whose worktree is kept still hold a port block. `grove release --stopped`
+(dry run first, then `--yes`) frees the blocks of those idle over an hour without touching
+the worktree or its data; each gets a new block on its next `up`. An `up` that finds every
+block taken does this to the longest-idle stopped instance by itself and names it.
+
 **Read the list before sweeping when other agents share the machine.** grove counts an
 instance as busy while tests or an agent run in its worktree, but not while only its own
 services do, so an agent driving a browser from elsewhere through a long QA pass looks

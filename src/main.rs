@@ -113,10 +113,12 @@ impl Machine {
     version,
     about,
     disable_help_subcommand = true,
-    after_help = "Worktree commands act on the worktree you run them in. `ls`, `top`, `health`, `prune` \
-                  and `clean` are machine-wide. `ls`, `status`, `doctor`, `down`, `gate`, `prune` and \
-                  `clean` accept instance names as `grove ls` shows them, or worktree paths: \
-                  `grove status feature_branch`. `--worktree` is an alias for the positional \
+    after_help = "Worktree commands act on the worktree you run them in. `ls`, `top`, `health`, `prune`, \
+                  `release` and `clean` are machine-wide. `ls`, `status`, `doctor`, `down`, `gate`, `prune`, \
+                  `release` and `clean` accept instance names as `grove ls` shows them, or worktree paths: \
+                  `grove status feature_branch`. `release` frees stopped instances' port blocks \
+                  (`grove release --stopped`, then `--yes`); a full range makes `up` take the block \
+                  of the stopped instance idle longest. `--worktree` is an alias for the positional \
                   target on `ls`, `status` and `gate`; it is repeatable on `prune` and `clean`."
 )]
 struct Cli {
@@ -297,6 +299,21 @@ enum Command {
         /// Name what would be reclaimed, and reclaim nothing
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Free the port blocks of stopped instances, keeping worktree, env files, database and containers (dry-run by default)
+    Release {
+        /// Instance names as `grove ls` shows them, or recorded worktree paths
+        #[arg(value_name = "NAME", required_unless_present = "stopped")]
+        names: Vec<String>,
+        /// Every stopped instance idle for at least --min-age
+        #[arg(long, conflicts_with = "names")]
+        stopped: bool,
+        /// With --stopped: minimum idle age (ms/s/m/h/d or seconds); 0 disables the age guard
+        #[arg(long, default_value = "1h", value_name = "DURATION")]
+        min_age: String,
+        /// Release the blocks; without this flag release is a dry run
+        #[arg(long)]
+        yes: bool,
     },
     /// Populate data; rerun after seed changes or resource recreation
     Seed {
@@ -675,11 +692,16 @@ fn main() -> Result<()> {
                 .max()
                 .unwrap_or(0)
                 .max(5);
+            let state_width = if entries.iter().any(|e| e.released) {
+                18
+            } else {
+                13
+            };
             if entries.is_empty() {
                 println!("no instances");
             } else {
                 println!(
-                    "{:<28} {:<13} {:<10} {:>5}  {:<port_width$}  OWNER",
+                    "{:<28} {:<state_width$} {:<10} {:>5}  {:<port_width$}  OWNER",
                     "INSTANCE", "STATE", "IDLE", "SIZE", "PORTS"
                 );
             }
@@ -709,6 +731,8 @@ fn main() -> Result<()> {
                         failed += 1;
                         "up failed".to_string()
                     }
+                } else if entry.released {
+                    "stopped (no ports)".to_string()
                 } else {
                     "stopped".to_string()
                 };
@@ -721,7 +745,7 @@ fn main() -> Result<()> {
                 };
                 let size = disk_of(entry).map(human_size).unwrap_or_default();
                 println!(
-                    "{:<28} {:<13} {:<10} {:>5}  {:<port_width$}  {}",
+                    "{:<28} {:<state_width$} {:<10} {:>5}  {:<port_width$}  {}",
                     entry.slug,
                     state,
                     idle,
@@ -910,38 +934,16 @@ fn main() -> Result<()> {
             // A dry run must not reap: `reap` removes the entries as it returns them, so
             // rehearsing with it would be the destructive act it exists to avoid.
             let orphans: Vec<Entry> = if selected {
-                let entries = registry.list()?;
-                let mut chosen = std::collections::BTreeMap::new();
-                for selector in &selectors {
-                    let selected_path = Path::new(selector);
-                    let selected_path = if selected_path.is_absolute() {
-                        selected_path.to_path_buf()
-                    } else {
-                        cwd.join(selected_path)
-                    };
-                    let matches: Vec<&Entry> = entries
-                        .iter()
-                        .filter(|entry| entry.slug == *selector || entry.worktree == selected_path)
-                        .collect();
-                    let entry = match matches.as_slice() {
-                        [entry] => *entry,
-                        [] => bail!(
-                            "no instance named or recorded at `{selector}`; `grove ls` lists instances"
-                        ),
-                        several => bail!(
-                            "{} instances match `{selector}`; select a worktree path instead",
-                            several.len()
-                        ),
-                    };
+                let chosen = select_entries(&registry.list()?, &selectors, &cwd)?;
+                for (selector, entry) in selectors.iter().zip(&chosen) {
                     if !entry.is_orphaned() {
                         bail!(
                             "`{selector}` still has its worktree at {}; `grove down` stops it",
                             entry.worktree.display()
                         );
                     }
-                    chosen.insert(entry.worktree.clone(), entry.clone());
                 }
-                chosen.into_values().collect()
+                dedup_by_worktree(chosen)
             } else if dry_run {
                 registry
                     .list()?
@@ -1092,6 +1094,12 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Some(Command::Release {
+            names,
+            stopped,
+            min_age,
+            yes,
+        }) => release(&cwd, &names, stopped, &min_age, yes),
         Some(Command::Seed { force }) => {
             let instance = Instance::open(&cwd)?;
             instance.refuse_in_main()?;
@@ -1496,6 +1504,124 @@ fn last_up(entry: &Entry) -> Option<grove::last_up::LastUp> {
     entry.instance_dir.as_deref().and_then(grove::last_up::read)
 }
 
+/// Registry entries for each selector, in selector order: an instance name as `grove ls`
+/// shows it, or a recorded worktree path. A selector matching nothing or several fails.
+fn select_entries(entries: &[Entry], selectors: &[String], cwd: &Path) -> Result<Vec<Entry>> {
+    selectors
+        .iter()
+        .map(|selector| {
+            let path = Path::new(selector);
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                cwd.join(path)
+            };
+            let matches: Vec<&Entry> = entries
+                .iter()
+                .filter(|entry| entry.slug == *selector || entry.worktree == path)
+                .collect();
+            match matches.as_slice() {
+                [entry] => Ok((*entry).clone()),
+                [] => bail!(
+                    "no instance named or recorded at `{selector}`; `grove ls` lists instances"
+                ),
+                several => bail!(
+                    "{} instances match `{selector}`; select a worktree path instead",
+                    several.len()
+                ),
+            }
+        })
+        .collect()
+}
+
+fn dedup_by_worktree(entries: Vec<Entry>) -> Vec<Entry> {
+    entries
+        .into_iter()
+        .map(|e| (e.worktree.clone(), e))
+        .collect::<std::collections::BTreeMap<_, _>>()
+        .into_values()
+        .collect()
+}
+
+/// `grove release`: hand stopped instances' port blocks back to the range. Only the
+/// reservation goes; the worktree, its rendered env files, its database and any shared
+/// containers are left exactly as they are, and the next `up` there allocates afresh.
+fn release(cwd: &Path, names: &[String], stopped: bool, min_age: &str, yes: bool) -> Result<()> {
+    let registry = grove::instance::registry()?;
+    let entries = registry.list()?;
+    let now = grove::registry::now();
+
+    let chosen: Vec<Entry> = if stopped {
+        let min_age = grove::instance::parse_duration(min_age)?.as_secs();
+        // Tests or agents still working in a worktree make it busy even with no service
+        // up; their next `up` would expect the same ports.
+        let activity = grove::top::Activity::sample(&entries);
+        let mut chosen: Vec<Entry> = entries
+            .into_iter()
+            .filter(|e| !e.ports.is_empty() && !e.is_running())
+            .filter(|e| {
+                !activity.is_busy(&e.worktree)
+                    && e.idle_seconds(now).is_none_or(|age| age >= min_age)
+            })
+            .collect();
+        chosen.sort_by_key(|e| e.idle_seconds(now).map(std::cmp::Reverse));
+        chosen
+    } else {
+        let chosen = dedup_by_worktree(select_entries(&entries, names, cwd)?);
+        if let Some(running) = chosen.iter().find(|e| e.is_running()) {
+            bail!(
+                "{} is running; `grove down {}` first, then release its ports",
+                running.slug,
+                running.slug
+            );
+        }
+        chosen
+    };
+
+    let mut released = 0;
+    for entry in &chosen {
+        if entry.ports.is_empty() {
+            println!("{:<28} holds no ports", entry.slug);
+            continue;
+        }
+        let ports = if yes {
+            match registry.drop_ports(&entry.worktree)? {
+                Some(ports) => ports,
+                None => continue,
+            }
+        } else {
+            entry.ports.clone()
+        };
+        let ports: Vec<String> = ports.iter().map(|(n, p)| format!("{n}={p}")).collect();
+        let idle = entry
+            .idle_seconds(now)
+            .map(|age| format!("idle {}", human_age(age)))
+            .unwrap_or_else(|| "idle unknown".to_string());
+        let verb = if yes { "released" } else { "would release" };
+        println!("{verb} {:<28} {:<10} {}", entry.slug, idle, ports.join(" "));
+        released += 1;
+    }
+
+    if released == 0 {
+        if stopped {
+            println!(
+                "nothing to release: no stopped instance holding ports has been idle {min_age}"
+            );
+        }
+        return Ok(());
+    }
+    let blocks = if released == 1 { "block" } else { "blocks" };
+    if yes {
+        println!(
+            "\nreleased {released} port {blocks}; worktrees, env files and databases kept. \
+             Each one's next `grove up` allocates a new block."
+        );
+    } else {
+        println!("\n{released} port {blocks}. Nothing released (dry run); pass --yes to release.");
+    }
+    Ok(())
+}
+
 fn ls_json(
     entries: &[Entry],
     now: u64,
@@ -1515,6 +1641,7 @@ fn ls_json(
                 "exposed": e.exposure.is_exposed(),
                 "public_host": e.exposure.public_host(),
                 "ports": e.ports,
+                "released": e.released,
                 "database": e.db_name,
                 "started_by": e.started_by,
                 "disk_bytes": disk_of(e),

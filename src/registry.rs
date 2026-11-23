@@ -57,6 +57,10 @@ pub struct Entry {
     /// nobody will — the store itself has no way to know who uses it.
     #[serde(default)]
     pub cache_keys: BTreeMap<String, String>,
+    /// Its port block was handed back by `grove release` or taken by an exhausted `up`.
+    /// Kept apart from empty `ports`, which is also what a repo declaring no ports has.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub released: bool,
 }
 
 /// Enough to reach a datastore without the config that declared it: the port to speak to,
@@ -112,7 +116,21 @@ impl Entry {
     pub fn is_orphaned(&self) -> bool {
         self.orphaned().is_some()
     }
+
+    /// Stopped, holding a block, and untouched for [`RECLAIM_AFTER`]: nobody loses ports
+    /// they are using if this block goes to someone else. An unknown idle age predates the
+    /// idle clock, so it is the oldest of all.
+    pub fn is_reclaimable(&self, now: u64) -> bool {
+        !self.ports.is_empty()
+            && !self.is_running()
+            && self
+                .idle_seconds(now)
+                .is_none_or(|age| age >= RECLAIM_AFTER)
+    }
 }
+
+/// How long a stopped instance sits untouched before an exhausted `up` may take its block.
+pub const RECLAIM_AFTER: u64 = 3600;
 
 /// How an instance lost its worktree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,40 +222,57 @@ impl Registry {
                 .flat_map(|(_, e)| e.ports.values().copied())
                 .collect();
 
-            let entry = Entry {
-                worktree: resolved.worktree.clone(),
-                slug: resolved.slug.clone(),
-                ports: ports::allocate_avoiding(
-                    &resolved.state_key(),
-                    &resolved.slug,
-                    names,
-                    &taken,
-                )
-                .map_err(|error| {
-                    match error.downcast_ref::<ports::Exhausted>() {
-                        Some(exhausted) => {
+            let ports = match ports::allocate_avoiding(
+                &resolved.state_key(),
+                &resolved.slug,
+                names,
+                &taken,
+            ) {
+                Ok(ports) => ports,
+                Err(error) => {
+                    let Some(exhausted) = error.downcast_ref::<ports::Exhausted>() else {
+                        return Err(error);
+                    };
+                    let range = exhausted.range.clone();
+                    match reclaim(state, &key, &range, names, &taken) {
+                        Some(ports) => ports,
+                        None => {
                             let others = state
                                 .instances
                                 .iter()
                                 .filter(|(k, _)| *k != &key)
                                 .map(|(_, e)| e);
-                            anyhow::anyhow!(
-                                ports::Pressure::of(&exhausted.range, others)
-                                    .exhausted_message(&exhausted.range)
-                            )
+                            anyhow::bail!(
+                                ports::Pressure::of(&range, others).exhausted_message(&range)
+                            );
                         }
-                        None => error,
                     }
-                })?,
-                services: BTreeMap::new(),
-                db_name: None,
-                db_resource: None,
-                exposure: crate::exposure::Exposure::default(),
-                last_used: None,
-                instance_dir: None,
-                disk_bytes: None,
-                started_by: None,
-                cache_keys: BTreeMap::new(),
+                }
+            };
+
+            // A released instance keeps its database, owner and history; only the block
+            // is new. Anything else is a first reservation.
+            let entry = match state.instances.get(&key) {
+                Some(existing) => Entry {
+                    ports,
+                    released: false,
+                    ..existing.clone()
+                },
+                None => Entry {
+                    worktree: resolved.worktree.clone(),
+                    slug: resolved.slug.clone(),
+                    ports,
+                    services: BTreeMap::new(),
+                    db_name: None,
+                    db_resource: None,
+                    exposure: crate::exposure::Exposure::default(),
+                    last_used: None,
+                    instance_dir: None,
+                    disk_bytes: None,
+                    started_by: None,
+                    cache_keys: BTreeMap::new(),
+                    released: false,
+                },
             };
             state.instances.insert(key, entry.clone());
             Ok(entry)
@@ -343,6 +378,30 @@ impl Registry {
         })
     }
 
+    /// Hand back a stopped instance's port block, keeping everything else about it. Checked
+    /// under the lock, so a service started since the caller looked is never cut loose.
+    /// Returns the ports it held, or None when it held none.
+    pub fn drop_ports(&self, worktree: &Path) -> Result<Option<BTreeMap<String, u16>>> {
+        self.with_lock(|state| {
+            let entry = state
+                .instances
+                .get_mut(&key(worktree))
+                .context("the instance is not registered")?;
+            if entry.is_running() {
+                anyhow::bail!(
+                    "{} is running; `grove down {}` first, then release its ports",
+                    entry.slug,
+                    entry.slug
+                );
+            }
+            if entry.ports.is_empty() {
+                return Ok(None);
+            }
+            entry.released = true;
+            Ok(Some(std::mem::take(&mut entry.ports)))
+        })
+    }
+
     /// Drop orphaned entries (see [`Entry::orphaned`]), so a deleted worktree stops holding ports.
     /// Returns what was dropped, so callers can report it rather than reclaiming silently.
     pub fn reap(&self) -> Result<Vec<Entry>> {
@@ -409,6 +468,45 @@ impl Registry {
             .with_context(|| format!("replacing {}", self.path.display()))?;
         Ok(())
     }
+}
+
+/// The block of the stopped instance idle the longest that is actually free to hand out,
+/// taken from it on the spot. One line on stderr names the loser: an instance that comes
+/// back up on new ports should not be a mystery.
+fn reclaim(
+    state: &mut State,
+    key: &str,
+    range: &std::ops::Range<u16>,
+    names: &[String],
+    taken: &HashSet<u16>,
+) -> Option<BTreeMap<String, u16>> {
+    let now = now();
+    let mut candidates: Vec<(&String, &Entry)> = state
+        .instances
+        .iter()
+        .filter(|(k, e)| k.as_str() != key && e.is_reclaimable(now))
+        .collect();
+    candidates.sort_by_key(|(_, e)| e.idle_seconds(now).map(std::cmp::Reverse));
+
+    let (victim, ports) = candidates.into_iter().find_map(|(k, e)| {
+        let theirs: HashSet<u16> = e.ports.values().copied().collect();
+        let others: HashSet<u16> = taken.difference(&theirs).copied().collect();
+        ports::take_block(range, &e.ports, names, &others).map(|p| (k.clone(), p))
+    })?;
+
+    let entry = state.instances.get_mut(&victim)?;
+    let idle = entry
+        .idle_seconds(now)
+        .map(|age| format!("idle {}", human_age(age)))
+        .unwrap_or_else(|| "idle age unknown".to_string());
+    let (low, high) = (ports.values().min()?, ports.values().max()?);
+    eprintln!(
+        "grove: no free port block; took {low}-{high} from stopped {} ({idle}), its next `grove up` gets a new block",
+        entry.slug
+    );
+    entry.ports.clear();
+    entry.released = true;
+    Some(ports)
 }
 
 fn key(worktree: &Path) -> String {

@@ -1,7 +1,9 @@
 //! Locating the pieces of an instance from wherever grove was invoked.
 //!
-//! Everything hangs off `git worktree list --porcelain` rather than path shape, so the
-//! several worktree layouts in the wild all resolve identically.
+//! One `git rev-parse` names both the current worktree and the shared git directory; the
+//! main checkout is the parent of that directory in the ordinary `$main/.git` layout.
+//! Anything else (bare repos, `--separate-git-dir`) falls back to the first entry of
+//! `git worktree list --porcelain`, which is slow once a repo has thousands of worktrees.
 
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
@@ -69,14 +71,24 @@ pub fn is_worktree(path: &Path) -> bool {
 }
 
 pub fn resolve(cwd: &Path) -> Result<Resolved> {
-    let stdout = git(cwd, &["worktree", "list", "--porcelain"])?;
-    let main_worktree = stdout
-        .lines()
-        .find_map(|l| l.strip_prefix("worktree "))
-        .map(PathBuf::from)
-        .context("`git worktree list --porcelain` listed no worktrees")?;
-
-    let worktree = PathBuf::from(git(cwd, &["rev-parse", "--show-toplevel"])?.trim());
+    let stdout = git(
+        cwd,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            "--git-common-dir",
+        ],
+    )?;
+    let mut lines = stdout.lines();
+    let (Some(top), Some(common)) = (lines.next(), lines.next()) else {
+        bail!("`git rev-parse` did not name a worktree and git directory");
+    };
+    let worktree = PathBuf::from(top);
+    let main_worktree = match main_beside(Path::new(common)) {
+        Some(main) => main,
+        None => listed_main(cwd)?,
+    };
 
     let slug = worktree
         .file_name()
@@ -88,6 +100,24 @@ pub fn resolve(cwd: &Path) -> Result<Resolved> {
         main_worktree,
         slug,
     })
+}
+
+/// The main checkout when the shared git directory is its `.git` — the same parent
+/// `git worktree list` reports first for that layout — else None.
+fn main_beside(common: &Path) -> Option<PathBuf> {
+    if common.file_name()? != ".git" || !common.is_dir() {
+        return None;
+    }
+    let main = common.parent()?;
+    is_worktree(main).then(|| main.to_path_buf())
+}
+
+fn listed_main(cwd: &Path) -> Result<PathBuf> {
+    git(cwd, &["worktree", "list", "--porcelain"])?
+        .lines()
+        .find_map(|l| l.strip_prefix("worktree "))
+        .map(PathBuf::from)
+        .context("`git worktree list --porcelain` listed no worktrees")
 }
 
 fn slugify(name: &str) -> String {

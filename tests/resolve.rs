@@ -84,3 +84,89 @@ fn repos_with_the_same_directory_name_get_different_state_keys() {
 
     assert_ne!(a.state_key(), b.state_key());
 }
+
+fn listed_main(cwd: &std::path::Path) -> std::path::PathBuf {
+    common::git(cwd, &["worktree", "list", "--porcelain"])
+        .lines()
+        .find_map(|l| l.strip_prefix("worktree "))
+        .map(std::path::PathBuf::from)
+        .expect("porcelain names a main worktree")
+}
+
+#[test]
+fn a_separate_git_dir_resolves_to_the_listed_main_worktree() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let main = root.join("repo");
+    let gitdir = root.join("store.git");
+    std::fs::create_dir(&main).unwrap();
+    common::git(
+        &main,
+        &["init", "-q", "--separate-git-dir", gitdir.to_str().unwrap()],
+    );
+    common::git(
+        &main,
+        &[
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@e",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "i",
+        ],
+    );
+    let wt = root.join("linked");
+    common::git(&main, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+
+    let r = resolve::resolve(&wt).expect("resolve");
+
+    assert_eq!(r.main_worktree, listed_main(&wt));
+    assert_eq!(r.worktree, wt);
+}
+
+#[test]
+fn a_bare_repo_cloned_into_dot_git_resolves_to_the_listed_main_worktree() {
+    let fx = Fixture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let project = root.join("project");
+    std::fs::create_dir(&project).unwrap();
+    common::git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            fx.main.to_str().unwrap(),
+            project.join(".git").to_str().unwrap(),
+        ],
+    );
+    let wt = project.join("linked");
+    common::git(
+        &project.join(".git"),
+        &["worktree", "add", "-q", wt.to_str().unwrap()],
+    );
+
+    let r = resolve::resolve(&wt).expect("resolve");
+
+    assert_eq!(r.main_worktree, listed_main(&wt));
+}
+
+#[test]
+fn a_relocated_core_worktree_resolves_to_the_listed_main_worktree() {
+    let fx = Fixture::new();
+    let elsewhere = fx.main.parent().unwrap().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    common::git(
+        &fx.main,
+        &["config", "core.worktree", elsewhere.to_str().unwrap()],
+    );
+    let wt = fx.add_worktree("t1");
+
+    let r = resolve::resolve(&wt).expect("resolve");
+
+    assert_eq!(r.main_worktree, listed_main(&wt));
+}

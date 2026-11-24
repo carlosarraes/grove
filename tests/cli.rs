@@ -1784,6 +1784,59 @@ fn run_executes_a_command_with_the_instance_environment() {
 }
 
 #[test]
+fn instance_commands_never_list_every_worktree() {
+    // `git worktree list` scales with the repo's worktree count — thousands on a busy
+    // checkout — so resolving the current instance must not call it.
+    use std::os::unix::fs::PermissionsExt;
+    let cli = Cli::new();
+    let wt = cli.worktree("no_listing");
+    let real_git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|p| p.join("git"))
+        .find(|p| p.is_file())
+        .unwrap();
+    let shim = TempDir::new().unwrap();
+    let log = shim.path().join("git.log");
+    std::fs::write(
+        shim.path().join("git"),
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
+            log.display(),
+            real_git.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        shim.path().join("git"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let mut paths = vec![shim.path().to_path_buf()];
+    paths.extend(std::env::split_paths(&cli.client_path()));
+    let path = std::env::join_paths(paths).unwrap();
+    let path = path.to_str().unwrap();
+
+    for args in [
+        &["up"][..],
+        &["run", "--", "true"],
+        &["status"],
+        &["restart"],
+        &["down"],
+    ] {
+        cli.run_env(&wt, &[("PATH", path)], args).success();
+    }
+
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        calls.contains("rev-parse"),
+        "the shim saw grove's git calls: {calls}"
+    );
+    assert!(
+        !calls.contains("worktree list"),
+        "instance commands listed every worktree:\n{calls}"
+    );
+}
+
+#[test]
 fn skill_install_writes_a_skill_agents_can_load() {
     let cli = Cli::new();
     let home = TempDir::new().expect("tempdir");
